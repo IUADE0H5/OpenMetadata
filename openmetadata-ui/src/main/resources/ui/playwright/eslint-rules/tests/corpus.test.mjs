@@ -40,14 +40,14 @@ test('the suppressions baseline matches its recorded state exactly', () => {
   // Known gap: counts are per file+rule, so swapping one violation for another
   // of the same rule in the same file stays invisible here.
   const EXPECTED = {
-    'om-playwright/justified-rule-disable': 12,
-    'om-playwright/no-blanket-test-slow': 83,
+    'om-playwright/justified-rule-disable': 10,
+    'om-playwright/no-blanket-test-slow': 80,
     'om-playwright/no-positional-locator': 1328,
     'om-playwright/require-assertion-per-test': 1,
     'playwright/no-force-option': 11,
-    'playwright/no-skipped-test': 4,
+    'playwright/no-skipped-test': 8,
     'playwright/no-wait-for-selector': 35,
-    'playwright/no-wait-for-timeout': 31,
+    'playwright/no-wait-for-timeout': 13,
   };
 
   assert.deepStrictEqual(

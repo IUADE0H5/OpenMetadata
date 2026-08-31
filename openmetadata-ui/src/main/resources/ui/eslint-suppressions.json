@@ -7,35 +7,6 @@
       "count": 1
     }
   },
-  "playwright/e2e/Auth/OktaSessionRenewalPublic.spec.ts": {
-    "om-playwright/justified-rule-disable": {
-      "count": 1
-    },
-    "om-playwright/no-blanket-test-slow": {
-      "count": 1
-    }
-  },
-  "playwright/e2e/Auth/SSOAuthentication.spec.ts": {
-    "playwright/no-skipped-test": {
-      "count": 2
-    },
-    "playwright/no-wait-for-timeout": {
-      "count": 19
-    }
-  },
-  "playwright/e2e/Auth/SSOLogin.spec.ts": {
-    "om-playwright/no-blanket-test-slow": {
-      "count": 1
-    }
-  },
-  "playwright/e2e/Auth/SSORenewal.spec.ts": {
-    "om-playwright/justified-rule-disable": {
-      "count": 1
-    },
-    "om-playwright/no-blanket-test-slow": {
-      "count": 1
-    }
-  },
   "playwright/e2e/Auth/SSOSelfSignup.spec.ts": {
     "om-playwright/no-blanket-test-slow": {
       "count": 1
@@ -46,6 +17,14 @@
       "count": 1
     },
     "om-playwright/no-blanket-test-slow": {
+      "count": 1
+    }
+  },
+  "playwright/e2e/Auth/SsoScenarios.spec.ts": {
+    "playwright/no-skipped-test": {
+      "count": 6
+    },
+    "playwright/no-wait-for-timeout": {
       "count": 1
     }
   },

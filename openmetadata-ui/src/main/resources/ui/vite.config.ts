@@ -428,6 +428,16 @@ export default defineConfig(async ({ mode }) => {
               return 'vendor-react';
             }
 
+            // `oidc-client` is the only vendor the /silent-callback entry
+            // path needs. Pin it into its own chunk so Rollup's
+            // experimentalMinChunkSize merger cannot fold it into
+            // vendor-antd — that merge makes vendor-antd a static
+            // sibling of index.tsx and pulls a >1 MB Antd chunk into the
+            // silent-refresh iframe, violating the scenario-7 budget.
+            if (packageName === 'oidc-client') {
+              return 'vendor-oidc-client';
+            }
+
             if (
               packageName.startsWith('@react-aria/') ||
               packageName.startsWith('@react-stately/') ||
