@@ -73,6 +73,7 @@ import { WILD_CARD_CHAR } from '../../../constants/char.constants';
 import { ROUTES } from '../../../constants/constants';
 import { usePermissionProvider } from '../../../context/PermissionProvider/PermissionProvider';
 import { ResourceEntity } from '../../../context/PermissionProvider/PermissionProvider.interface';
+import { ClientErrors } from '../../../enums/Axios.enum';
 import { EntityType } from '../../../enums/entity.enum';
 import { SearchIndex } from '../../../enums/search.enum';
 import type { Metric } from '../../../generated/entity/data/metric';
@@ -396,8 +397,13 @@ const MetricListPage = () => {
     ? treePaging.total
     : searchResponse?.hits.total.value ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalMetrics / METRIC_PAGE_SIZE));
+  const activeListError = isTreeMode ? treeError : searchError;
+  const isActiveListErrorNotFound =
+    (activeListError as AxiosError)?.response?.status ===
+    ClientErrors.NOT_FOUND;
   const listingError =
-    permissionError ?? (isTreeMode ? treeError : searchError);
+    permissionError ??
+    (isActiveListErrorNotFound ? undefined : activeListError);
   const listingErrorMessage = permissionError
     ? t('server.fetch-entity-permissions-error', {
         entity: t('label.metric-plural'),
@@ -405,6 +411,9 @@ const MetricListPage = () => {
     : t('server.entity-fetch-error', { entity: t('label.metric-plural') });
   const hasGroups = topLevelNodes.some(({ groupId }) => Boolean(groupId));
   const areAllGroupsExpanded = collapsedGroupIds.length === 0;
+  const isUnfiltered = !searchText && !statusFilter;
+  const isTrulyEmpty =
+    !listingError && !isMetricsPending && rows.length === 0 && isUnfiltered;
 
   useEffect(() => {
     if (listingError) {
@@ -1062,10 +1071,10 @@ const MetricListPage = () => {
   );
 
   const renderEmpty = () => {
-    const isUnfiltered = !searchText && !statusFilter;
-
     return (
-      <Box className="tw:min-h-96 tw:p-4" justify="center">
+      <Box
+        className="tw:relative tw:h-[calc(100vh-230px)] tw:p-4"
+        justify="center">
         <EmptyPlaceholder
           actions={
             isUnfiltered && permission.Create
@@ -1117,27 +1126,24 @@ const MetricListPage = () => {
               : t('label.no-data')
           }
           variant={isUnfiltered ? 'features' : 'blank'}
+          width="100%"
         />
       </Box>
     );
   };
 
   const renderError = () => (
-    <Box className="tw:min-h-80 tw:p-6" justify="center">
-      <Card data-testid="metric-list-error" size="sm">
-        <Card.Content>
-          <Box align="center" direction="col" gap={3}>
-            <Typography className="tw:text-error-primary" size="text-sm">
-              <span role="alert">
-                {getErrorText(listingError as AxiosError, listingErrorMessage)}
-              </span>
-            </Typography>
-            <Button color="secondary" onPress={handleRetry}>
-              {t('label.try-again')}
-            </Button>
-          </Box>
-        </Card.Content>
-      </Card>
+    <Box align="center" className="tw:min-h-40 tw:p-6" justify="center">
+      <Box align="center" direction="col" gap={3}>
+        <Typography className="tw:text-error-primary" size="text-sm">
+          <span role="alert">
+            {getErrorText(listingError as AxiosError, listingErrorMessage)}
+          </span>
+        </Typography>
+        <Button color="secondary" onPress={handleRetry}>
+          {t('label.try-again')}
+        </Button>
+      </Box>
     </Box>
   );
 
@@ -1230,197 +1236,200 @@ const MetricListPage = () => {
         </Card>
       ) : (
         <Card size="sm">
-          <Box
-            align="center"
-            className="tw:flex-col tw:border-b tw:border-secondary tw:px-4 tw:py-3 tw:sm:flex-row tw:sm:flex-nowrap"
-            data-testid="metric-list-toolbar"
-            gap={3}
-            justify="between">
-            {selectedMetricIds.length ? (
-              <Box align="center" className="tw:w-full tw:flex-wrap" gap={3}>
-                <Badge color="brand" size="sm">
-                  {selectedMetricIds.length} {t('label.selected-lowercase')}
-                </Badge>
-                <Button
-                  color="link-gray"
-                  data-testid="clear-metric-selection"
-                  iconLeading={XClose}
-                  onPress={() => setSelectedMetricIds([])}>
-                  {t('label.clear')}
-                </Button>
-                {permission.EditAll && (
-                  <Button
-                    className="tw:text-brand-primary! tw:hover:text-brand-primary! tw:*:data-icon:text-fg-brand-primary!"
-                    color="link-color"
-                    data-testid="bulk-edit-metric"
-                    iconLeading={Edit03}
-                    onPress={handleBulkEdit}>
-                    {t('label.bulk-edit-count', {
-                      count: selectedMetricIds.length,
-                    })}
-                  </Button>
-                )}
-                {permission.Delete && (
-                  <Button
-                    color="link-destructive"
-                    data-testid="bulk-delete-metric"
-                    iconLeading={Trash01}
-                    onPress={() => setIsDeleteDialogOpen(true)}>
-                    {t('label.delete')}
-                  </Button>
-                )}
-              </Box>
-            ) : (
-              <Input
-                className="tw:w-full tw:sm:max-w-84"
-                data-testid="metric-search"
-                icon={SearchLg}
-                placeholder={t('label.search-entity', {
-                  entity: t('label.metric-plural'),
-                })}
-                value={searchText}
-                wrapperClassName="tw:w-full tw:sm:max-w-84"
-                onChange={handleSearchTextChange}
-              />
-            )}
-
+          {!isTrulyEmpty && (
             <Box
               align="center"
-              className="tw:w-full tw:flex-wrap tw:sm:w-auto tw:sm:flex-nowrap"
+              className="tw:flex-col tw:border-b tw:border-secondary tw:px-4 tw:py-3 tw:sm:flex-row tw:sm:flex-nowrap"
+              data-testid="metric-list-toolbar"
               gap={3}
-              justify="end">
-              {!selectedMetricIds.length && (
-                <>
-                  <Dropdown.Root>
-                    <Button color="link-color" iconTrailing={ChevronDown}>
-                      {statusFilter
-                        ? getStatusLabel(statusFilter)
-                        : t('label.status')}
-                    </Button>
-                    <Dropdown.Popover>
-                      <Dropdown.Menu
-                        selectedKeys={new Set([statusFilter ?? 'all'])}
-                        onAction={(key) =>
-                          handleStatusFilterChange(
-                            key === 'all' ? undefined : (key as EntityStatus)
-                          )
-                        }>
-                        <Dropdown.Item id="all" label={t('label.all')} />
-                        {METRIC_STATUS_FILTER_OPTIONS.map((status) => (
-                          <Dropdown.Item
-                            id={status}
-                            key={status}
-                            label={getStatusLabel(status)}
-                          />
-                        ))}
-                      </Dropdown.Menu>
-                    </Dropdown.Popover>
-                  </Dropdown.Root>
+              justify="between">
+              {selectedMetricIds.length ? (
+                <Box align="center" className="tw:w-full tw:flex-wrap" gap={3}>
+                  <Badge color="brand" size="sm">
+                    {selectedMetricIds.length} {t('label.selected-lowercase')}
+                  </Badge>
+                  <Button
+                    color="link-gray"
+                    data-testid="clear-metric-selection"
+                    iconLeading={XClose}
+                    onPress={() => setSelectedMetricIds([])}>
+                    {t('label.clear')}
+                  </Button>
                   {permission.EditAll && (
                     <Button
-                      className="tw:focus-visible:outline-none! tw:focus-visible:bg-brand-primary_alt"
+                      className="tw:text-brand-primary! tw:hover:text-brand-primary! tw:*:data-icon:text-fg-brand-primary!"
                       color="link-color"
                       data-testid="bulk-edit-metric"
                       iconLeading={Edit03}
                       onPress={handleBulkEdit}>
-                      {t('label.bulk-edit-all')}
+                      {t('label.bulk-edit-count', {
+                        count: selectedMetricIds.length,
+                      })}
                     </Button>
                   )}
-                  <span
-                    aria-hidden="true"
-                    className="tw:h-5 tw:w-px tw:bg-border-secondary"
-                  />
-                  {isTreeMode && hasGroups && (
-                    <>
-                      <Button
-                        color="link-gray"
-                        data-testid="toggle-expand-all"
-                        iconLeading={Rows03}
-                        onPress={
-                          areAllGroupsExpanded ? collapseAll : expandAll
-                        }>
-                        {areAllGroupsExpanded
-                          ? t('label.collapse-all')
-                          : t('label.expand-all')}
-                      </Button>
-                      <span
-                        aria-hidden="true"
-                        className="tw:h-5 tw:w-px tw:bg-border-secondary"
-                      />
-                    </>
-                  )}
-                </>
-              )}
-              <ButtonGroup
-                aria-label={t('label.view')}
-                selectedKeys={new Set([viewMode])}
-                size="sm"
-                onSelectionChange={(keys) => {
-                  const nextMode = Array.from(keys)[0];
-                  if (nextMode === 'card' || nextMode === 'table') {
-                    handleViewModeChange(nextMode);
-                  }
-                }}>
-                <ButtonGroupItem
-                  aria-label={t('label.table')}
-                  data-testid="metric-table-view-button"
-                  iconLeading={Rows03}
-                  id="table"
-                />
-                <ButtonGroupItem
-                  aria-label={t('label.card')}
-                  data-testid="metric-card-view-button"
-                  iconLeading={Grid01}
-                  id="card"
-                />
-              </ButtonGroup>
-              {!selectedMetricIds.length && (
-                <>
-                  <span
-                    aria-hidden="true"
-                    className="tw:h-5 tw:w-px tw:bg-border-secondary"
-                  />
-                  <Dropdown.Root>
+                  {permission.Delete && (
                     <Button
-                      className="tw:focus-visible:outline-none! tw:focus-visible:bg-brand-primary_alt"
-                      color="link-color"
-                      iconLeading={Settings01}>
-                      {t('label.customize')}
+                      color="link-destructive"
+                      data-testid="bulk-delete-metric"
+                      iconLeading={Trash01}
+                      onPress={() => setIsDeleteDialogOpen(true)}>
+                      {t('label.delete')}
                     </Button>
-                    <Dropdown.Popover>
-                      <Box className="tw:p-2" direction="col" gap={1}>
-                        <Button
-                          color="link-color"
-                          onPress={() =>
-                            persistVisibleColumns(
-                              visibleColumns.length ===
-                                METRIC_COLUMN_ORDER.length
-                                ? []
-                                : METRIC_COLUMN_ORDER
+                  )}
+                </Box>
+              ) : (
+                <Input
+                  className="tw:w-full tw:sm:max-w-84"
+                  data-testid="metric-search"
+                  icon={SearchLg}
+                  placeholder={t('label.search-entity', {
+                    entity: t('label.metric-plural'),
+                  })}
+                  value={searchText}
+                  wrapperClassName="tw:w-full tw:sm:max-w-84"
+                  onChange={handleSearchTextChange}
+                />
+              )}
+
+              <Box
+                align="center"
+                className="tw:w-full tw:flex-wrap tw:sm:w-auto tw:sm:flex-nowrap"
+                gap={3}
+                justify="end">
+                {!selectedMetricIds.length && (
+                  <>
+                    <Dropdown.Root>
+                      <Button color="link-color" iconTrailing={ChevronDown}>
+                        {statusFilter
+                          ? getStatusLabel(statusFilter)
+                          : t('label.status')}
+                      </Button>
+                      <Dropdown.Popover>
+                        <Dropdown.Menu
+                          selectedKeys={new Set([statusFilter ?? 'all'])}
+                          onAction={(key) =>
+                            handleStatusFilterChange(
+                              key === 'all' ? undefined : (key as EntityStatus)
                             )
                           }>
-                          {visibleColumns.length === METRIC_COLUMN_ORDER.length
-                            ? t('label.hide-all')
-                            : t('label.view-all')}
+                          <Dropdown.Item id="all" label={t('label.all')} />
+                          {METRIC_STATUS_FILTER_OPTIONS.map((status) => (
+                            <Dropdown.Item
+                              id={status}
+                              key={status}
+                              label={getStatusLabel(status)}
+                            />
+                          ))}
+                        </Dropdown.Menu>
+                      </Dropdown.Popover>
+                    </Dropdown.Root>
+                    {permission.EditAll && (
+                      <Button
+                        className="tw:focus-visible:outline-none! tw:focus-visible:bg-brand-primary_alt"
+                        color="link-color"
+                        data-testid="bulk-edit-metric"
+                        iconLeading={Edit03}
+                        onPress={handleBulkEdit}>
+                        {t('label.bulk-edit-all')}
+                      </Button>
+                    )}
+                    <span
+                      aria-hidden="true"
+                      className="tw:h-5 tw:w-px tw:bg-border-secondary"
+                    />
+                    {isTreeMode && hasGroups && (
+                      <>
+                        <Button
+                          color="link-gray"
+                          data-testid="toggle-expand-all"
+                          iconLeading={Rows03}
+                          onPress={
+                            areAllGroupsExpanded ? collapseAll : expandAll
+                          }>
+                          {areAllGroupsExpanded
+                            ? t('label.collapse-all')
+                            : t('label.expand-all')}
                         </Button>
-                        {METRIC_COLUMN_ORDER.map((columnId) => (
+                        <span
+                          aria-hidden="true"
+                          className="tw:h-5 tw:w-px tw:bg-border-secondary"
+                        />
+                      </>
+                    )}
+                  </>
+                )}
+                <ButtonGroup
+                  aria-label={t('label.view')}
+                  selectedKeys={new Set([viewMode])}
+                  size="sm"
+                  onSelectionChange={(keys) => {
+                    const nextMode = Array.from(keys)[0];
+                    if (nextMode === 'card' || nextMode === 'table') {
+                      handleViewModeChange(nextMode);
+                    }
+                  }}>
+                  <ButtonGroupItem
+                    aria-label={t('label.table')}
+                    data-testid="metric-table-view-button"
+                    iconLeading={Rows03}
+                    id="table"
+                  />
+                  <ButtonGroupItem
+                    aria-label={t('label.card')}
+                    data-testid="metric-card-view-button"
+                    iconLeading={Grid01}
+                    id="card"
+                  />
+                </ButtonGroup>
+                {!selectedMetricIds.length && (
+                  <>
+                    <span
+                      aria-hidden="true"
+                      className="tw:h-5 tw:w-px tw:bg-border-secondary"
+                    />
+                    <Dropdown.Root>
+                      <Button
+                        className="tw:focus-visible:outline-none! tw:focus-visible:bg-brand-primary_alt"
+                        color="link-color"
+                        iconLeading={Settings01}>
+                        {t('label.customize')}
+                      </Button>
+                      <Dropdown.Popover>
+                        <Box className="tw:p-2" direction="col" gap={1}>
                           <Button
-                            color="tertiary"
-                            iconLeading={
-                              visibleColumns.includes(columnId) ? Eye : EyeOff
-                            }
-                            key={columnId}
-                            onPress={() => handleToggleColumn(columnId)}>
-                            {t(METRIC_COLUMN_LABEL_KEYS[columnId])}
+                            color="link-color"
+                            onPress={() =>
+                              persistVisibleColumns(
+                                visibleColumns.length ===
+                                  METRIC_COLUMN_ORDER.length
+                                  ? []
+                                  : METRIC_COLUMN_ORDER
+                              )
+                            }>
+                            {visibleColumns.length ===
+                            METRIC_COLUMN_ORDER.length
+                              ? t('label.hide-all')
+                              : t('label.view-all')}
                           </Button>
-                        ))}
-                      </Box>
-                    </Dropdown.Popover>
-                  </Dropdown.Root>
-                </>
-              )}
+                          {METRIC_COLUMN_ORDER.map((columnId) => (
+                            <Button
+                              color="tertiary"
+                              iconLeading={
+                                visibleColumns.includes(columnId) ? Eye : EyeOff
+                              }
+                              key={columnId}
+                              onPress={() => handleToggleColumn(columnId)}>
+                              {t(METRIC_COLUMN_LABEL_KEYS[columnId])}
+                            </Button>
+                          ))}
+                        </Box>
+                      </Dropdown.Popover>
+                    </Dropdown.Root>
+                  </>
+                )}
+              </Box>
             </Box>
-          </Box>
+          )}
 
           <span aria-live="polite" className="tw:sr-only">
             {isMetricsBusy || isSearchTextPending
