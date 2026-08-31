@@ -17,11 +17,16 @@ import { SearchIndex } from '../enums/search.enum';
 import { LabelType } from '../generated/type/tagLabel';
 import { t } from '../utils/i18next/LocalUtil';
 
+const DOMAINS_DISPLAY_NAME_FIELD = 'domains.displayName';
+const TAGS_TAG_FQN_FIELD = 'tags.tagFQN';
+const TIER_TAG_FQN_FIELD = 'tier.tagFQN';
+const SERVICE_DISPLAY_NAME_FIELD = 'service.displayName';
+
 export const COMMON_DROPDOWN_ITEMS = [
   {
     label: 'label.domain-plural',
     key: EntityFields.DOMAINS,
-    sourceFields: 'domains.displayName',
+    sourceFields: DOMAINS_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.data-product-plural',
@@ -36,17 +41,17 @@ export const COMMON_DROPDOWN_ITEMS = [
   {
     label: 'label.tag',
     key: EntityFields.TAG,
-    sourceFields: 'tags.tagFQN',
+    sourceFields: TAGS_TAG_FQN_FIELD,
   },
   {
     label: 'label.tier',
     key: EntityFields.TIER,
-    sourceFields: 'tier.tagFQN',
+    sourceFields: TIER_TAG_FQN_FIELD,
   },
   {
     label: 'label.service',
     key: EntityFields.SERVICE,
-    sourceFields: 'service.displayName',
+    sourceFields: SERVICE_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.service-type',
@@ -63,7 +68,7 @@ export const DATA_ASSET_DROPDOWN_ITEMS = [
   {
     label: 'label.domain-plural',
     key: EntityFields.DOMAINS,
-    sourceFields: 'domains.displayName',
+    sourceFields: DOMAINS_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.data-product-plural',
@@ -78,12 +83,12 @@ export const DATA_ASSET_DROPDOWN_ITEMS = [
   {
     label: 'label.tag',
     key: EntityFields.TAG,
-    sourceFields: 'tags.tagFQN',
+    sourceFields: TAGS_TAG_FQN_FIELD,
   },
   {
     label: 'label.tier',
     key: EntityFields.TIER,
-    sourceFields: 'tier.tagFQN',
+    sourceFields: TIER_TAG_FQN_FIELD,
   },
   {
     label: 'label.certification',
@@ -93,7 +98,7 @@ export const DATA_ASSET_DROPDOWN_ITEMS = [
   {
     label: 'label.service',
     key: EntityFields.SERVICE,
-    sourceFields: 'service.displayName',
+    sourceFields: SERVICE_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.service-type',
@@ -228,7 +233,7 @@ export const GLOSSARY_DROPDOWN_ITEMS = [
   {
     label: 'label.domain-plural',
     key: EntityFields.DOMAINS,
-    sourceFields: 'domains.displayName',
+    sourceFields: DOMAINS_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.owner-plural',
@@ -238,7 +243,7 @@ export const GLOSSARY_DROPDOWN_ITEMS = [
   {
     label: 'label.tag',
     key: EntityFields.TAG,
-    sourceFields: 'tags.tagFQN',
+    sourceFields: TAGS_TAG_FQN_FIELD,
   },
   {
     label: 'label.glossary-plural',
@@ -255,7 +260,7 @@ export const TAG_DROPDOWN_ITEMS = [
   {
     label: 'label.domain-plural',
     key: EntityFields.DOMAINS,
-    sourceFields: 'domains.displayName',
+    sourceFields: DOMAINS_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.classification',
@@ -268,7 +273,7 @@ export const DATA_PRODUCT_DROPDOWN_ITEMS = [
   {
     label: 'label.domain-plural',
     key: EntityFields.DOMAINS,
-    sourceFields: 'domains.displayName',
+    sourceFields: DOMAINS_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.owner-plural',
@@ -293,17 +298,17 @@ export const DOMAIN_DATAPRODUCT_DROPDOWN_ITEMS = [
   {
     label: 'label.tag',
     key: EntityFields.TAG,
-    sourceFields: 'tags.tagFQN',
+    sourceFields: TAGS_TAG_FQN_FIELD,
   },
   {
     label: 'label.tier',
     key: EntityFields.TIER,
-    sourceFields: 'tier.tagFQN',
+    sourceFields: TIER_TAG_FQN_FIELD,
   },
   {
     label: 'label.service',
     key: EntityFields.SERVICE,
-    sourceFields: 'service.displayName',
+    sourceFields: SERVICE_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.service-type',
@@ -323,7 +328,7 @@ export const GLOSSARY_ASSETS_DROPDOWN_ITEMS = [
   {
     label: 'label.domain-plural',
     key: EntityFields.DOMAINS,
-    sourceFields: 'domains.displayName',
+    sourceFields: DOMAINS_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.owner-plural',
@@ -333,17 +338,17 @@ export const GLOSSARY_ASSETS_DROPDOWN_ITEMS = [
   {
     label: 'label.tag',
     key: EntityFields.TAG,
-    sourceFields: 'tags.tagFQN',
+    sourceFields: TAGS_TAG_FQN_FIELD,
   },
   {
     label: 'label.tier',
     key: EntityFields.TIER,
-    sourceFields: 'tier.tagFQN',
+    sourceFields: TIER_TAG_FQN_FIELD,
   },
   {
     label: 'label.service',
     key: EntityFields.SERVICE,
-    sourceFields: 'service.displayName',
+    sourceFields: SERVICE_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.service-type',
@@ -363,7 +368,7 @@ export const TAG_ASSETS_DROPDOWN_ITEMS = [
   {
     label: 'label.domain-plural',
     key: EntityFields.DOMAINS,
-    sourceFields: 'domains.displayName',
+    sourceFields: DOMAINS_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.owner-plural',
@@ -373,17 +378,17 @@ export const TAG_ASSETS_DROPDOWN_ITEMS = [
   {
     label: 'label.tag',
     key: EntityFields.TAG,
-    sourceFields: 'tags.tagFQN',
+    sourceFields: TAGS_TAG_FQN_FIELD,
   },
   {
     label: 'label.tier',
     key: EntityFields.TIER,
-    sourceFields: 'tier.tagFQN',
+    sourceFields: TIER_TAG_FQN_FIELD,
   },
   {
     label: 'label.service',
     key: EntityFields.SERVICE,
-    sourceFields: 'service.displayName',
+    sourceFields: SERVICE_DISPLAY_NAME_FIELD,
   },
   {
     label: 'label.service-type',
@@ -417,7 +422,7 @@ export const KNOWLEDGE_PAGE_DROPDOWN_ITEMS = [
   {
     label: t('label.tag'),
     key: EntityFields.TAG,
-    sourceFields: 'tags.tagFQN',
+    sourceFields: TAGS_TAG_FQN_FIELD,
   },
 ];
 
