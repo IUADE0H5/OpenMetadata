@@ -131,10 +131,11 @@ export const useApplicationStore = create<ApplicationStore>()((set, get) => ({
       // its own <Route path="/callback"> that renders regardless of
       // childElement, AppRouter's else branch owns <Route
       // path="/auth/callback"> → SamlCallback, and /silent-callback is
-      // now handled by the pre-AuthProvider short-circuit in index.tsx
-      // (initializeAuthState never fires there). A short unauthenticated
-      // frame on /callback would still be masked by OidcCallbackWrapper
-      // rendering above the catch-all `path="*"`, so no blink returns.
+      // served by its own HTML entry (`silent-callback.html`) rather
+      // than the SPA shell, so this code path is never entered on that
+      // URL. A short unauthenticated frame on /callback would still be
+      // masked by OidcCallbackWrapper rendering above the catch-all
+      // `path="*"`, so no blink returns.
 
       let token = '';
 

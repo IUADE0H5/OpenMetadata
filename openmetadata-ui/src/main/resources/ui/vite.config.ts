@@ -343,6 +343,21 @@ export default defineConfig(async ({ mode }) => {
       // count, and we're not the right project to be carrying it.
       modulePreload: { polyfill: false },
       rollupOptions: {
+        // `/silent-callback` renders a dedicated HTML entry so its
+        // dependency graph is exactly `oidc-client` + the tiny
+        // `silentCallbackEntry.ts` — no React, no antd, none of the
+        // shared app-utils that Rollup's `experimentalMinChunkSize`
+        // merger was folding into the small SPA entry (which pulled
+        // `vendor-antd` in as a `<link rel=modulepreload>` sibling and
+        // broke scenario 7 of SsoScenarios.spec). Playwright's coarse
+        // E2E build keeps a single entry — the merged
+        // `app-e2e-runtime`/`vendor-e2e-framework` layout depends on it.
+        input: isPlaywrightBundle
+          ? undefined
+          : {
+              main: path.resolve(__dirname, 'index.html'),
+              silentCallback: path.resolve(__dirname, 'silent-callback.html'),
+            },
         onwarn(warning, warn) {
           if (isPlaywrightBundle && warning.code === 'CIRCULAR_CHUNK') {
             throw new Error(warning.message);

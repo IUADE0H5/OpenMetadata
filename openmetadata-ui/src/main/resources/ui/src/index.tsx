@@ -11,10 +11,6 @@
  *  limitations under the License.
  */
 
-import React from 'react';
-import { createRoot } from 'react-dom/client';
-import SilentCallback from './components/Auth/SilentCallback';
-import { isSilentCallbackRoute } from './components/Auth/SilentCallback/isSilentCallbackRoute';
 import { getBasePath } from './utils/HistoryUtils';
 import { isSsoTestLoginPopup } from './utils/SsoTestLoginPopup';
 
@@ -50,55 +46,45 @@ if (!container) {
   throw new Error('Failed to find the root element');
 }
 
-const root = createRoot(container);
-const silentCallbackRoute = isSilentCallbackRoute();
-
-// Three mutually-exclusive entry paths, dispatched from a single spot so the
-// bundle graph reflects the intent:
+// Two mutually-exclusive entry paths, each dispatched via a dynamic
+// `import()` so this entry file's static graph stays small. The silent-
+// refresh iframe used to be a third branch here, but the URL now serves
+// its own HTML (`silent-callback.html` — see `OpenMetadataAssetServlet`
+// and `vite.config.ts`) so the SPA entry chunk never has to carry
+// `oidc-client` or a `SilentCallback` React tree.
 //
-//   1. Silent-refresh iframe — render the tiny SilentCallback shim and
-//      nothing else. AppRoot + its deps stay off this chunk (scenario 7 of
-//      SsoScenarios.spec caps the JS payload on `/silent-callback`).
-//   2. SSO "Test Login" popup — dynamic import the test-login bootstrap so
-//      it never touches the real AuthProvider or session storage.
-//   3. Regular app boot — dynamic import BootstrapApp, which pulls in
+//   1. SSO "Test Login" popup — dynamic-import the test-login bootstrap
+//      so it never touches the real AuthProvider or session storage.
+//   2. Regular app boot — dynamic-import `BootstrapApp`, which pulls in
 //      AppRoot, styles, i18n, and the core-components package.
-if (silentCallbackRoute) {
-  root.render(
-    <React.StrictMode>
-      <SilentCallback />
-    </React.StrictMode>
-  );
-} else if (isSsoTestLoginPopup()) {
+if (isSsoTestLoginPopup()) {
   import('./components/SettingsSso/SsoTestLogin/ssoTestCallbackBootstrap')
     .then((module) => module.runSsoTestCallback())
     // If the chunk fails to load, close the popup so the opener doesn't hang.
     .catch(() => globalThis.close());
 } else {
   recordPlaywrightAppBoot();
-  void import('./BootstrapApp').then(({ bootstrapApp }) => bootstrapApp(root));
+  void import('./BootstrapApp').then(({ bootstrapApp }) =>
+    bootstrapApp(container)
+  );
 }
 
 // Service-worker lifecycle -- registers the asset cache in prod, unregisters
-// any stale one in dev where Vite HMR fights it. Skipped on the
-// silent-callback path: the iframe has no need for the cache, and
-// unregistering there would tear down the parent tab's cached assets.
-if (!silentCallbackRoute) {
-  if (import.meta.env.DEV) {
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker
-        .getRegistrations()
-        .then((registrations) =>
-          registrations.forEach((registration) => registration.unregister())
-        );
-    }
-  } else if ('serviceWorker' in navigator && 'indexedDB' in globalThis) {
-    window.addEventListener('load', () => {
-      const basePath = getBasePath();
-      const serviceWorkerPath = basePath
-        ? `${basePath}/app-worker.js`
-        : '/app-worker.js';
-      navigator.serviceWorker.register(serviceWorkerPath);
-    });
+// any stale one in dev where Vite HMR fights it.
+if (import.meta.env.DEV) {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker
+      .getRegistrations()
+      .then((registrations) =>
+        registrations.forEach((registration) => registration.unregister())
+      );
   }
+} else if ('serviceWorker' in navigator && 'indexedDB' in globalThis) {
+  window.addEventListener('load', () => {
+    const basePath = getBasePath();
+    const serviceWorkerPath = basePath
+      ? `${basePath}/app-worker.js`
+      : '/app-worker.js';
+    navigator.serviceWorker.register(serviceWorkerPath);
+  });
 }
