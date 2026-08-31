@@ -19,10 +19,7 @@ import {
   ProviderCredentials,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import {
-  SsoProviderFixture,
-  SsoProviderSlug,
-} from './fixture';
+import { SsoProviderFixture, SsoProviderSlug } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 import type { ProviderHelper } from './index';
 import { fetchIdpX509Certificate } from './saml-metadata';
@@ -209,7 +206,6 @@ export const keycloakSamlProviderFixture: SsoProviderFixture = {
       },
     };
   },
-
 
   async performLogin(page: Page) {
     await page.goto('/signin');

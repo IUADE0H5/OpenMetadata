@@ -18,7 +18,7 @@ import {
   ProviderConfigOverride,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import {  SsoProviderFixture } from './fixture';
+import { SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 import { ProviderHelper } from './index';
 import {
@@ -124,7 +124,6 @@ export const keycloakOidcConfidentialProviderFixture: SsoProviderFixture = {
       },
     };
   },
-
 
   async performLogin(page: Page) {
     await page.goto('/signin');

@@ -16,7 +16,7 @@ import {
   fetchSecurityConfig,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import {  SsoProviderFixture } from './fixture';
+import { SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 
 // Credentials for the LDIF-seeded user. Must match
@@ -126,7 +126,6 @@ export const ldapProviderFixture: SsoProviderFixture = {
       },
     };
   },
-
 
   async performLogin(page: Page) {
     await page.goto('/signin');

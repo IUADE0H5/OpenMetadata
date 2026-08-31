@@ -16,7 +16,7 @@ import {
   fetchSecurityConfig,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import {  SsoProviderFixture } from './fixture';
+import { SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 
 // Static admin credentials used by every Basic-provider suite. The seeded
@@ -96,7 +96,6 @@ export const basicProviderFixture: SsoProviderFixture = {
       },
     };
   },
-
 
   async performLogin(page: Page) {
     await page.goto('/signin');

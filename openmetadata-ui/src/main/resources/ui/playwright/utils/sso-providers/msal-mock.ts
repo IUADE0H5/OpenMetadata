@@ -37,7 +37,7 @@ import {
   mintAdminRestoreToken,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import {  SsoProviderFixture } from './fixture';
+import { SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 import { mintMockJwt } from './mock-token';
 
@@ -295,7 +295,6 @@ export const msalMockProviderFixture: SsoProviderFixture = {
       },
     };
   },
-
 
   async performLogin(page: Page) {
     // The mock must be installed *before* the first navigation so the

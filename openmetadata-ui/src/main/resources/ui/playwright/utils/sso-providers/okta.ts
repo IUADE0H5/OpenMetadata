@@ -19,7 +19,7 @@ import {
   ProviderCredentials,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import {  SsoProviderFixture } from './fixture';
+import { SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 import { ProviderHelper } from './index';
 
@@ -135,7 +135,6 @@ export const oktaProviderFixture: SsoProviderFixture = {
       },
     };
   },
-
 
   async performLogin(page: Page) {
     await page.goto('/signin');
