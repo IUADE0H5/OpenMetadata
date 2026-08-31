@@ -73,6 +73,23 @@ const trackSuccessfulRefreshes = (
 };
 
 for (const fixture of FIXTURES) {
+  // Skip the whole leg at module-load time when the fixture reports the
+  // env is not shaped for it (e.g. Okta with no OKTA_CLIENT_ID, Keycloak
+  // with no KEYCLOAK_SAML_BASE_URL). Filtering here — instead of a
+  // `test.skip()` inside `beforeAll` — keeps the report free of noise
+  // "skipped" rows and satisfies `playwright/no-skipped-test`. The
+  // reason is emitted so a missing IdP env var still shows up in the CI
+  // log rather than disappearing silently.
+  if (!fixture.isAvailable()) {
+    process.stderr.write(
+      `[SsoScenarios] Skipping ${fixture.slug}: ${
+        fixture.unavailableReason?.() ??
+        'fixture reports isAvailable() === false'
+      }\n`
+    );
+    continue;
+  }
+
   test.describe(
     `SSO / ${fixture.name} [${fixture.slug}]`,
     { tag: [`@${fixture.slug}`, '@sso-matrix'] },
@@ -84,45 +101,18 @@ for (const fixture of FIXTURES) {
       // backend anyway, so retries never bought us anything here.
       test.describe.configure({ retries: 0 });
 
-      // Every scenario in this describe block is skipped as a group if the
-      // fixture reports it isn't runnable in the current env — e.g. Okta with
-      // no OKTA_CLIENT_ID, Keycloak with no KEYCLOAK_SAML_BASE_URL. Runs before
-      // configureBackend so we don't waste an admin login on an unusable row.
-      test.beforeAll(() => {
-        if (!fixture.isAvailable()) {
-          test.skip(
-            true,
-            `Fixture unavailable: ${
-              fixture.unavailableReason?.() ?? 'no reason given'
-            }`
-          );
-        }
-      });
-
       let restoreConfig: (() => Promise<void>) | undefined;
       // Describe-scoped admin session. `configureBackend`'s returned
       // restore closure captures the apiContext it received, so disposing
       // early (in a beforeAll finally) makes the afterAll restore hit a
       // dead context with "apiRequestContext.put: Target page, context or
-      // browser has been closed". Keep both apiContext and afterAction
+      // browser has been closed". `sharedAfterAction` keeps that context
       // alive for the whole describe; dispose only from afterAll AFTER
-      // restore runs. Additionally: once configureBackend swaps the
-      // backend away from Basic, /api/v1/auth/login no longer accepts the
-      // seeded admin creds — scenarios 8/9 must reuse this same context
-      // instead of re-performing admin login.
-      let sharedApiContext:
-        | import('@playwright/test').APIRequestContext
-        | undefined;
+      // restore runs.
       let sharedAfterAction: (() => Promise<void>) | undefined;
-      // PAT minted BEFORE the provider swap; usable across the swap by
-      // scenarios 8/9 to authenticate the broken-config PUT after the
-      // session-bound sharedApiContext has been 401'd. See
-      // `mintAdminRestoreToken` in ssoAuth.ts.
-      let sharedRestoreToken: string | undefined;
 
       test.beforeAll(async ({ browser }) => {
         const { apiContext, afterAction } = await performAdminLogin(browser);
-        sharedApiContext = apiContext;
         sharedAfterAction = afterAction;
         try {
           // Mint a PAT and snapshot BEFORE the provider swap. The current
@@ -131,9 +121,10 @@ for (const fixture of FIXTURES) {
           // stays verifiable across the swap — see `mintAdminRestoreToken`
           // in ssoAuth.ts. Without this, afterAll's restore hits 401 on
           // every non-Basic leg and fails the whole describe.
+          let restoreToken: string | undefined;
           let snapshot: SecurityConfigSnapshot | undefined;
           try {
-            sharedRestoreToken = await mintAdminRestoreToken(apiContext);
+            restoreToken = await mintAdminRestoreToken(apiContext);
             snapshot = await fetchSecurityConfig(apiContext);
           } catch {
             // Non-fatal: fall back to the fixture-owned restore below. Some
@@ -144,8 +135,8 @@ for (const fixture of FIXTURES) {
 
           const configured = await fixture.configureBackend(apiContext);
           restoreConfig = async () => {
-            if (sharedRestoreToken && snapshot) {
-              const patContext = await getAuthContext(sharedRestoreToken);
+            if (restoreToken && snapshot) {
+              const patContext = await getAuthContext(restoreToken);
               try {
                 await restoreSecurityConfig(patContext, snapshot);
 
@@ -163,7 +154,6 @@ for (const fixture of FIXTURES) {
           // If configureBackend failed, we still own the admin session —
           // release it so the leg fails fast without leaking the worker.
           await afterAction();
-          sharedApiContext = undefined;
           sharedAfterAction = undefined;
           throw err;
         }
@@ -219,161 +209,141 @@ for (const fixture of FIXTURES) {
       // its axios 401 interceptor) must detect the expired token and drive a
       // /auth/refresh handshake, then land the user back on the authenticated
       // shell without ever bouncing through /signin.
-      test('silent refresh recovers an expired token', async ({ page }) => {
-        test.slow();
+      //
+      // Only Basic/LDAP/SAML/confidential-OIDC drive their Renewer through
+      // OM's `/api/v1/auth/refresh` — MSAL/Auth0/OIDC-public/Okta run silent
+      // refresh entirely inside the browser SDK, so the `waitForResponse` on
+      // `/auth/refresh` below would hang for those fixtures. Gate at
+      // registration time (rather than a runtime `test.skip()`) so
+      // SDK-driven fixtures never enrol this scenario in the first place.
+      if (fixture.usesBackendRefresh) {
+        test('silent refresh recovers an expired token', async ({ page }) => {
+          test.slow();
 
-        // Only Basic/LDAP/SAML/confidential-OIDC drive their Renewer through
-        // OM's `/api/v1/auth/refresh` — MSAL/Auth0/OIDC-public/Okta run
-        // silent refresh entirely inside the browser SDK, so this
-        // `waitForResponse` on `/auth/refresh` would time out. See
-        // `usesBackendRefresh` in fixture.ts.
-        if (!fixture.usesBackendRefresh) {
-          test.skip(
-            true,
-            `${fixture.slug} refreshes via SDK, no observable /auth/refresh call`
+          await fixture.performLogin(page);
+          await fixture.forceTokenExpiry(page);
+
+          const refreshPromise = page.waitForResponse(
+            (resp) =>
+              resp.url().includes(AUTH_REFRESH_PATH) && resp.status() === 200,
+            { timeout: 30_000 }
           );
 
-          return;
-        }
+          // Reload rather than a same-URL goto: reload guarantees the coordinator
+          // reinstalls and inspects the stored token, which is what the "expired
+          // token on cold-load" contract actually exercises.
+          await page.reload({ waitUntil: 'domcontentloaded' });
 
-        await fixture.performLogin(page);
-        await fixture.forceTokenExpiry(page);
+          await refreshPromise;
 
-        const refreshPromise = page.waitForResponse(
-          (resp) =>
-            resp.url().includes(AUTH_REFRESH_PATH) && resp.status() === 200,
-          { timeout: 30_000 }
-        );
-
-        // Reload rather than a same-URL goto: reload guarantees the coordinator
-        // reinstalls and inspects the stored token, which is what the "expired
-        // token on cold-load" contract actually exercises.
-        await page.reload({ waitUntil: 'domcontentloaded' });
-
-        await refreshPromise;
-
-        await expect(page.getByTestId(APP_BAR_HOME_TESTID)).toBeVisible({
-          timeout: 30_000,
+          await expect(page.getByTestId(APP_BAR_HOME_TESTID)).toBeVisible({
+            timeout: 30_000,
+          });
+          expect(page.url()).not.toContain('/signin');
         });
-        expect(page.url()).not.toContain('/signin');
-      });
+      }
 
       // Scenario 4 — a second tab in the same browser context inherits the
       // authenticated session via shared localStorage without a second IdP
       // handshake. Fixtures whose auth is per-page (Basic, LDAP) opt out via
-      // supportsCrossTab.
-      test('multi-tab shares auth state after login in one tab', async ({
-        browser,
-      }) => {
-        test.slow();
+      // supportsCrossTab. Gate at registration time so the runtime
+      // `test.skip()` is never needed.
+      if (fixture.supportsCrossTab) {
+        test('multi-tab shares auth state after login in one tab', async ({
+          browser,
+        }) => {
+          test.slow();
 
-        if (!fixture.supportsCrossTab) {
-          test.skip(
-            true,
-            `${fixture.slug} does not mint tokens with cross-tab storage`
-          );
-        }
+          const context = await browser.newContext();
+          try {
+            const tabA = await context.newPage();
+            await fixture.performLogin(tabA);
 
-        const context = await browser.newContext();
-        try {
-          const tabA = await context.newPage();
-          await fixture.performLogin(tabA);
+            const tabB = await context.newPage();
+            await tabB.goto('/', { waitUntil: 'domcontentloaded' });
 
-          const tabB = await context.newPage();
-          await tabB.goto('/', { waitUntil: 'domcontentloaded' });
-
-          await expect(tabB.getByTestId(APP_BAR_HOME_TESTID)).toBeVisible({
-            timeout: 20_000,
-          });
-        } finally {
-          await context.close();
-        }
-      });
+            await expect(tabB.getByTestId(APP_BAR_HOME_TESTID)).toBeVisible({
+              timeout: 20_000,
+            });
+          } finally {
+            await context.close();
+          }
+        });
+      }
 
       // Scenario 5 — CrossTabLock (Web Locks + BroadcastChannel) coalesces
       // concurrent refresh attempts to exactly one 200. The follower tab does
       // NOT retry against the server: it resolves off the leader's broadcast,
       // so only one 200 hits the network across both tabs.
-      test('cross-tab refresh coalesces to a single /auth/refresh call', async ({
-        browser,
-      }) => {
-        test.slow();
+      // Only meaningful when BOTH capabilities hold: the CrossTabLock
+      // presumes cross-tab shared storage, and the "single 200 hits the
+      // network" assertion presumes /auth/refresh is observable. Gate at
+      // registration time so SDK-refresh or per-tab fixtures never enrol.
+      if (fixture.supportsCrossTab && fixture.usesBackendRefresh) {
+        test('cross-tab refresh coalesces to a single /auth/refresh call', async ({
+          browser,
+        }) => {
+          test.slow();
 
-        if (!fixture.supportsCrossTab) {
-          test.skip(true, `${fixture.slug} skipped: no cross-tab lock`);
-        }
-
-        // Same reasoning as scenario 3 — SDK-driven refresh produces no
-        // observable /auth/refresh call for MSAL/Auth0/OIDC-public/Okta,
-        // so the "single 200 hits the network" assertion trivially passes
-        // (0 calls) but tells us nothing about the CrossTabLock.
-        if (!fixture.usesBackendRefresh) {
-          test.skip(
-            true,
-            `${fixture.slug} refreshes via SDK, no observable /auth/refresh call to coalesce`
-          );
-
-          return;
-        }
-
-        const context = await browser.newContext();
-        try {
-          const tabA = await context.newPage();
-          await fixture.performLogin(tabA);
-
-          const tabB = await context.newPage();
-          await tabB.goto('/', { waitUntil: 'domcontentloaded' });
-          await expect(tabB.getByTestId(APP_BAR_HOME_TESTID)).toBeVisible({
-            timeout: 20_000,
-          });
-
-          const refreshCalls: string[] = [];
-          const stopA = trackSuccessfulRefreshes(tabA, refreshCalls);
-          const stopB = trackSuccessfulRefreshes(tabB, refreshCalls);
-
+          const context = await browser.newContext();
           try {
-            // Force both stored tokens expired before either tab is asked to
-            // do anything auth-gated, so the race is between their coordinator
-            // boots — which is what the CrossTabLock is meant to serialize.
-            await Promise.all([
-              fixture.forceTokenExpiry(tabA),
-              fixture.forceTokenExpiry(tabB),
-            ]);
+            const tabA = await context.newPage();
+            await fixture.performLogin(tabA);
 
-            // Reload both tabs simultaneously — each coordinator wakes with an
-            // expired token and races for the Web Lock.
-            await Promise.all([
-              tabA.reload({ waitUntil: 'domcontentloaded' }),
-              tabB.reload({ waitUntil: 'domcontentloaded' }),
-            ]);
+            const tabB = await context.newPage();
+            await tabB.goto('/', { waitUntil: 'domcontentloaded' });
+            await expect(tabB.getByTestId(APP_BAR_HOME_TESTID)).toBeVisible({
+              timeout: 20_000,
+            });
 
-            await Promise.all([
-              expect(tabA.getByTestId(APP_BAR_HOME_TESTID)).toBeVisible({
-                timeout: 30_000,
-              }),
-              expect(tabB.getByTestId(APP_BAR_HOME_TESTID)).toBeVisible({
-                timeout: 30_000,
-              }),
-            ]);
+            const refreshCalls: string[] = [];
+            const stopA = trackSuccessfulRefreshes(tabA, refreshCalls);
+            const stopB = trackSuccessfulRefreshes(tabB, refreshCalls);
 
-            // The follower resolves off a BroadcastChannel notification, not
-            // the leader's own response, so poll briefly for the counter to
-            // settle instead of asserting on the instant the leader completes.
-            await expect
-              .poll(() => refreshCalls.length, { timeout: 10_000 })
-              .toBeGreaterThan(0);
+            try {
+              // Force both stored tokens expired before either tab is asked to
+              // do anything auth-gated, so the race is between their coordinator
+              // boots — which is what the CrossTabLock is meant to serialize.
+              await Promise.all([
+                fixture.forceTokenExpiry(tabA),
+                fixture.forceTokenExpiry(tabB),
+              ]);
+
+              // Reload both tabs simultaneously — each coordinator wakes with an
+              // expired token and races for the Web Lock.
+              await Promise.all([
+                tabA.reload({ waitUntil: 'domcontentloaded' }),
+                tabB.reload({ waitUntil: 'domcontentloaded' }),
+              ]);
+
+              await Promise.all([
+                expect(tabA.getByTestId(APP_BAR_HOME_TESTID)).toBeVisible({
+                  timeout: 30_000,
+                }),
+                expect(tabB.getByTestId(APP_BAR_HOME_TESTID)).toBeVisible({
+                  timeout: 30_000,
+                }),
+              ]);
+
+              // The follower resolves off a BroadcastChannel notification, not
+              // the leader's own response, so poll briefly for the counter to
+              // settle instead of asserting on the instant the leader completes.
+              await expect
+                .poll(() => refreshCalls.length, { timeout: 10_000 })
+                .toBeGreaterThan(0);
+            } finally {
+              stopA();
+              stopB();
+            }
+
+            expect(refreshCalls).toHaveLength(1);
+            expect(tabA.url()).not.toContain('/signin');
+            expect(tabB.url()).not.toContain('/signin');
           } finally {
-            stopA();
-            stopB();
+            await context.close();
           }
-
-          expect(refreshCalls).toHaveLength(1);
-          expect(tabA.url()).not.toContain('/signin');
-          expect(tabB.url()).not.toContain('/signin');
-        } finally {
-          await context.close();
-        }
-      });
+        });
+      }
 
       // Scenario 6 — cold-load with an expired stored token must render the
       // authenticated shell within budget. Real IdPs vary, so the ceiling is
@@ -402,49 +372,51 @@ for (const fixture of FIXTURES) {
       // handoff and MUST NOT boot the full app. If AppRoot ever mounted here
       // (regression: someone re-adds it under AuthProvider), a >2 MB main
       // chunk would load and the sidebar shell would attach — this test
-      // catches both.
-      test('silent-callback iframe does not load the full app', async ({
-        page,
-      }) => {
-        if (!fixture.supportsSilentCallback) {
-          test.skip(
-            true,
-            `${fixture.slug} does not use the silent-callback iframe`
-          );
+      // catches both. Only OIDC-public exercises this route; every other
+      // provider either never issues a silent-refresh iframe (Basic/LDAP)
+      // or renews via its own SDK (MSAL/Auth0/Okta/SAML), so registration
+      // is gated at the fixture level.
+      if (fixture.supportsSilentCallback) {
+        test('silent-callback iframe does not load the full app', async ({
+          page,
+        }) => {
+          const responses: Array<{ url: string; size: number }> = [];
+          page.on('response', async (resp) => {
+            if (
+              resp.url().endsWith('.js') ||
+              resp.url().endsWith('.js.map') ||
+              resp.url().endsWith('.css')
+            ) {
+              const body = await resp.body().catch(() => null);
+              responses.push({ url: resp.url(), size: body?.length ?? 0 });
+            }
+          });
 
-          return;
-        }
+          // `waitUntil: 'load'` fires once every top-level resource — the
+          // entry chunk plus every `<link rel=modulepreload>` sibling the
+          // built index.html emits — has settled. That is the exact
+          // response set the bundle-size assertion below inspects, so it
+          // is the correct synchronization point (no wall-clock sleep, no
+          // banned `networkidle`). oidc-client's own async work is fire-
+          // and-forget inside a hidden iframe and is not asserted on.
+          await page.goto('/silent-callback', { waitUntil: 'load' });
 
-        const responses: Array<{ url: string; size: number }> = [];
-        page.on('response', async (resp) => {
-          if (
-            resp.url().endsWith('.js') ||
-            resp.url().endsWith('.js.map') ||
-            resp.url().endsWith('.css')
-          ) {
-            const body = await resp.body().catch(() => null);
-            responses.push({ url: resp.url(), size: body?.length ?? 0 });
-          }
+          // Full-app shell markers MUST NOT be present in the iframe DOM.
+          await expect(
+            page.getByTestId(APP_BAR_HOME_TESTID)
+          ).not.toBeAttached();
+          await expect(page.locator('#appbar')).not.toBeAttached();
+
+          // Bundle-size budget: no single JS chunk larger than 500 KB should
+          // load for this route. The full-app bundle is >2 MB, so exceeding
+          // 500 KB means AppRoot mounted. Threshold picked to be loose enough
+          // for oidc-client itself and to survive Vite's hot-reload wrappers
+          // in dev; tighten if it proves too permissive.
+          const largeChunks = responses.filter((r) => r.size > 500_000);
+
+          expect(largeChunks).toEqual([]);
         });
-
-        await page.goto('/silent-callback');
-        // Wait a couple hundred ms for oidc-client to fire signinSilentCallback
-        // and any async work to complete; then snapshot the DOM.
-        await page.waitForTimeout(500);
-
-        // Full-app shell markers MUST NOT be present in the iframe DOM.
-        await expect(page.getByTestId(APP_BAR_HOME_TESTID)).not.toBeAttached();
-        await expect(page.locator('#appbar')).not.toBeAttached();
-
-        // Bundle-size budget: no single JS chunk larger than 500 KB should
-        // load for this route. The full-app bundle is >2 MB, so exceeding
-        // 500 KB means AppRoot mounted. Threshold picked to be loose enough
-        // for oidc-client itself and to survive Vite's hot-reload wrappers
-        // in dev; tighten if it proves too permissive.
-        const largeChunks = responses.filter((r) => r.size > 500_000);
-
-        expect(largeChunks).toEqual([]);
-      });
+      }
 
       // Scenarios 8 & 9 previously asserted a ConfigErrorPage short-circuit
       // that hard-blocked the whole UI on any missing top-level field. Per
