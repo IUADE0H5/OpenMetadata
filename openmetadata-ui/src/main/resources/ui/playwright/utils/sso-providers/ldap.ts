@@ -16,7 +16,7 @@ import {
   fetchSecurityConfig,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import { SsoBrokenConfigureResult, SsoProviderFixture } from './fixture';
+import {  SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 
 // Credentials for the LDIF-seeded user. Must match
@@ -107,11 +107,6 @@ export const ldapProviderFixture: SsoProviderFixture = {
   supportsCrossTab: false,
   supportsSelfSignup: false,
   supportsSilentCallback: false,
-  // LDAP server rejects both empty-string and delete on
-  // `ldapConfiguration.host` (400 "must not be null" / 500 "Failed to
-  // reload security system"). No client-invalid-server-valid config
-  // exists — verified locally against openldap + docker OM.
-  supportsBrokenConfigCheck: false,
   usesBackendRefresh: true,
 
   // The compose service is expected up when this profile runs; when it is
@@ -132,22 +127,6 @@ export const ldapProviderFixture: SsoProviderFixture = {
     };
   },
 
-  async configureBrokenBackend(
-    apiContext: APIRequestContext
-  ): Promise<SsoBrokenConfigureResult> {
-    const snapshot = await fetchSecurityConfig(apiContext);
-    await applyProviderConfig(apiContext, snapshot, buildBrokenConfig());
-
-    return {
-      restore: async () => {
-        await restoreSecurityConfig(apiContext, snapshot);
-      },
-      // Validator must name the missing LDAP field before the bind attempt
-      // — otherwise the operator sees a cryptic "connection refused" from
-      // deep in the LDAP client and has no idea which knob to turn.
-      expectedWarningPattern: /host/,
-    };
-  },
 
   async performLogin(page: Page) {
     await page.goto('/signin');

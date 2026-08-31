@@ -19,7 +19,7 @@ import {
   ProviderCredentials,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import { SsoBrokenConfigureResult, SsoProviderFixture } from './fixture';
+import {  SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 import { ProviderHelper } from './index';
 
@@ -114,7 +114,6 @@ export const oktaProviderFixture: SsoProviderFixture = {
   supportsCrossTab: true,
   supportsSelfSignup: true,
   supportsSilentCallback: false,
-  supportsBrokenConfigCheck: true,
   usesBackendRefresh: false,
 
   signInButtonPattern: /(sign in|log in) with Okta/i,
@@ -137,30 +136,6 @@ export const oktaProviderFixture: SsoProviderFixture = {
     };
   },
 
-  async configureBrokenBackend(
-    apiContext: APIRequestContext
-  ): Promise<SsoBrokenConfigureResult> {
-    const snapshot = await fetchSecurityConfig(apiContext);
-    const payload = buildConfigPayload();
-    // Empty top-level `clientId` — nested `oidcConfiguration.*` is stripped
-    // from the public config endpoint, so the client validator only sees
-    // top-level fields. Server accepts non-null empty string; client's
-    // `isFieldMissing` flags it.
-    const authConfig = payload.authenticationConfiguration as Record<
-      string,
-      unknown
-    >;
-    authConfig.clientId = '';
-
-    await applyProviderConfig(apiContext, snapshot, payload);
-
-    return {
-      restore: async () => {
-        await restoreSecurityConfig(apiContext, snapshot);
-      },
-      expectedWarningPattern: /clientId/,
-    };
-  },
 
   async performLogin(page: Page) {
     await page.goto('/signin');

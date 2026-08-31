@@ -18,7 +18,7 @@ import {
   ProviderConfigOverride,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import { SsoBrokenConfigureResult, SsoProviderFixture } from './fixture';
+import {  SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 import { ProviderHelper } from './index';
 import {
@@ -106,7 +106,6 @@ export const keycloakOidcConfidentialProviderFixture: SsoProviderFixture = {
   supportsCrossTab: true,
   supportsSelfSignup: true,
   supportsSilentCallback: false,
-  supportsBrokenConfigCheck: true,
   usesBackendRefresh: true,
 
   signInButtonPattern: /(sign in|log in) with Keycloak/i,
@@ -126,33 +125,6 @@ export const keycloakOidcConfidentialProviderFixture: SsoProviderFixture = {
     };
   },
 
-  async configureBrokenBackend(
-    apiContext: APIRequestContext
-  ): Promise<SsoBrokenConfigureResult> {
-    const snapshot = await fetchSecurityConfig(apiContext);
-    const payload = buildConfigPayload();
-    // Confidential OIDC's client validator checks `clientId`
-    // (validateAuthFieldsDetailed's REQUIRED_FIELDS_BY_PROVIDER) but
-    // NOT `oidcConfiguration.responseType`, so the responseType='invalid'
-    // trick that works for the public client doesn't fire ConfigErrorPage
-    // here. Set clientId to empty-string instead — server accepts non-null,
-    // client `isFieldMissing` flags it. Deleting the field fails the
-    // server's `@NotNull` first.
-    const authConfig = payload.authenticationConfiguration as Record<
-      string,
-      unknown
-    >;
-    authConfig.clientId = '';
-
-    await applyProviderConfig(apiContext, snapshot, payload);
-
-    return {
-      restore: async () => {
-        await restoreSecurityConfig(apiContext, snapshot);
-      },
-      expectedWarningPattern: /clientId/,
-    };
-  },
 
   async performLogin(page: Page) {
     await page.goto('/signin');

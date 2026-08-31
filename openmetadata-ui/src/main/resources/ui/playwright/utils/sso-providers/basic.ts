@@ -16,7 +16,7 @@ import {
   fetchSecurityConfig,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import { SsoBrokenConfigureResult, SsoProviderFixture } from './fixture';
+import {  SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 
 // Static admin credentials used by every Basic-provider suite. The seeded
@@ -80,9 +80,6 @@ export const basicProviderFixture: SsoProviderFixture = {
   supportsCrossTab: false,
   supportsSelfSignup: false,
   supportsSilentCallback: false,
-  // Basic's client validator only requires `provider`; there is no field
-  // we can set to a client-invalid-yet-server-valid value.
-  supportsBrokenConfigCheck: false,
   usesBackendRefresh: true,
 
   isAvailable: () => true, // Always available — no external deps
@@ -100,21 +97,6 @@ export const basicProviderFixture: SsoProviderFixture = {
     };
   },
 
-  async configureBrokenBackend(
-    apiContext: APIRequestContext
-  ): Promise<SsoBrokenConfigureResult> {
-    const snapshot = await fetchSecurityConfig(apiContext);
-    await applyProviderConfig(apiContext, snapshot, buildBrokenConfig());
-
-    return {
-      restore: async () => {
-        await restoreSecurityConfig(apiContext, snapshot);
-      },
-      // The validator (added in commit 9) must name the missing field so
-      // engineers see *what* is wrong before the IdP throws a cryptic error.
-      expectedWarningPattern: /providerName/,
-    };
-  },
 
   async performLogin(page: Page) {
     await page.goto('/signin');

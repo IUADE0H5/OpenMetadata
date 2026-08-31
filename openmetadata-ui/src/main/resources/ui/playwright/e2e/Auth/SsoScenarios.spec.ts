@@ -450,10 +450,16 @@ for (const fixture of FIXTURES) {
       // that hard-blocked the whole UI on any missing top-level field. Per
       // conductor review the block was replaced with a toast that lets the
       // SPA render normally, so those page-render + no-IdP-redirect
-      // assertions no longer apply. The validator itself still logs
-      // `[AuthConfig] Missing config value: <field>` via console.warn — a
-      // dedicated unit test in AuthProvider.test.tsx covers that surface,
-      // which doesn't need a full docker-compose Playwright leg.
+      // assertions no longer apply. Coverage now lives in:
+      //   - src/utils/AuthProvider.util.test.ts — asserts the validator
+      //     returns the missing-field list and emits an
+      //     `[AuthConfig] Missing config value: <field>` console.warn per
+      //     field (the surface an admin tails logs with).
+      //   - src/components/Auth/AuthProviders/AuthProvider.test.tsx —
+      //     asserts the AuthProvider mount calls `showErrorToast` with the
+      //     joined field names when the fetched config fails validation
+      //     (the surface the user sees).
+      // Neither needs a full docker-compose Playwright leg.
     }
   );
 }

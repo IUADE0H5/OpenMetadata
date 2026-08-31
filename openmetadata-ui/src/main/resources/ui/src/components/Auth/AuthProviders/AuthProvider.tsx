@@ -27,6 +27,7 @@ import type { WebStorageStateStore } from 'oidc-client';
 import {
   ComponentType,
   createContext,
+  Fragment,
   ReactNode,
   useCallback,
   useContext,
@@ -275,6 +276,14 @@ export const AuthProvider = ({
   const { t } = useTranslation();
 
   const [msalInstance, setMsalInstance] = useState<IPublicClientApplication>();
+  // False when `validateAuthFieldsDetailed` flagged any required field
+  // as missing on the last `fetchAuthConfig` run. Used to short-circuit
+  // the Azure-specific `!msalInstance` gate below — with an empty
+  // clientId MSAL's PublicClientApplication.initialize() rejects and
+  // `msalInstance` never sets, so the whole shell would sit on Loader.
+  // Falling through to `getProtectedApp()` renders SignInPage instead
+  // (matches the invalid-config path every other provider already takes).
+  const [hasValidConfig, setHasValidConfig] = useState<boolean>(true);
 
   const authenticatorRef = useRef<AuthenticatorRef>(null);
 
@@ -682,6 +691,7 @@ export const AuthProvider = ({
             authConfig as AuthenticationConfigurationWithScope
           );
           const configJson = getAuthConfig(authConfig);
+          setHasValidConfig(validation.valid);
           if (!validation.valid) {
             // Surface the misconfiguration with a toast — the SPA still
             // proceeds to render whatever the current provider allows so
@@ -701,8 +711,20 @@ export const AuthProvider = ({
           setJwtPrincipalClaimsMapping(authConfig.jwtPrincipalClaimsMapping);
           setAuthConfig(configJson);
           setAuthorizerConfig(authorizerConfig);
-          // RDF enabled status is already set from system config in App.tsx
-          updateAuthInstance(configJson);
+          // RDF enabled status is already set from system config in App.tsx.
+          //
+          // Gate the SDK-instance wiring on validation.valid: MSAL's
+          // PublicClientApplication.initialize() rejects an empty
+          // clientId, and setMsalInstance never runs, leaving
+          // isConfigLoading true forever — the whole shell sits on
+          // <Loader /> instead of falling through to SignInPage like the
+          // other providers do. Skip the SDK boot when required fields
+          // are missing so Azure matches Basic/LDAP/OIDC/Auth0/Okta:
+          // toast fires, SignInPage renders, admin can retry after the
+          // config is fixed on the server.
+          if (validation.valid) {
+            updateAuthInstance(configJson);
+          }
           const oidcToken = await getOidcToken();
           if (!oidcToken) {
             handleStoreProtectedRedirectPath();
@@ -817,15 +839,25 @@ export const AuthProvider = ({
         );
       }
       case AuthProviderEnum.Azure: {
-        return msalInstance ? (
-          <LazyMsalProviderWrapper instance={msalInstance}>
-            <LazyMsalAuthenticator ref={authenticatorRef}>
-              {childElement}
-            </LazyMsalAuthenticator>
-          </LazyMsalProviderWrapper>
-        ) : (
-          <Loader fullScreen />
-        );
+        if (msalInstance) {
+          return (
+            <LazyMsalProviderWrapper instance={msalInstance}>
+              <LazyMsalAuthenticator ref={authenticatorRef}>
+                {childElement}
+              </LazyMsalAuthenticator>
+            </LazyMsalProviderWrapper>
+          );
+        }
+
+        // No msalInstance because the config validator flagged fields
+        // missing and updateAuthInstance was skipped. Render children
+        // (SignInPage / AppRouter) directly so the shell isn't locked
+        // to Loader with an unrecoverable state.
+        if (!hasValidConfig) {
+          return <Fragment>{childElement}</Fragment>;
+        }
+
+        return <Loader fullScreen />;
       }
       default: {
         return null;
@@ -858,7 +890,9 @@ export const AuthProvider = ({
 
   const isConfigLoading =
     !authConfig ||
-    (authConfig.provider === AuthProviderEnum.Azure && !msalInstance);
+    (authConfig.provider === AuthProviderEnum.Azure &&
+      hasValidConfig &&
+      !msalInstance);
 
   return (
     <AuthContext.Provider value={contextValues}>

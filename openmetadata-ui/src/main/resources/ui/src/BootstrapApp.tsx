@@ -12,7 +12,7 @@
  */
 
 import React from 'react';
-import { Root } from 'react-dom/client';
+import type { Root } from 'react-dom/client';
 
 /**
  * Full-app bootstrap. Kept off the entry chunk (imported dynamically from

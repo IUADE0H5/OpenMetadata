@@ -38,13 +38,6 @@ export interface SsoConfigureResult {
   restore: () => Promise<void>;
 }
 
-export interface SsoBrokenConfigureResult extends SsoConfigureResult {
-  // A pattern the client-side validator MUST log/render for this specific
-  // misconfiguration. Scenario 9 asserts against this so each provider gets
-  // to name its own required-field message without a shared string table.
-  expectedWarningPattern: RegExp;
-}
-
 // Every provider fixture implements this. The scenarios spec is written
 // against the interface only — no per-provider `if` branches. If a scenario
 // can't apply to a provider (e.g. cross-tab for Basic), the fixture flags it
@@ -67,18 +60,6 @@ export interface SsoProviderFixture {
   supportsSelfSignup: boolean;
   /** true when the provider supports the /silent-callback iframe flow */
   supportsSilentCallback: boolean;
-  /**
-   * true when the fixture can produce a config that is client-invalid
-   * (the SPA validator flags it and renders ConfigErrorPage) BUT still
-   * server-valid (the PUT returns 200). Some providers can't:
-   *   - Basic: the client validator only requires `provider`, and setting
-   *     that to empty is nonsensical, so no "broken" client config exists.
-   *   - LDAP: the server's `@NotNull` on `ldapConfiguration.host` (and the
-   *     LDAP init that runs on `PUT`) reject both empty-string and delete
-   *     — server always rejects before the client sees the config.
-   * When false, scenarios 8 and 9 are `.skip()`'d for this provider.
-   */
-  supportsBrokenConfigCheck: boolean;
   /**
    * true when the AuthCoordinator's Renewer for this provider hits OM's
    * `/api/v1/auth/refresh` endpoint (Basic/LDAP via BasicAuthAuthenticator,
@@ -113,15 +94,6 @@ export interface SsoProviderFixture {
    * Returns a `restore` that must be called from `afterAll` to reset config.
    */
   configureBackend(apiContext: APIRequestContext): Promise<SsoConfigureResult>;
-
-  /**
-   * Same as configureBackend but with one intentionally-invalid field so
-   * scenarios 8/9 can verify the client-side validator catches it BEFORE
-   * any IdP redirect. Fixture also declares the log pattern to assert.
-   */
-  configureBrokenBackend(
-    apiContext: APIRequestContext
-  ): Promise<SsoBrokenConfigureResult>;
 
   // ── Test actions ────────────────────────────────────────────────────────
 

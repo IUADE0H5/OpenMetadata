@@ -18,7 +18,7 @@ import {
   ProviderConfigOverride,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import { SsoBrokenConfigureResult, SsoProviderFixture } from './fixture';
+import {  SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 import { ProviderHelper } from './index';
 import {
@@ -115,7 +115,6 @@ export const keycloakOidcPublicProviderFixture: SsoProviderFixture = {
   // Public OIDC is the only one that drives the /silent-callback iframe
   // via oidc-client's signinSilent — same-origin refresh with no popup.
   supportsSilentCallback: true,
-  supportsBrokenConfigCheck: true,
   usesBackendRefresh: false,
 
   expectedResponseType: 'code',
@@ -136,31 +135,6 @@ export const keycloakOidcPublicProviderFixture: SsoProviderFixture = {
     };
   },
 
-  async configureBrokenBackend(
-    apiContext: APIRequestContext
-  ): Promise<SsoBrokenConfigureResult> {
-    const snapshot = await fetchSecurityConfig(apiContext);
-    const payload = buildConfigPayload();
-    // Empty out `clientId` at the top level. The public config endpoint
-    // exposes `clientId` but strips nested `oidcConfiguration.*`, so a
-    // nested mangling wouldn't reach the client-side validator. Server's
-    // Bean-Validation accepts non-null empty; client's `isFieldMissing`
-    // flags it.
-    const authConfig = payload.authenticationConfiguration as Record<
-      string,
-      unknown
-    >;
-    authConfig.clientId = '';
-
-    await applyProviderConfig(apiContext, snapshot, payload);
-
-    return {
-      restore: async () => {
-        await restoreSecurityConfig(apiContext, snapshot);
-      },
-      expectedWarningPattern: /clientId/,
-    };
-  },
 
   async performLogin(page: Page) {
     await page.goto('/signin');

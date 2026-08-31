@@ -61,7 +61,7 @@ const silentCallbackRoute = isSilentCallbackRoute();
 //      SsoScenarios.spec caps the JS payload on `/silent-callback`).
 //   2. SSO "Test Login" popup — dynamic import the test-login bootstrap so
 //      it never touches the real AuthProvider or session storage.
-//   3. Regular app boot — dynamic import bootstrapApp, which pulls in
+//   3. Regular app boot — dynamic import BootstrapApp, which pulls in
 //      AppRoot, styles, i18n, and the core-components package.
 if (silentCallbackRoute) {
   root.render(
@@ -76,7 +76,7 @@ if (silentCallbackRoute) {
     .catch(() => globalThis.close());
 } else {
   recordPlaywrightAppBoot();
-  void import('./bootstrapApp').then(({ bootstrapApp }) => bootstrapApp(root));
+  void import('./BootstrapApp').then(({ bootstrapApp }) => bootstrapApp(root));
 }
 
 // Service-worker lifecycle -- registers the asset cache in prod, unregisters

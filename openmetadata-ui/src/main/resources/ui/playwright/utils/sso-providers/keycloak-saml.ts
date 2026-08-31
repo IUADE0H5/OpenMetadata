@@ -20,7 +20,6 @@ import {
   restoreSecurityConfig,
 } from '../ssoAuth';
 import {
-  SsoBrokenConfigureResult,
   SsoProviderFixture,
   SsoProviderSlug,
 } from './fixture';
@@ -191,12 +190,6 @@ export const keycloakSamlProviderFixture: SsoProviderFixture = {
   supportsCrossTab: !IS_CROSSSITE,
   supportsSelfSignup: true,
   supportsSilentCallback: false,
-  // SAML's public config endpoint strips `samlConfiguration.*` (server-side
-  // secrets), and `getAuthConfig` omits `providerName` from the SAML shape,
-  // so `REQUIRED_FIELDS_BY_PROVIDER[Saml]` is just `['provider']`. There is
-  // no top-level field we can meaningfully break to trigger ConfigErrorPage
-  // without also breaking the sign-in flow itself — skip scenarios 8/9.
-  supportsBrokenConfigCheck: false,
   usesBackendRefresh: true,
 
   signInButtonPattern: /(sign in|log in) with SAML SSO/i,
@@ -217,30 +210,6 @@ export const keycloakSamlProviderFixture: SsoProviderFixture = {
     };
   },
 
-  async configureBrokenBackend(
-    apiContext: APIRequestContext
-  ): Promise<SsoBrokenConfigureResult> {
-    const snapshot = await fetchSecurityConfig(apiContext);
-    const payload = await buildConfigPayload(SAML_PROFILE);
-    // Drop samlConfiguration.idp.entityId — the client-side validator must
-    // name this specific field before any redirect to the IdP.
-    const authConfig = payload.authenticationConfiguration as Record<
-      string,
-      unknown
-    >;
-    const samlConfig = authConfig.samlConfiguration as Record<string, unknown>;
-    const idpConfig = samlConfig.idp as Record<string, unknown>;
-    delete idpConfig.entityId;
-
-    await applyProviderConfig(apiContext, snapshot, payload);
-
-    return {
-      restore: async () => {
-        await restoreSecurityConfig(apiContext, snapshot);
-      },
-      expectedWarningPattern: /samlConfiguration\.idp\.entityId|entityId/,
-    };
-  },
 
   async performLogin(page: Page) {
     await page.goto('/signin');

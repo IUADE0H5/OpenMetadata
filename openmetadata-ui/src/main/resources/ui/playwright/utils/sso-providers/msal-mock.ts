@@ -37,7 +37,7 @@ import {
   mintAdminRestoreToken,
   restoreSecurityConfig,
 } from '../ssoAuth';
-import { SsoBrokenConfigureResult, SsoProviderFixture } from './fixture';
+import {  SsoProviderFixture } from './fixture';
 import { forceTokenExpiry } from './force-token-expiry';
 import { mintMockJwt } from './mock-token';
 
@@ -271,7 +271,6 @@ export const msalMockProviderFixture: SsoProviderFixture = {
   supportsCrossTab: true,
   supportsSelfSignup: false,
   supportsSilentCallback: false,
-  supportsBrokenConfigCheck: true,
   usesBackendRefresh: false,
 
   isAvailable: () => true,
@@ -297,19 +296,6 @@ export const msalMockProviderFixture: SsoProviderFixture = {
     };
   },
 
-  async configureBrokenBackend(
-    apiContext: APIRequestContext
-  ): Promise<SsoBrokenConfigureResult> {
-    const snapshot = await fetchSecurityConfig(apiContext);
-    await applyProviderConfig(apiContext, snapshot, buildBrokenConfig());
-
-    return {
-      restore: async () => {
-        await restoreSecurityConfig(apiContext, snapshot);
-      },
-      expectedWarningPattern: /clientId/,
-    };
-  },
 
   async performLogin(page: Page) {
     // The mock must be installed *before* the first navigation so the

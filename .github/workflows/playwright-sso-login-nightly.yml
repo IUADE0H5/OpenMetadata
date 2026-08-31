@@ -32,11 +32,19 @@ on:
       - 'openmetadata-ui/src/main/resources/ui/src/index.tsx'
       - 'openmetadata-ui/src/main/resources/ui/playwright/e2e/Auth/**'
       - 'openmetadata-ui/src/main/resources/ui/playwright/utils/sso-providers/**'
-      # Backend auth surface — JwtFilter, code-flow / SAML / basic / LDAP
-      # authenticators, the public /system/config/auth endpoint, and the
-      # authenticator-handler factory that dispatches the login/refresh
-      # servlets the SPA calls.
-      - 'openmetadata-service/src/main/java/org/openmetadata/service/security/**'
+      # Backend auth surface — narrow to the packages the SSO matrix
+      # actually exercises (login/refresh, JWT filter, SAML handler,
+      # OIDC/SAML code flow, LDAP/basic authenticators, the servlet
+      # handler factory, and the public /system/config/auth endpoint).
+      # Sibling `security/` packages (mask, policyevaluator, jwt-key
+      # rotation utilities) don't drive this matrix and stay off the
+      # trigger to keep unrelated PRs from re-running a 40m docker leg.
+      - 'openmetadata-service/src/main/java/org/openmetadata/service/security/JwtFilter.java'
+      - 'openmetadata-service/src/main/java/org/openmetadata/service/security/AuthenticationCodeFlowHandler.java'
+      - 'openmetadata-service/src/main/java/org/openmetadata/service/security/AuthServeletHandlerFactory.java'
+      - 'openmetadata-service/src/main/java/org/openmetadata/service/security/SecurityUtil.java'
+      - 'openmetadata-service/src/main/java/org/openmetadata/service/security/auth/**'
+      - 'openmetadata-service/src/main/java/org/openmetadata/service/security/saml/**'
       - 'openmetadata-service/src/main/java/org/openmetadata/service/resources/system/ConfigResource.java'
       # Schema-first source of truth for auth types (authentication,
       # authorizer, SAML/OIDC client configs). A schema change regenerates

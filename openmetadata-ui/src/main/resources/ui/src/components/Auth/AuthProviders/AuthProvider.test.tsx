@@ -15,8 +15,10 @@ import { act } from 'react-test-renderer';
 import { REDIRECT_PATHNAME } from '../../../constants/router.constants';
 import { AuthProvider as AuthProviderProps } from '../../../generated/configuration/authenticationConfiguration';
 import axiosClient from '../../../rest';
+import { fetchAuthenticationConfig } from '../../../rest/miscAPI';
 import { getLoggedInUser } from '../../../rest/userAPI';
 import { isRefreshableAuthError } from '../../../utils/AuthProvider.util';
+import { showErrorToast } from '../../../utils/ToastUtils';
 import AuthProvider, { useAuthProvider } from './AuthProvider';
 
 const localStorageMock = {
@@ -512,5 +514,59 @@ describe('Test getLoggedInUserDetails catch (auth-coordinator-refactor Task 13 â
     });
 
     expect(mockSetIsAuthenticated).toHaveBeenCalledWith(false);
+  });
+});
+
+// Hoisted so the `no-identical-functions` linter doesn't compare it to the
+// intra-describe `WrapperComponent` in the AuthCoordinator wiring block.
+const MissingConfigConsumer = () => <div>ConsumerComponent</div>;
+
+const MissingConfigWrapper = () => (
+  <AuthProvider childComponentType={MissingConfigConsumer}>
+    <MissingConfigConsumer />
+  </AuthProvider>
+);
+
+describe('AuthProvider missing-config toast (replaces ConfigErrorPage)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('fires showErrorToast when validateAuthFieldsDetailed flags missing fields', async () => {
+    // Azure requires providerName + clientId + callbackUrl + authority
+    // (see REQUIRED_FIELDS_BY_PROVIDER). Returning a config missing all
+    // four must produce exactly one toast during AuthProvider mount.
+    // Guards against a regression where the mount either short-circuits
+    // back to a ConfigErrorPage (old behavior) or silently proceeds with
+    // no user-facing surface. The `t()` mock in setupTests.js returns
+    // keys verbatim, so the specific field list is asserted in the
+    // AuthProvider.util unit test â€” this test's job is to confirm the
+    // mount wired the toast call at all.
+    (fetchAuthenticationConfig as jest.Mock).mockResolvedValueOnce({
+      provider: AuthProviderProps.Azure,
+      providerName: '',
+      clientId: '',
+      callbackUrl: '',
+      authority: '',
+    });
+
+    await act(async () => {
+      render(<MissingConfigWrapper />);
+    });
+
+    expect(showErrorToast).toHaveBeenCalledTimes(1);
+    expect(showErrorToast).toHaveBeenCalledWith(
+      'message.auth-configuration-missing-fields'
+    );
+  });
+
+  it('does not fire the toast when the config is valid', async () => {
+    // Baseline: the default `{provider:'basic'}` mock in fetchAuthenticationConfig
+    // above passes the validator (Basic requires only `provider`). No toast.
+    await act(async () => {
+      render(<MissingConfigWrapper />);
+    });
+
+    expect(showErrorToast).not.toHaveBeenCalled();
   });
 });
