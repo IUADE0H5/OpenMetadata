@@ -44,5 +44,6 @@ class AthenaLineageSource(AthenaQueryParserSource, LineageSource):
                     yield TableQuery(
                         dialect=self.dialect.value,
                         query=query.Query,
+                        databaseName=self.database_name,
                         serviceName=self.config.serviceName,
                     )
