@@ -30,6 +30,7 @@ from metadata.generated.schema.entity.data.storedProcedure import (
     StoredProcedure,
     StoredProcedureType,
 )
+from metadata.generated.schema.entity.data.table import Column as TableColumn
 from metadata.generated.schema.entity.data.table import Table
 from metadata.generated.schema.entity.services.databaseService import DatabaseService
 from metadata.generated.schema.entity.services.ingestionPipelines.status import (
@@ -38,6 +39,7 @@ from metadata.generated.schema.entity.services.ingestionPipelines.status import 
 from metadata.generated.schema.metadataIngestion.parserconfig.queryParserConfig import (
     QueryParserType,
 )
+from metadata.generated.schema.type.basic import FullyQualifiedEntityName
 from metadata.generated.schema.type.entityLineage import (
     ColumnLineage,
     LineageDetails,
@@ -62,6 +64,10 @@ from metadata.utils.timeout import timeout
 
 logger = utils_logger()
 DEFAULT_SCHEMA_NAME = "<default>"
+# Trino/Athena qualify a table as catalog.schema.table; "AwsDataCatalog" (Athena's default Glue Data
+# Catalog) is not an OpenMetadata database and must never be searched as one - it is dropped the same
+# way DEFAULT_SCHEMA_NAME is, so callers fall back to the connector's real (synthetic) database name.
+IGNORED_CATALOG_NAMES = {"awsdatacatalog"}
 CUTOFF_NODES = 20
 NODE_PROCESSING_TIMEOUT = 30  # seconds
 
@@ -215,9 +221,12 @@ def search_table_entities(
 
         search_tuple = (service_name, normalized_db, normalized_schema, table)
         if search_tuple in search_cache:
+            # A miss is cached too: temp tables, CTE names and unnest aliases recur on every
+            # query, and re-searching ES and the API for each of them dominates the usage sink.
             result = search_cache.get(search_tuple)
             if result:
                 return result
+            continue
 
         try:
             table_entities: Optional[List[Table]] = []  # noqa: UP006, UP045
@@ -296,7 +305,7 @@ def get_table_fqn_from_query_name(
     if schema_query == DEFAULT_SCHEMA_NAME:
         schema_query = None
 
-    if database_query == DEFAULT_SCHEMA_NAME:
+    if database_query == DEFAULT_SCHEMA_NAME or (database_query and database_query.lower() in IGNORED_CATALOG_NAMES):
         database_query = None
 
     return database_query, schema_query, table
@@ -587,12 +596,72 @@ def get_table_entities_from_query(
     return None
 
 
+def _find_columns_named(columns: List[TableColumn], name: str) -> List[TableColumn]:  # noqa: UP006
+    """All columns called `name` at any depth of a nested column tree, case-insensitively."""
+    found = []
+    for column in columns or []:
+        if column.name.root.lower() == name.lower():
+            found.append(column)
+        found.extend(_find_columns_named(column.children or [], name))
+    return found
+
+
+def _resolve_nested_column_fqn(table_entity: Table, path: List[str]) -> Optional[str]:  # noqa: UP006, UP045
+    """
+    Resolve `struct[.struct...].field` against a table's nested columns.
+
+    The parser keeps only the innermost qualifier of a deep path (`a.b.c` arrives as struct `b`,
+    field `c`), so the first part is looked up at any depth and must be unique in the table;
+    the remaining parts are walked as children.
+    """
+    anchors = _find_columns_named(table_entity.columns or [], path[0])
+    if len(anchors) != 1:
+        return None
+    column = anchors[0]
+    for part in path[1:]:
+        column = next((c for c in column.children or [] if c.name.root.lower() == part.lower()), None)
+        if column is None:
+            return None
+    return column.fullyQualifiedName.root if column.fullyQualifiedName else None
+
+
+def _get_struct_column_lineage(
+    to_entity: Table,
+    from_entity: Table,
+    from_table_raw_name: str,
+    sources: dict,
+) -> List[ColumnLineage]:  # noqa: UP006
+    """
+    The parser reports `struct.field` as if `struct` were a table, so those pairs land under a
+    `<default>.struct[.struct]` key that never matches the source table. Resolve them against the
+    source table's nested columns; a key that does not walk to a real child column is skipped.
+    """
+    column_lineage = []
+    prefix = f"{DEFAULT_SCHEMA_NAME}."
+    for source_key, pairs in sources.items():
+        if source_key == from_table_raw_name or not source_key.startswith(prefix):
+            continue
+        struct_path = source_key[len(prefix) :].split(".")
+        for to_col, from_col in pairs:
+            to_col_fqn = get_column_fqn(to_entity, to_col)
+            from_col_fqn = _resolve_nested_column_fqn(from_entity, [*struct_path, from_col])
+            if to_col_fqn and from_col_fqn:
+                column_lineage.append(
+                    ColumnLineage(
+                        fromColumns=[FullyQualifiedEntityName(from_col_fqn)],
+                        toColumn=FullyQualifiedEntityName(to_col_fqn),
+                    )
+                )
+    return column_lineage
+
+
 def get_column_lineage(
     to_entity: Table,
     from_entity: Table,
     to_table_raw_name: str,
     from_table_raw_name: str,
     column_lineage_map: dict,
+    resolve_struct_sources: bool = False,
 ) -> List[ColumnLineage]:  # noqa: UP006
     """Get column lineage
 
@@ -602,11 +671,23 @@ def get_column_lineage(
         to_table_raw_name (str): table entity raw name we link to
         from_table_raw_name (str): table entity raw name we link from
         column_lineage_map (dict): map of the column lineage
+        resolve_struct_sources (bool): also resolve `struct.field` sources against the nested
+            columns of from_entity. Only safe when from_entity is the statement's single source
+            table, otherwise a join partner with the same struct would receive the lineage too.
 
     Returns:
         List[ColumnLineage]
     """
     column_lineage = []
+    if resolve_struct_sources:
+        column_lineage.extend(
+            _get_struct_column_lineage(
+                to_entity=to_entity,
+                from_entity=from_entity,
+                from_table_raw_name=from_table_raw_name,
+                sources=column_lineage_map.get(to_table_raw_name) or {},
+            )
+        )
     if column_lineage_map.get(to_table_raw_name) and column_lineage_map.get(to_table_raw_name).get(from_table_raw_name):
         # Select all
         if "*" in column_lineage_map.get(to_table_raw_name).get(from_table_raw_name)[0]:
@@ -634,6 +715,7 @@ def _build_table_lineage(
     lineage_source: LineageSource = LineageSource.QueryLineage,
     procedure: Optional[EntityReference] = None,  # noqa: UP045
     temp_lineage_tables: Optional[List] = None,  # noqa: UP006, UP045
+    resolve_struct_sources: bool = False,
 ) -> Either[LineageRequest]:
     """
     Prepare the lineage request generator
@@ -673,6 +755,7 @@ def _build_table_lineage(
             from_entity=from_entity,
             from_table_raw_name=str(from_table_raw_name),
             column_lineage_map=column_lineage_map,
+            resolve_struct_sources=resolve_struct_sources,
         )
         lineage_details = LineageDetails(sqlQuery=masked_query, source=lineage_source, pipeline=procedure)
         if temp_lineage_tables:
@@ -711,6 +794,7 @@ def _create_lineage_by_table_name(
     procedure: Optional[EntityReference] = None,  # noqa: UP045
     graph: Optional[DiGraph] = None,  # noqa: UP045
     schema_fallback: bool = False,
+    resolve_struct_sources: bool = False,
 ) -> Iterable[Either[LineageRequest]]:
     """
     This method is to create a lineage between two tables
@@ -767,6 +851,7 @@ def _create_lineage_by_table_name(
                     column_lineage_map=column_lineage_map,
                     lineage_source=lineage_source,
                     procedure=procedure,
+                    resolve_struct_sources=resolve_struct_sources,
                 )
 
     except Exception as exc:
@@ -819,7 +904,12 @@ def get_lineage_by_query(
     timeout_seconds: int = LINEAGE_PARSING_TIMEOUT,
     lineage_source: LineageSource = LineageSource.QueryLineage,
     graph: Optional[DiGraph] = None,  # noqa: UP045
-    lineage_parser: Optional[LineageParser] = None,  # noqa: UP045
+    # Accepts a real LineageParser, or a picklable stand-in for one built by a batch parse pool
+    # (metadata.ingestion.lineage.query_lineage_pool.ParsedLineage) - duck-typed to the same
+    # masked_query/query_hash/column_lineage(_map)/*_tables attributes this function reads. Not
+    # narrowed to a Union/Protocol here to avoid this module importing from query_lineage_pool,
+    # which imports from this one.
+    lineage_parser: Optional[Any] = None,  # noqa: UP045
     schema_fallback: bool = False,
     service_name: Optional[str] = None,  # backward compatibility for python sdk  # noqa: UP045
     parser_type: QueryParserType = QueryParserType.Auto,
@@ -844,8 +934,15 @@ def get_lineage_by_query(
         query_hash = lineage_parser.query_hash
         logger.debug(f"[{query_hash}] Running lineage with query: {masked_query or query}")
 
-        raw_column_lineage = lineage_parser.column_lineage
-        column_lineage.update(populate_column_lineage_map(raw_column_lineage))
+        # A batch-parsed statement (query_lineage_pool.ParsedLineage) carries the column lineage map
+        # already built in its worker process against the real sqllineage Column objects, which are
+        # not reliably picklable back to this one - see that module's docstring. Anything else (the
+        # real LineageParser) still goes through populate_column_lineage_map here, unchanged.
+        precomputed_column_lineage_map = getattr(lineage_parser, "column_lineage_map", None)
+        if precomputed_column_lineage_map is not None:
+            column_lineage.update(precomputed_column_lineage_map)
+        else:
+            column_lineage.update(populate_column_lineage_map(lineage_parser.column_lineage))
 
         for intermediate_table in lineage_parser.intermediate_tables:
             for source_table in lineage_parser.source_tables:
@@ -909,6 +1006,7 @@ def get_lineage_by_query(
                             schema_name=schema_name,
                             masked_query=masked_query,
                             column_lineage_map=column_lineage,
+                            resolve_struct_sources=len(lineage_parser.source_tables) == 1,  # pyright: ignore[reportArgumentType]
                             lineage_source=lineage_source,
                             procedure=procedure,
                             graph=graph,

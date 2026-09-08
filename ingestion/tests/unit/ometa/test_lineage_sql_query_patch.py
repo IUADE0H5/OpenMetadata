@@ -94,7 +94,11 @@ def assert_patched(client, expected_query):
     if expected_query is None:
         assert sql_query_ops(client) == []
     else:
-        assert sql_query_ops(client) == [{"op": "add", "path": "/sqlQuery", "value": expected_query}]
+        # `add` when the edge had no query, `replace` when it had a different one; both set the value.
+        ops = sql_query_ops(client)
+        assert [(op["op"] in ("add", "replace"), op["path"], op["value"]) for op in ops] == [
+            (True, "/sqlQuery", expected_query)
+        ]
 
 
 class TestAddLineageSqlQuery:

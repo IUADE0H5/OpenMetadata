@@ -617,3 +617,34 @@ class TestIntegrationAndEdgeCases(unittest.TestCase):
                         callable(method),
                         f"Method '{method_name}' exists but is not callable!",
                     )
+
+
+# ---------------------------------------------------------------------------
+# metric_values() / close(): wiring to the query lineage pool (see query_lineage_pool.py)
+# ---------------------------------------------------------------------------
+
+
+def test_metric_values_reports_the_default_pools_stats():
+    from metadata.ingestion.lineage.query_lineage_pool import close_default_pool, get_default_pool
+
+    close_default_pool()
+    get_default_pool().stats.statements = 5
+    source = TestableLineageSource.__new__(TestableLineageSource)
+
+    try:
+        assert source.metric_values()["lineage_statements"] == 5
+    finally:
+        close_default_pool()
+
+
+def test_close_shuts_down_the_default_pool():
+    from metadata.ingestion.lineage.query_lineage_pool import close_default_pool, get_default_pool
+
+    close_default_pool()
+    pool = get_default_pool()
+    pool._workers()  # force the process pool to actually start
+    source = TestableLineageSource.__new__(TestableLineageSource)
+
+    source.close()
+
+    assert pool._pool is None

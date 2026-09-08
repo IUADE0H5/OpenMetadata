@@ -34,6 +34,10 @@ from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.generated.schema.type.tableQuery import TableQuery
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.lineage.models import Dialect
+from metadata.ingestion.lineage.query_lineage_pool import (
+    get_default_pool,
+    resolve_batch_tables,
+)
 from metadata.ingestion.lineage.sql_lineage import get_lineage_by_query
 from metadata.ingestion.models.ometa_lineage import (
     LineageRequest,
@@ -305,44 +309,72 @@ def query_lineage_processor(
     parser_type: QueryParserType,
 ) -> None:
     """
-    Generate lineage for a list of table queries
+    Generate lineage for a chunk of table queries.
+
+    Two phases run ahead of the per-statement loop below: every not-yet-processed statement in the
+    chunk is parsed once per distinct shape across all CPU cores (`QueryLineagePool.parse_batch`,
+    same idea as the usage query parser - see its module docstring), then every distinct table
+    referenced anywhere in the parsed batch is resolved against the catalog once each
+    (`resolve_batch_tables`). The per-statement `get_lineage_by_query` calls below therefore make no
+    further server round trips for tables already seen in this run. See
+    `metadata.ingestion.lineage.query_lineage_pool` and CHANGELOG.md.
     """
+    pending = [
+        table_query for table_query in table_queries or [] if not _query_already_processed(metadata, table_query)
+    ]
+    if not pending:
+        return
 
-    for table_query in table_queries or []:
-        if not _query_already_processed(metadata, table_query):
-            # Prepare service names for lineage processing
-            service_names = [table_query.serviceName]
-            if processCrossDatabaseLineage and crossDatabaseServiceNames:
-                service_names.extend(crossDatabaseServiceNames)
+    pool = get_default_pool()
+    parsed_batch = pool.parse_batch(pending, dialect, parser_type)
+    parsed_items = list(zip(pending, parsed_batch, strict=True))
+    resolve_batch_tables(metadata, parsed_items, processCrossDatabaseLineage, crossDatabaseServiceNames, pool.stats)
 
-            lineages: Iterable[Either[LineageRequest]] = get_lineage_by_query(
-                metadata,
-                query=table_query.query,
-                service_names=service_names,
-                database_name=table_query.databaseName,
-                schema_name=table_query.databaseSchema,
-                dialect=dialect,
-                timeout_seconds=parsingTimeoutLimit,
-                graph=graph,
-                parser_type=parser_type,
-            )
+    for table_query, parsed in parsed_items:
+        if parsed is None or parsed.parse_failed:
+            # Recorded in pool.stats.parse_failures already; never raised across the pool boundary.
+            continue
 
-            for lineage_request in lineages or []:
-                queue.put(lineage_request)
+        # Prepare service names for lineage processing
+        service_names = [table_query.serviceName]
+        if processCrossDatabaseLineage and crossDatabaseServiceNames:
+            service_names.extend(crossDatabaseServiceNames)
 
-                # If we identified lineage properly, ingest the original query
-                if lineage_request.right:
-                    queue.put(
-                        Either(
-                            right=CreateQueryRequest(
-                                query=SqlQuery(table_query.query),
-                                query_type=table_query.query_type,
-                                duration=table_query.duration,
-                                processedLineage=True,
-                                service=serviceName,
-                            )
+        # A source table that is a table-valued UDF call needs the real LineageParser (its ES-backed
+        # resolution is not something the picklable stand-in can carry, see ParsedLineage) - rare, so
+        # falling back to a fresh in-process parse for just this statement costs little.
+        lineage_parser = None if parsed.has_udf_source else parsed
+
+        lineages: Iterable[Either[LineageRequest]] = get_lineage_by_query(
+            metadata,
+            query=table_query.query,
+            service_names=service_names,
+            database_name=table_query.databaseName,
+            schema_name=table_query.databaseSchema,
+            dialect=dialect,
+            timeout_seconds=parsingTimeoutLimit,
+            graph=graph,
+            lineage_parser=lineage_parser,
+            parser_type=parser_type,
+        )
+
+        for lineage_request in lineages or []:
+            queue.put(lineage_request)
+
+            # If we identified lineage properly, ingest the original query
+            if lineage_request.right:
+                pool.stats.requests += 1
+                queue.put(
+                    Either(
+                        right=CreateQueryRequest(
+                            query=SqlQuery(table_query.query),
+                            query_type=table_query.query_type,
+                            duration=table_query.duration,
+                            processedLineage=True,
+                            service=serviceName,
                         )
                     )
+                )
 
 
 def view_lineage_processor(
