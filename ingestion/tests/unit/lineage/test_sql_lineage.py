@@ -219,6 +219,23 @@ class SqlLineageTest(TestCase):
             "vw_customer",
         )
 
+    def test_table_name_from_query_drops_the_athena_glue_catalog_name(self):
+        """
+        Athena/Trino qualify a table as catalog.schema.table. "AwsDataCatalog" (Athena's default
+        Glue Data Catalog) is never an OpenMetadata database and must be dropped like the sqllineage
+        `<default>` placeholder, so callers fall back to the connector's real database name instead
+        of searching for a database literally named "awsdatacatalog" (issue: usage sink warnings
+        "Could not fetch table default.awsdatacatalog.<schema>.<table>").
+        """
+        assert get_table_fqn_from_query_name("awsdatacatalog.sales.orders") == (None, "sales", "orders")
+        assert get_table_fqn_from_query_name("AwsDataCatalog.sales.orders") == (None, "sales", "orders")
+        # a schema/database that merely contains the substring must not be dropped
+        assert get_table_fqn_from_query_name("my_awsdatacatalog_backup.sales.orders") == (
+            "my_awsdatacatalog_backup",
+            "sales",
+            "orders",
+        )
+
         assert get_table_fqn_from_query_name('Prod."OpsDataViews.Reporting".vw_customer') == (
             "Prod",
             '"OpsDataViews.Reporting"',

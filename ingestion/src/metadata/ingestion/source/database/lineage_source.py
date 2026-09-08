@@ -39,6 +39,10 @@ from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.generated.schema.type.tableQuery import TableQuery
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.lineage.models import ConnectionTypeDialectMapper, Dialect
+from metadata.ingestion.lineage.query_lineage_pool import (
+    close_default_pool,
+    default_pool_stats,
+)
 from metadata.ingestion.lineage.sql_lineage import (
     get_column_fqn,
     get_lineage_by_graph,
@@ -79,6 +83,17 @@ class LineageSource(QueryParserSource, ABC):
     """
 
     dialect: Dialect
+
+    def metric_values(self) -> dict:
+        """Run counters for a metrics reporter; any step may expose this and be picked up generically
+        (a reporter that pushes run gauges can read it without knowing the step). Backed by the query
+        lineage pool's stats - see metadata.ingestion.lineage.query_lineage_pool.LineageParseStats.
+        """
+        return default_pool_stats().as_metrics()
+
+    def close(self):
+        close_default_pool()
+        super().close()
 
     @staticmethod
     def generate_lineage_with_processes(  # noqa: C901
