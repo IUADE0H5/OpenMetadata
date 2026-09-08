@@ -66,6 +66,20 @@ class AthenaQueryParserSource(QueryParserSource, ABC):
             raise InvalidSourceException(f"Expected AthenaConnection, but got {connection}")
         return cls(config, metadata)
 
+    @property
+    def database_name(self) -> str:
+        """
+        The OpenMetadata database name for this Athena service.
+
+        Athena has no native database concept, so CommonDbSourceService.get_database_names
+        (metadata sync) defaults it to "default" unless serviceConnection.config.databaseName
+        is set. Usage/lineage build TableQuery objects independently of that method, so without
+        this they leave TableQuery.databaseName unset - query matching then falls back to a
+        wildcard instead of the actual synthetic database name metadata sync used, and lineage/
+        usage silently fail to resolve any table.
+        """
+        return self.service_connection.databaseName or "default"
+
     def _get_work_group_response(self, next_token: str, is_first_call: bool = False):
         if is_first_call:
             return self.client.list_work_groups()
