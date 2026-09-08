@@ -25,6 +25,7 @@ from metadata.generated.schema.type.basic import (
     SqlQuery,
     Timestamp,
 )
+from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.generated.schema.type.tableUsageCount import (
     QueryCostWrapper,
     TableUsageCount,
@@ -102,10 +103,11 @@ class TestMetadataUsageBulkSinkErrorHandling(TestCase):
         mock_table = create_mock_table()
         table_usage = create_table_usage_with_queries()
 
-        self.mock_metadata.ingest_entity_queries_data.side_effect = create_api_error(409, "Entity already exists")
+        self.mock_metadata.ingest_queries_bulk.side_effect = create_api_error(409, "Entity already exists")
 
         initial_failures = len(self.sink.status.failures)
         self.sink.get_table_usage_and_joins([mock_table], table_usage)
+        self.sink._flush_queries()
 
         self.assertEqual(
             len(self.sink.status.failures),
@@ -118,12 +120,13 @@ class TestMetadataUsageBulkSinkErrorHandling(TestCase):
         mock_table = create_mock_table()
         table_usage = create_table_usage_with_queries()
 
-        self.mock_metadata.ingest_entity_queries_data.side_effect = create_api_error(
+        self.mock_metadata.ingest_queries_bulk.side_effect = create_api_error(
             400, "Date range can only include past 30 days starting today"
         )
 
         initial_failures = len(self.sink.status.failures)
         self.sink.get_table_usage_and_joins([mock_table], table_usage)
+        self.sink._flush_queries()
 
         self.assertEqual(
             len(self.sink.status.failures),
@@ -136,10 +139,11 @@ class TestMetadataUsageBulkSinkErrorHandling(TestCase):
         mock_table = create_mock_table()
         table_usage = create_table_usage_with_queries()
 
-        self.mock_metadata.ingest_entity_queries_data.side_effect = create_api_error(500, "Internal server error")
+        self.mock_metadata.ingest_queries_bulk.side_effect = create_api_error(500, "Internal server error")
 
         initial_failures = len(self.sink.status.failures)
         self.sink.get_table_usage_and_joins([mock_table], table_usage)
+        self.sink._flush_queries()
 
         self.assertEqual(
             len(self.sink.status.failures),
@@ -147,35 +151,33 @@ class TestMetadataUsageBulkSinkErrorHandling(TestCase):
             "500 error should add to failures list",
         )
 
-    def test_api_error_409_allows_processing_to_continue(self):
-        """Test that after a 409 error, the sink can continue processing other tables"""
+    def test_queries_for_all_tables_are_queued_and_sent_in_one_bulk_call(self):
+        """Every (query, table) pair of a file is handed to the bulk path once, on flush"""
         mock_table1 = create_mock_table("table1")
         mock_table2 = create_mock_table("table2")
         table_usage = create_table_usage_with_queries()
 
-        call_count = [0]
-
-        def side_effect_fn(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                raise create_api_error(409, "Entity already exists")
-            return None  # noqa: RET501
-
-        self.mock_metadata.ingest_entity_queries_data.side_effect = side_effect_fn
-
-        initial_failures = len(self.sink.status.failures)
         self.sink.get_table_usage_and_joins([mock_table1, mock_table2], table_usage)
+        self.mock_metadata.ingest_queries_bulk.assert_not_called()
+        self.sink._flush_queries()
 
-        self.assertEqual(
-            len(self.sink.status.failures),
-            initial_failures,
-            "409 errors should not add to failures list",
-        )
-        self.assertEqual(
-            self.mock_metadata.ingest_entity_queries_data.call_count,
-            2,
-            "Both tables should be processed",
-        )
+        self.mock_metadata.ingest_queries_bulk.assert_called_once()
+        pairs = self.mock_metadata.ingest_queries_bulk.call_args.args[0]
+        self.assertEqual([ref.id.root for _, ref in pairs], [mock_table1.id.root, mock_table2.id.root])
+        self.assertTrue(all(ref.type == "table" for _, ref in pairs))
+        self.assertEqual({query.query.root for query, _ in pairs}, {"SELECT * FROM test_table"})
+        self.assertEqual(self.sink._pending_queries, [])
+
+    def test_queue_flushes_early_when_it_reaches_the_size_bound(self):
+        from metadata.ingestion.bulksink import metadata_usage
+
+        mock_table = create_mock_table()
+        table_usage = create_table_usage_with_queries()
+        with patch.object(metadata_usage, "QUERY_FLUSH_SIZE", 2):
+            self.sink.get_table_usage_and_joins([mock_table, mock_table], table_usage)
+
+        self.mock_metadata.ingest_queries_bulk.assert_called_once()
+        self.assertEqual(len(self.mock_metadata.ingest_queries_bulk.call_args.args[0]), 2)
 
 
 class TestPublishQueryCostNoneHandling(TestCase):
@@ -372,3 +374,83 @@ class TestHandleQueryCostErrorHandling(TestCase):
             5,
             "All 5 cost records should be published",
         )
+
+
+class TestMetadataUsageBulkSinkDeferredWrites(TestCase):
+    """Per-table HTTP writes are merged and flushed concurrently instead of issued per usage record"""
+
+    def setUp(self):
+        self.mock_metadata = MagicMock()
+        self.mock_metadata.get_entity_reference.return_value = EntityReference(id=uuid4(), type="user")
+        self.sink = MetadataUsageBulkSink(
+            config=MetadataUsageSinkConfig(filename="/tmp/test_usage"), metadata=self.mock_metadata
+        )
+        self.sink.service_name = "test_service"
+
+    @staticmethod
+    def _usage(query_date: int, user: str = "alice"):
+        return TableUsageCount(
+            table="test_table",
+            date=str(query_date),
+            databaseName="test_db",
+            databaseSchema="test_schema",
+            count=1,
+            sqlQueries=[
+                CreateQueryRequest(
+                    query=SqlQuery("SELECT * FROM test_table"),
+                    query_type="SELECT",
+                    queryDate=Timestamp(query_date),
+                    users=[FullyQualifiedEntityName(user)],
+                    service=FullyQualifiedEntityName("test_service"),
+                )
+            ],
+            joins=[],
+            serviceName="test_service",
+        )
+
+    def test_life_cycle_is_patched_once_per_table_with_the_latest_access(self):
+        table = create_mock_table()
+
+        self.sink.get_table_usage_and_joins([table], self._usage(1702000000000))
+        self.sink.get_table_usage_and_joins([table], self._usage(1702200000000))
+        self.sink.get_table_usage_and_joins([table], self._usage(1702100000000))
+        self.mock_metadata.patch_life_cycle.assert_not_called()
+
+        self.sink._flush_deferred_writes()
+
+        self.mock_metadata.patch_life_cycle.assert_called_once()
+        life_cycle = self.mock_metadata.patch_life_cycle.call_args.kwargs["life_cycle"]
+        self.assertEqual(life_cycle.accessed.timestamp.root, 1702200000000)
+        self.assertEqual(self.sink._life_cycles, {})
+
+    def test_user_references_are_looked_up_once_per_user(self):
+        table = create_mock_table()
+
+        for date in (1702000000000, 1702100000000, 1702200000000):
+            self.sink.get_table_usage_and_joins([table], self._usage(date))
+            self.sink.get_table_usage_and_joins([table], self._usage(date, user="bob"))
+
+        self.assertEqual(self.mock_metadata.get_entity_reference.call_count, 2)
+
+    def test_usage_for_every_table_is_published_and_counted_as_scanned(self):
+        tables = [create_mock_table(f"t{i}") for i in range(5)]
+        for table in tables:
+            self.sink.get_table_usage_and_joins([table], create_table_usage())
+
+        self.sink._MetadataUsageBulkSink__publish_usage_records()
+
+        self.assertEqual(self.mock_metadata.publish_table_usage.call_count, 5)
+        self.assertEqual(
+            sorted(self.sink.status.records), sorted(f"Table: {t.fullyQualifiedName.root}" for t in tables)
+        )
+
+    def test_failed_usage_publish_is_recorded_without_stopping_the_others(self):
+        tables = [create_mock_table(f"t{i}") for i in range(3)]
+        for table in tables:
+            self.sink.get_table_usage_and_joins([table], create_table_usage())
+        self.mock_metadata.publish_table_usage.side_effect = [None, RuntimeError("boom"), None]
+
+        self.sink._MetadataUsageBulkSink__publish_usage_records()
+
+        self.assertEqual(len(self.sink.status.failures), 1)
+        self.assertEqual(len(self.sink.status.records), 2)
