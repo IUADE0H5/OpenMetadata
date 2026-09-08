@@ -61,6 +61,7 @@ from metadata.generated.schema.type.entityLineage import ColumnLineage
 from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.generated.schema.type.filterPattern import FilterPattern
 from metadata.ingestion.api.models import Either
+from metadata.ingestion.source.database.athena.lineage import AthenaLineageSource
 from metadata.ingestion.source.database.athena.metadata import AthenaSource
 from metadata.ingestion.source.database.athena.models import AthenaStatus
 from metadata.ingestion.source.database.athena.query_parser import (
@@ -349,6 +350,7 @@ class TestAthenaUsageYieldTableQueries:
         source = MagicMock()
         source.dialect.value = "athena"
         source.config.serviceName = "test_athena"
+        source.database_name = "default"
         source.start = datetime(2024, 1, 1)
         source.is_not_dbt_or_om_query.return_value = True
         return source
@@ -377,6 +379,19 @@ class TestAthenaUsageYieldTableQueries:
         assert len(results[0].queries) == 1
         assert results[0].queries[0].endTime == COMPLETION_DT.isoformat(" ", "seconds")
 
+    def test_database_name_is_set_on_table_query(self):
+        """Regression: TableQuery.databaseName must be set, or lineage/usage query
+        matching falls back to a wildcard instead of the database metadata sync used."""
+        status = AthenaStatus(State="SUCCEEDED", SubmissionDateTime=SUBMISSION_DT)
+
+        source = self._make_source()
+        source.database_name = "my_athena_account_id"
+        source.get_queries.return_value = [self._make_query_list(status)]
+
+        results = list(AthenaUsageSource.yield_table_queries(source))
+
+        assert results[0].queries[0].databaseName == "my_athena_account_id"
+
     def test_end_time_falls_back_to_submission_when_completion_missing(self):
         status = AthenaStatus(State="SUCCEEDED", SubmissionDateTime=SUBMISSION_DT)
 
@@ -388,6 +403,65 @@ class TestAthenaUsageYieldTableQueries:
         assert len(results) == 1
         assert len(results[0].queries) == 1
         assert results[0].queries[0].endTime == SUBMISSION_DT.isoformat(" ", "seconds")
+
+
+class TestAthenaLineageYieldTableQuery:
+    def _make_source(self, database_name="default"):
+        source = MagicMock()
+        source.dialect.value = "athena"
+        source.config.serviceName = "test_athena"
+        source.database_name = database_name
+        source.start = datetime(2024, 1, 1)
+        source.is_not_dbt_or_om_query.return_value = True
+        return source
+
+    def _make_query_list(self, status):
+        query = MagicMock()
+        query.Query = "SELECT 1"
+        query.Status = status
+        query_list = MagicMock()
+        query_list.QueryExecutions = [query]
+        return query_list
+
+    def test_database_name_is_set_on_table_query(self):
+        """Regression: databaseName must be set on the yielded TableQuery, or
+        lineage matching falls back to a wildcard instead of the database
+        metadata sync used, silently failing to resolve any table."""
+        status = AthenaStatus(State="SUCCEEDED", SubmissionDateTime=SUBMISSION_DT)
+        source = self._make_source(database_name="123456789012")
+        source.get_queries.return_value = [self._make_query_list(status)]
+
+        results = list(AthenaLineageSource.yield_table_query(source))
+
+        assert len(results) == 1
+        assert results[0].databaseName == "123456789012"
+
+    def test_defaults_to_default_when_no_database_name_configured(self):
+        status = AthenaStatus(State="SUCCEEDED", SubmissionDateTime=SUBMISSION_DT)
+        source = self._make_source(database_name="default")
+        source.get_queries.return_value = [self._make_query_list(status)]
+
+        results = list(AthenaLineageSource.yield_table_query(source))
+
+        assert results[0].databaseName == "default"
+
+
+class TestAthenaQueryParserDatabaseName:
+    """AthenaQueryParserSource.database_name mirrors CommonDbSourceService's
+    metadata-sync fallback, so usage/lineage query matching agrees with the
+    database name metadata sync actually used."""
+
+    def test_uses_configured_database_name(self):
+        source = MagicMock()
+        source.service_connection.databaseName = "my_custom_db"
+
+        assert AthenaQueryParserSource.database_name.fget(source) == "my_custom_db"
+
+    def test_falls_back_to_default_when_not_configured(self):
+        source = MagicMock()
+        source.service_connection.databaseName = None
+
+        assert AthenaQueryParserSource.database_name.fget(source) == "default"
 
 
 class TestAthenaGetWorkGroups:

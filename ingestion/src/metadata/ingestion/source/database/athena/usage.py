@@ -43,6 +43,7 @@ class AthenaUsageSource(AthenaQueryParserSource, UsageSource):
                 TableQuery(
                     dialect=self.dialect.value,
                     query=query.Query,
+                    databaseName=self.database_name,
                     startTime=query.Status.SubmissionDateTime.isoformat(DATETIME_SEPARATOR, DATETIME_TIME_SPEC),
                     endTime=query.Status.CompletionDateTime.isoformat(DATETIME_SEPARATOR, DATETIME_TIME_SPEC)
                     if getattr(query.Status, "CompletionDateTime", None)
