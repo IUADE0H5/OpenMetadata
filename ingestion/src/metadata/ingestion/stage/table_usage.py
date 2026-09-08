@@ -21,6 +21,9 @@ import traceback
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple  # noqa: UP035
 
+from cachetools import LRUCache
+from pydantic import Field
+
 from metadata.config.common import ConfigModel
 from metadata.generated.schema.api.data.createQuery import CreateQueryRequest
 from metadata.generated.schema.entity.services.ingestionPipelines.status import (
@@ -28,12 +31,17 @@ from metadata.generated.schema.entity.services.ingestionPipelines.status import 
 )
 from metadata.generated.schema.entity.teams.user import User
 from metadata.generated.schema.type.queryParserData import ParsedData, QueryParserData
-from metadata.generated.schema.type.tableUsageCount import TableUsageCount
+from metadata.generated.schema.type.tableUsageCount import TableColumnJoin, TableUsageCount
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.api.steps import Stage
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
 from metadata.utils.constants import UTF_8
-from metadata.utils.helpers import get_query_hash, init_staging_dir
+from metadata.utils.helpers import (
+    TRANSIENT_TABLE_PATTERNS,
+    get_query_hash,
+    init_staging_dir,
+    is_transient_table_name,
+)
 from metadata.utils.logger import ingestion_logger
 
 logger = ingestion_logger()
@@ -41,6 +49,13 @@ logger = ingestion_logger()
 
 class TableStageConfig(ConfigModel):
     filename: str
+    # Regexes, matched in full against the table component of a parsed reference, naming tables that
+    # never exist in the catalog; added to the built-in `TRANSIENT_TABLE_PATTERNS`.
+    transientTablePatterns: List[str] = Field(default_factory=list)  # noqa: N815, UP006
+
+    @property
+    def transient_table_patterns(self) -> Tuple[str, ...]:  # noqa: UP006
+        return TRANSIENT_TABLE_PATTERNS + tuple(self.transientTablePatterns)
 
 
 class TableUsageStage(Stage):
@@ -67,6 +82,9 @@ class TableUsageStage(Stage):
         init_staging_dir(self.config.filename)
         self.wrote_something = False
         self.service_name = ""
+        # Query logs repeat a handful of principals thousands of times; without this the stage
+        # spends most of a run on GET /users/name/{fqn}. Misses are cached too.
+        self._user_lookup_cache: LRUCache = LRUCache(maxsize=1000)
 
     @property
     def name(self) -> str:
@@ -98,12 +116,17 @@ class TableUsageStage(Stage):
         From the user received in the query history call - who executed the query in the db -
         return if we find any users in OM that match, plus the user that we found in the db record.
         """
-        if username:
+        if not username:
+            return None, None
+        if username in self._user_lookup_cache:
+            user_fqn = self._user_lookup_cache[username]
+        else:
             user = self.metadata.get_by_name(entity=User, fqn=username)
-            if user:
-                return [user.fullyQualifiedName.root], [username]
-            return None, [username]
-        return None, None
+            user_fqn = user.fullyQualifiedName.root if user else None
+            self._user_lookup_cache[username] = user_fqn
+        if user_fqn:
+            return [user_fqn], [username]
+        return None, [username]
 
     def _add_sql_query(self, record, table):
         users, used_by = self._get_user_entity(record.userName)
@@ -137,8 +160,20 @@ class TableUsageStage(Stage):
                 )
             ]
 
+    def _is_transient(self, table: Optional[str]) -> bool:  # noqa: UP045
+        return is_transient_table_name(table, self.config.transient_table_patterns)
+
+    def _catalog_joins(self, table_joins: Optional[List[TableColumnJoin]]) -> List[TableColumnJoin]:  # noqa: UP006, UP045
+        """Joins of a table, without the ones against tables that will never resolve."""
+        kept = []
+        for column_join in table_joins or []:
+            joined_with = [column for column in column_join.joinedWith if not self._is_transient(column.table)]
+            if joined_with:
+                kept.append(TableColumnJoin(tableColumn=column_join.tableColumn, joinedWith=joined_with))
+        return kept
+
     def _handle_table_usage(self, parsed_data: ParsedData, table: str) -> Iterable[Either[str]]:
-        table_joins = parsed_data.joins.get(table)
+        table_joins = self._catalog_joins(parsed_data.joins.get(table))
         try:
             self._add_sql_query(record=parsed_data, table=table)
             table_usage_count = self.table_usage.get((table, parsed_data.date))
@@ -204,6 +239,9 @@ class TableUsageStage(Stage):
             if parsed_data is None:
                 continue
             for table in parsed_data.tables:
+                if self._is_transient(table):
+                    logger.debug(f"Skipping transient table [{table}] in query [{parsed_data.sql}]")
+                    continue
                 yield from self._handle_table_usage(parsed_data=parsed_data, table=table)
             self._handle_query_cost(parsed_data)
         self.dump_data_to_file()
