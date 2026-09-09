@@ -324,14 +324,23 @@ class TopologyRunnerMixin(Generic[C]):
         """Compute children nodes if any"""
         return [get_topology_node(child, self.topology) for child in node.children] if node.children else []
 
+    def on_stage_failure(self, stage: NodeStage, node_entity: Any) -> None:
+        """Called once per entity a stage failed for - the processor raised, or it reported a
+        ``Left``. Sources that reconcile deletions against what a run produced override this to
+        keep the entity as still present: failed is not gone. The default does nothing."""
+
     def _run_stage_processor(self, stage: NodeStage, node_entity: Any) -> Iterable[Entity]:
         """Run the stage processor"""
         try:
             stage_fn = getattr(self, stage.processor)
-            yield from stage_fn(node_entity) or []
+            for entity_request in stage_fn(node_entity) or []:
+                if getattr(entity_request, "left", None) is not None:
+                    self.on_stage_failure(stage, node_entity)
+                yield entity_request
         except Exception as exc:
             logger.debug(traceback.format_exc())
             logger.error(f"Error running stage processor: {exc}")
+            self.on_stage_failure(stage, node_entity)
 
     def _process_stage(self, stage: NodeStage, node_entity: Any) -> Iterable[Entity]:
         """
