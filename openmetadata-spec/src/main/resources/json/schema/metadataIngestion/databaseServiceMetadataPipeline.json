@@ -54,6 +54,18 @@
       "default": true,
       "title": "Mark Deleted Tables"
     },
+    "allowEmptyingSchema": {
+      "description": "Guard for Mark Deleted Tables. A run that produced no table at all for a schema it lists - a filter that matches nothing in the source, a source that failed for that schema - would soft delete every table of that schema. By default such a schema is left untouched and the run reports it as a failure. Enable this to let one run empty a single schema; deleting several schemas in one run needs Allow Emptying Multiple Schemas as well. A table the run failed on always counts as still present.",
+      "type": "boolean",
+      "default": false,
+      "title": "Allow Emptying Schema"
+    },
+    "allowEmptyingMultipleSchemas": {
+      "description": "With Allow Emptying Schema, lets a single run soft delete every table of more than one schema - the unrestricted behaviour. Off by default: once a run has emptied one schema, further schemas that would be emptied are left untouched and reported.",
+      "type": "boolean",
+      "default": false,
+      "title": "Allow Emptying Multiple Schemas"
+    },
     "markDeletedStoredProcedures": {
       "description": "Optional configuration to soft delete stored procedures in OpenMetadata if the source stored procedures are deleted. Also, if the stored procedures is deleted, all the associated entities like lineage, etc., with that stored procedures will be deleted",
       "type": "boolean",

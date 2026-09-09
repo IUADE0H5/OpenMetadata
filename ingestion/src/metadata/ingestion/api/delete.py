@@ -13,6 +13,7 @@ Delete methods
 """
 
 import traceback
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Set, Type  # noqa: UP035
 
 from metadata.config.settings import ingestion_settings
@@ -29,6 +30,43 @@ from metadata.utils.logger import utils_logger
 logger = utils_logger()
 
 SERVICE_SCOPE_KEY = "service"
+
+
+@dataclass
+class StaleDeleteGuard:
+    """What a run may empty. Stale deletion removes every in-scope entity the run did not
+    produce, so a run that produced nothing for a scope it lists - a filter that matches nothing
+    in the source, a source that failed for that scope - would wipe the scope. Unless told it may,
+    such a scope is left untouched and reported.
+
+    One guard is shared by all the scopes of a run: with ``allow_empty_scope`` a single scope may
+    be emptied per run, and only ``allow_multiple_empty_scopes`` restores the unrestricted
+    behaviour. Scopes the run saw at least one entity in are reconciled normally.
+    """
+
+    allow_empty_scope: bool = False
+    allow_multiple_empty_scopes: bool = False
+    emptied: List[str] = field(default_factory=list)  # noqa: UP006
+
+    def permits_emptying(self, scope_fqn: str) -> Optional[str]:  # noqa: UP045
+        """None when the scope may be emptied, else the flag that would allow it."""
+        if not self.allow_empty_scope:
+            return "allowEmptyingSchema"
+        if self.emptied and scope_fqn not in self.emptied and not self.allow_multiple_empty_scopes:
+            return "allowEmptyingMultipleSchemas"
+        if scope_fqn not in self.emptied:
+            self.emptied.append(scope_fqn)
+        return None
+
+
+def _seen_in_scope(entity_source_state: Set[str], scope_fqn: str) -> bool:  # noqa: UP006
+    prefix = scope_fqn + "."
+    return any(fqn.startswith(prefix) for fqn in entity_source_state)
+
+
+def _live_in_scope(metadata: OpenMetadata, entity_type: Type[T], params: Dict[str, str]) -> int:  # noqa: UP006
+    listing = metadata.list_entities(entity=entity_type, params=params, limit=1)
+    return int(getattr(listing, "total", 0) or 0)
 
 
 def _default_dispatch_async() -> bool:
@@ -59,6 +97,39 @@ def _scope_params_as_fqn(params: Optional[Dict[str, str]]) -> Optional[Dict[str,
         return params
 
 
+PROCEED, SKIP = "proceed", "skip"
+
+
+def _guard_decision(
+    metadata: OpenMetadata,
+    entity_type: Type[T],  # noqa: UP006
+    entity_source_state: Set[str],  # noqa: UP006
+    params: Dict[str, str],  # noqa: UP006
+    guard: StaleDeleteGuard,
+):
+    """``PROCEED`` (something was seen in the scope, or the guard allows emptying it), ``SKIP``
+    (the scope holds nothing live, so there is nothing to delete), or the ``StackTraceError`` to
+    report instead of emptying the scope."""
+    scope_fqn = next(iter(params.values()))
+    if _seen_in_scope(entity_source_state, scope_fqn):
+        return PROCEED
+    live = _live_in_scope(metadata, entity_type, params)
+    if live == 0:
+        return SKIP
+    needed = guard.permits_emptying(scope_fqn)
+    if needed is None:
+        return PROCEED
+    return StackTraceError(
+        name=f"Delete stale {entity_type.__name__} in {scope_fqn}",
+        error=(
+            f"Refused: this run produced no {entity_type.__name__} for {scope_fqn} but it holds "
+            f"{live} - deleting them would empty the scope. Check the filters and the source; set "
+            f"{needed} on the pipeline if that is intended."
+        ),
+        stackTrace=None,
+    )
+
+
 def delete_entity_from_source(
     metadata: OpenMetadata,
     entity_type: Type[T],  # noqa: UP006
@@ -66,6 +137,7 @@ def delete_entity_from_source(
     recursive: bool = True,
     params: Optional[Dict[str, str]] = None,  # noqa: UP006, UP045
     dispatch_async: Optional[bool] = None,  # noqa: UP045
+    guard: Optional[StaleDeleteGuard] = None,  # noqa: UP045
 ) -> Iterable[Either[DeleteEntity]]:
     """
     Soft-delete the entities of ``entity_type`` within ``params`` scope that were not seen in
@@ -89,8 +161,19 @@ def delete_entity_from_source(
         server-side async endpoint (returns 202 + jobId, runs cascade on the server's
         executor) so ingestion does not block on large hierarchies — see issue #4003. The
         server-side bulk deleteStale path is already async by design and ignores this flag.
+    :param guard: When given, a scope the run produced nothing for is not emptied unless the
+        guard allows it; the refusal is reported as a failure of the run. Without it the scope is
+        emptied, as before.
     """
     use_async = dispatch_async if dispatch_async is not None else _default_dispatch_async()
+    if guard is not None and params:
+        decision = _guard_decision(metadata, entity_type, entity_source_state, params, guard)
+        if decision == SKIP:
+            return
+        if decision != PROCEED:
+            logger.warning(f"{decision.name}: {decision.error}")
+            yield Either(left=decision)  # pyright: ignore[reportCallIssue]
+            return
     # Flush the sink buffer so the scope entity and the entities seen this run are committed
     # before the server resolves the scope and computes what is stale.
     barrier = Barrier(reason=f"flush_before_delete_stale:{entity_type.__name__}")

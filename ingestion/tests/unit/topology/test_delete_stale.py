@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from metadata.generated.schema.type.bulkOperationResult import BulkOperationResult
 from metadata.ingestion.api.delete import delete_entity_from_source
+from metadata.ingestion.api.models import Either
 from metadata.ingestion.models.barrier import Barrier
 from metadata.ingestion.ometa.client import APIError
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
@@ -301,3 +302,86 @@ class TestServiceScopeIsSentAsFqn:
         body = metadata.client.delete.call_args.kwargs["json"]
         assert body["scopeFqn"] == '"Looker- 2.0 Test"'
         assert body["scopeEntityType"] == "service"
+
+
+class TestStaleDeleteGuard:
+    """A run that produced nothing for a scope must not empty that scope unless told it may."""
+
+    @staticmethod
+    def _metadata(live_total: int):
+        metadata = MagicMock()
+        metadata.get_suffix.return_value = "/tables"
+        metadata.delete_stale_entities.return_value = BulkOperationResult(
+            status="success", numberOfRowsProcessed=0, numberOfRowsPassed=0, numberOfRowsFailed=0
+        )
+        metadata.list_entities.return_value = MagicMock(total=live_total)
+        return metadata
+
+    @staticmethod
+    def _run(metadata, seen, guard, scope="svc.db.sch"):
+        from metadata.ingestion.api.delete import delete_entity_from_source
+
+        results = list(
+            delete_entity_from_source(
+                metadata=metadata,
+                entity_type=MockEntity,
+                entity_source_state=seen,
+                recursive=True,
+                params={"databaseSchema": scope},
+                guard=guard,
+            )
+        )
+        return [r.left for r in results if isinstance(r, Either) and r.left is not None]
+
+    def test_a_scope_the_run_saw_tables_in_is_reconciled_normally(self):
+        from metadata.ingestion.api.delete import StaleDeleteGuard
+
+        metadata = self._metadata(live_total=5)
+        errors = self._run(metadata, {"svc.db.sch.t1"}, StaleDeleteGuard())
+        assert errors == []
+        metadata.delete_stale_entities.assert_called_once()
+        metadata.list_entities.assert_not_called()
+
+    def test_a_scope_with_nothing_seen_and_nothing_live_needs_no_delete(self):
+        from metadata.ingestion.api.delete import StaleDeleteGuard
+
+        metadata = self._metadata(live_total=0)
+        errors = self._run(metadata, set(), StaleDeleteGuard())
+        assert errors == []
+        metadata.delete_stale_entities.assert_not_called()
+
+    def test_emptying_a_scope_is_refused_by_default_and_reported(self):
+        from metadata.ingestion.api.delete import StaleDeleteGuard
+
+        metadata = self._metadata(live_total=524)
+        errors = self._run(metadata, {"svc.db.other.t1"}, StaleDeleteGuard())
+        metadata.delete_stale_entities.assert_not_called()
+        assert len(errors) == 1
+        assert "svc.db.sch" in errors[0].name
+        assert "524" in errors[0].error and "allowEmptyingSchema" in errors[0].error
+
+    def test_the_flag_allows_one_scope_to_be_emptied_per_run(self):
+        from metadata.ingestion.api.delete import StaleDeleteGuard
+
+        guard = StaleDeleteGuard(allow_empty_scope=True)
+        first = self._metadata(live_total=10)
+        assert self._run(first, set(), guard, scope="svc.db.a") == []
+        first.delete_stale_entities.assert_called_once()
+        second = self._metadata(live_total=10)
+        errors = self._run(second, set(), guard, scope="svc.db.b")
+        second.delete_stale_entities.assert_not_called()
+        assert len(errors) == 1 and "allowEmptyingMultipleSchemas" in errors[0].error
+
+    def test_the_second_flag_restores_the_unrestricted_behaviour(self):
+        from metadata.ingestion.api.delete import StaleDeleteGuard
+
+        guard = StaleDeleteGuard(allow_empty_scope=True, allow_multiple_empty_scopes=True)
+        for scope in ("svc.db.a", "svc.db.b", "svc.db.c"):
+            metadata = self._metadata(live_total=10)
+            assert self._run(metadata, set(), guard, scope=scope) == []
+            metadata.delete_stale_entities.assert_called_once()
+
+    def test_without_a_guard_nothing_changes(self):
+        metadata = self._metadata(live_total=524)
+        assert self._run(metadata, set(), None) == []
+        metadata.delete_stale_entities.assert_called_once()

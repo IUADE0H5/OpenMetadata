@@ -25,6 +25,7 @@ from metadata.generated.schema.entity.data.table import (
     Column,
     Constraint,
     DataType,
+    Table,
     TableType,
 )
 from metadata.generated.schema.entity.services.databaseService import (
@@ -892,6 +893,27 @@ class PostgresUnitTest(TestCase):
         # the failure must name the offending procedure, not "UNKNOWN"
         reported_error = self.postgres_source.status.failed.call_args.kwargs["error"]
         self.assertEqual(reported_error.name, "null_prosrc_func")
+
+    def test_a_table_the_run_failed_on_still_counts_as_seen(self):
+        """Unknown is not gone: a table whose stage errored must not be deleted as stale."""
+        source = self.postgres_source
+        source.database_source_state = set()
+        source.context.get().__dict__["database_service"] = "postgres_source"
+        source.context.get().__dict__["database"] = "118146679784"
+        source.context.get().__dict__["database_schema"] = "default"
+
+        table_stage = next(stage for stage in source.topology.table.stages if stage.type_ is Table)
+        source.on_stage_failure(table_stage, ("throttled", TableType.Regular))
+
+        self.assertEqual(source.database_source_state, {"postgres_source.118146679784.default.throttled"})
+
+    def test_the_stale_delete_guard_follows_the_pipeline_flags(self):
+        source = self.postgres_source
+        source.source_config.allowEmptyingSchema = True
+        source.source_config.allowEmptyingMultipleSchemas = False
+        guard = source.stale_delete_guard
+        self.assertTrue(guard.allow_empty_scope)
+        self.assertFalse(guard.allow_multiple_empty_scopes)
 
 
 class TestPostgresCommonMappings(TestCase):
