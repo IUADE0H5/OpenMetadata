@@ -13,6 +13,7 @@ Lineage Parser configuration
 """
 
 import hashlib
+import re
 import time
 import traceback
 from collections import defaultdict
@@ -87,6 +88,10 @@ class LineageParser:
         self.query_hash = self.get_query_hash(query)
         self.query_parsing_success = True
         self.query_parsing_failure_reason = None
+        # Which parser delivered, and - when it was not the first one tried - why the earlier one
+        # gave up. A fallback that works is a successful parse; the reason stays visible.
+        self.parser_name: Optional[str] = None  # noqa: UP045
+        self.fallback_reason: Optional[str] = None  # noqa: UP045
         self.dialect = dialect
         self.masked_query = None
         self._clean_query = self.clean_raw_query(query)
@@ -106,6 +111,21 @@ class LineageParser:
                 )
                 or self._clean_query
             )
+
+    def _parser_selected(self, name: str, recovered: bool = True) -> None:
+        """Record the parser that delivered. If an earlier parser had failed, that failure is kept
+        as ``fallback_reason`` and said once at INFO; the parse itself is a success - otherwise the
+        column lineage this parser produced would be dropped downstream as if nothing had parsed.
+        ``recovered=False`` is the last-resort sqlparse pass, whose output is degraded (no column
+        lineage, tables only) and keeps the earlier failure as the parse's reason."""
+        if recovered and not self.query_parsing_success:
+            reason = re.sub(r"^\[[^\]]*\] ", "", self.query_parsing_failure_reason or "")
+            self.fallback_reason = reason
+            logger.info(f"[{self.query_hash}] {name} parsed the query after a fallback: {reason}")
+            self.query_parsing_success = True
+            self.query_parsing_failure_reason = None
+        self.parser_name = name
+        logger.debug(f"[{self.query_hash}] Selected {name} for query parsing")
 
     @staticmethod
     def get_query_hash(query: str, length: int = 8) -> str:
@@ -130,9 +150,9 @@ class LineageParser:
         :return: List of involved tables
         """
         try:
-            logger.debug(f"[{self.query_hash}] [UsageSink] Source tables: {self.source_tables}")
-            logger.debug(f"[{self.query_hash}] [UsageSink] Intermediate tables: {self.intermediate_tables}")
-            logger.debug(f"[{self.query_hash}] [UsageSink] Target tables: {self.target_tables}")
+            logger.debug(f"[{self.query_hash}] Source tables: {self.source_tables}")
+            logger.debug(f"[{self.query_hash}] Intermediate tables: {self.intermediate_tables}")
+            logger.debug(f"[{self.query_hash}] Target tables: {self.target_tables}")
 
             return list(set(self.source_tables).union(set(self.intermediate_tables)).union(set(self.target_tables)))
 
@@ -569,8 +589,7 @@ class LineageParser:
                 lr_sqlglot = None
 
             if lr_sqlglot:
-                self.query_hash += "-SqlGlot"
-                logger.debug(f"[{self.query_hash}] Selected SqlGlot for query parsing")
+                self._parser_selected("SqlGlot")
                 return lr_sqlglot
 
         @timeout(seconds=timeout_seconds)
@@ -618,8 +637,7 @@ class LineageParser:
                 lr_sqlfluff = None
 
             if lr_sqlfluff:
-                self.query_hash += "-SqlFluff"
-                logger.debug(f"[{self.query_hash}] Selected SqlFluff for query parsing")
+                self._parser_selected("SqlFluff")
                 return lr_sqlfluff
 
         @timeout(seconds=timeout_seconds)
@@ -667,8 +685,7 @@ class LineageParser:
             lr_sqlparse = None
 
         if lr_sqlparse:
-            self.query_hash += "-SqlParse"
-            logger.debug(f"[{self.query_hash}] Selected SqlParse for query parsing")
+            self._parser_selected("SqlParse", recovered=False)
             return lr_sqlparse
 
         # log failed query

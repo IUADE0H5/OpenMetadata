@@ -99,6 +99,9 @@ class ParsedLineage:
     has_udf_source: bool = False
     parse_failed: bool = False
     failure_reason: Optional[str] = None  # noqa: UP045
+    # the parser that delivered, and the earlier parser's failure when it was a fallback
+    parser_name: Optional[str] = None  # noqa: UP045
+    fallback_reason: Optional[str] = None  # noqa: UP045
 
 
 def _shape_key(query: str, dialect: Dialect, parser_type: QueryParserType) -> tuple:
@@ -151,6 +154,8 @@ def _parse_lineage_in_worker(args: Tuple[str, str, str]) -> ParsedLineage:  # no
         column_lineage_map=populate_column_lineage_map(parser.column_lineage) if parser.query_parsing_success else {},
         has_udf_source=any(isinstance(table, DataFunction) for table in sources),
         failure_reason=None if parser.query_parsing_success else parser.query_parsing_failure_reason,
+        parser_name=getattr(parser, "parser_name", None),
+        fallback_reason=getattr(parser, "fallback_reason", None),
     )
 
 

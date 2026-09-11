@@ -297,9 +297,10 @@ def get_table_fqn_from_query_name(
     else:
         database_query, schema_query, table = (empty_list * (3 - len(split_table))) + split_table
 
+        # Only what the statement itself qualifies: a missing database here is normal (the run's
+        # database applies), it is not a lookup failure.
         logger.debug(
-            f"[UsageSink] Extracted components before cleanup -> "
-            f"database: {database_query}, schema: {schema_query}, table: {table}"
+            f"Table reference as written -> database: {database_query}, schema: {schema_query}, table: {table}"
         )
 
     if schema_query == DEFAULT_SCHEMA_NAME:

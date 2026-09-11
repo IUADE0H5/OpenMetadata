@@ -657,3 +657,34 @@ END $$"""
         self.assertEqual(parser.source_tables, [])
         self.assertEqual(parser.target_tables, [])
         self.assertEqual(parser.column_lineage, [])
+
+
+MERGE_WITH_CTE_WILDCARD = """
+MERGE INTO cur.t t USING (
+    WITH r AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY ts DESC) AS rn FROM raw.t)
+    SELECT * FROM r WHERE rn = 1
+) s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.v
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)
+"""
+
+
+def test_a_parser_that_delivers_after_another_failed_is_a_successful_parse():
+    """collate-sqllineage 2.1.7's SqlGlot analyzer dies with KeyError 'type' on a MERGE whose USING
+    subquery selects * from a CTE; SqlFluff then parses it. That is a success with a story, not a
+    failure: the flag must say so, or the pool drops whatever the fallback produced."""
+    parser = LineageParser(MERGE_WITH_CTE_WILDCARD, dialect=Dialect.ATHENA)
+    assert parser.query_parsing_success is True
+    assert parser.query_parsing_failure_reason is None
+    assert parser.parser_name == "SqlFluff"
+    assert parser.fallback_reason and "SqlGlot" in parser.fallback_reason and "'type'" in parser.fallback_reason
+    assert {str(t) for t in parser.source_tables} == {"raw.t"} and {str(t) for t in parser.target_tables} == {"cur.t"}
+
+
+def test_the_query_hash_never_changes_with_the_parser_chosen():
+    """One id per query in the logs, whichever parser ends up delivering."""
+    plain = LineageParser("INSERT INTO cur.t SELECT id, v FROM raw.t", dialect=Dialect.ATHENA)
+    assert plain.query_hash == LineageParser.get_query_hash(plain.query) and "-" not in plain.query_hash
+    assert plain.parser_name == "SqlGlot" and plain.fallback_reason is None
+    fallback = LineageParser(MERGE_WITH_CTE_WILDCARD, dialect=Dialect.ATHENA)
+    assert fallback.query_hash == LineageParser.get_query_hash(fallback.query) and "-" not in fallback.query_hash

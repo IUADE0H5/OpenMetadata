@@ -385,3 +385,28 @@ def test_unnest_is_not_a_udf_source_but_a_real_function_is(monkeypatch):
     fake.source_tables = [udf, "s.u"]
     parsed = module._parse_lineage_in_worker(("q", "athena", "Auto"))
     assert parsed.has_udf_source is True and str(udf) in parsed.source_tables
+
+
+def test_a_fallback_parse_keeps_its_column_lineage_and_says_which_parser_delivered(monkeypatch):
+    from types import SimpleNamespace
+
+    from metadata.ingestion.lineage import query_lineage_pool as module
+
+    fake = SimpleNamespace(
+        query_parsing_success=True,
+        query_parsing_failure_reason=None,
+        parser_name="SqlFluff",
+        fallback_reason="Query parsing with SqlGlot failed with error: 'type'",
+        masked_query="MERGE INTO s.t USING (SELECT * FROM s.u) x ON ?",
+        query_hash="h4",
+        source_tables=["s.u"],
+        target_tables=["s.t"],
+        intermediate_tables=[],
+        column_lineage=[],
+    )
+    monkeypatch.setattr(module, "LineageParser", lambda *a, **k: fake)
+
+    parsed = module._parse_lineage_in_worker(("MERGE INTO s.t USING (SELECT * FROM s.u) x ON 1=1", "athena", "Auto"))
+
+    assert parsed.parse_failed is False and parsed.failure_reason is None
+    assert parsed.parser_name == "SqlFluff" and "SqlGlot" in parsed.fallback_reason
