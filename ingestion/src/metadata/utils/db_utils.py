@@ -101,12 +101,18 @@ def get_view_lineage(
         )
         query_hash = lineage_parser.query_hash
 
-        if table_entity.serviceType == DatabaseServiceType.Postgres:
+        # table_entity is None when the view's own entity cannot be resolved (not yet ingested, or a
+        # transient lookup miss - e.g. a name the catalog stores with characters that make the lookup
+        # fail intermittently). The serviceType schema fallbacks and the table-entity branch below
+        # need it; query-based lineage does not. Guard every use so a missing entity degrades
+        # gracefully instead of raising AttributeError, which the broad except below otherwise turns
+        # into a misleading "Could not parse query" for what is really an unresolved-entity case.
+        if table_entity is not None and table_entity.serviceType == DatabaseServiceType.Postgres:
             # For Postgres, if schema is not defined, we need to use the public schema
             schema_name = PUBLIC_SCHEMA
             schema_fallback = True
 
-        if table_entity.serviceType == DatabaseServiceType.Dremio:
+        if table_entity is not None and table_entity.serviceType == DatabaseServiceType.Dremio:
             # Dremio folders nest arbitrarily deep and are flattened into a single dotted
             # schema name (`folder.subfolder`), but a Dremio query spells every folder out
             # as its own path segment. The SQL parser keeps only the first two segments as
@@ -135,7 +141,7 @@ def get_view_lineage(
                 or []
             )
 
-        else:
+        elif table_entity is not None:
             yield from (
                 get_lineage_via_table_entity(
                     metadata,
@@ -152,6 +158,10 @@ def get_view_lineage(
                 )
                 or []
             )
+        else:
+            # No parseable source/target tables and no view entity to fall back on: nothing to link.
+            # Logged as the real reason instead of being reported as a parse failure.
+            logger.debug(f"View entity not found for [{table_fqn}] and no source/target parsed; skipping view lineage")
     except Exception as exc:
         logger.debug(traceback.format_exc())
         logger.warning(f"Could not parse query [{view_definition}] ingesting lineage failed: {exc}")
