@@ -80,6 +80,10 @@ from metadata.utils.ssl_manager import SSLManager, check_ssl_and_init
 
 logger = ingestion_logger()
 
+# A partitioned table of these types keeps its type: the format (Iceberg) or the object kind (views)
+# says more about the table than "Partitioned", and the Iceberg profiler gates on it.
+PARTITION_PRESERVED_TABLE_TYPES = (TableType.View, TableType.MaterializedView, TableType.Iceberg)
+
 
 class ColumnAndReferredColumn(BaseModel):
     table_name: str
@@ -609,10 +613,7 @@ class CommonDbSourceService(DatabaseServiceSource, SqlColumnHandlerMixin, SqlAlc
             is_partitioned, partition_details = self.get_table_partition_details(
                 table_name=table_name, schema_name=schema_name, inspector=self.inspector
             )
-            if is_partitioned and table_type not in (
-                TableType.View,
-                TableType.MaterializedView,
-            ):
+            if is_partitioned and table_type not in PARTITION_PRESERVED_TABLE_TYPES:
                 table_request.tableType = TableType.Partitioned.value
             if is_partitioned:
                 table_request.tablePartition = partition_details

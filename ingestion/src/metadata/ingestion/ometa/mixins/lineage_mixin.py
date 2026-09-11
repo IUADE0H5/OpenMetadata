@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from metadata.generated.schema.api.lineage.addLineage import AddLineageRequest
 from metadata.generated.schema.entity.services.databaseService import DatabaseService
-from metadata.generated.schema.type.basic import FullyQualifiedEntityName, Uuid
+from metadata.generated.schema.type.basic import FullyQualifiedEntityName, SqlQuery, Uuid
 from metadata.generated.schema.type.entityLineage import (
     ColumnLineage,
     EntitiesEdge,
@@ -194,26 +194,44 @@ class OMetaLineageMixin(Generic[T]):
         original: Sequence[Dict[str, Any] | ColumnLineage] | None,  # noqa: UP006
         updated: Sequence[Dict[str, Any] | ColumnLineage] | None,  # noqa: UP006
     ) -> list[dict[str, Any]]:
-        flat_original_result = set()
-        flat_updated_result = set()
-        original_data: list[dict[str, Any]] = [
-            column.model_dump() if isinstance(column, ColumnLineage) else column for column in original or []
-        ]
+        # Stored pairs first, in their stored order, then the new ones; every pair once. An edge
+        # that already holds duplicates comes back collapsed, so the next patch removes them.
+        merged: list[dict[str, Any]] = []
+        seen: set = set()
         try:
-            for column in original_data:
-                if column.get("toColumn") and column.get("fromColumns"):
-                    flat_original_result.add((*column.get("fromColumns", []), column.get("toColumn")))
-            for column in updated or []:
+            for column in [*(original or []), *(updated or [])]:
                 data = column.model_dump() if isinstance(column, ColumnLineage) else column
-                if data.get("toColumn") and data.get("fromColumns"):
-                    flat_updated_result.add((*data.get("fromColumns", []), data.get("toColumn")))
+                if not (data.get("toColumn") and data.get("fromColumns")):
+                    continue
+                key = (*data.get("fromColumns", []), data.get("toColumn"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(dict(data))
         except Exception as exc:
             logger.debug(f"Error while merging column lineage: {exc}")
             logger.debug(traceback.format_exc())
-        union_result = flat_original_result.union(flat_updated_result)
-        if flat_original_result == union_result:
-            return original_data
-        return [{"fromColumns": list(col_data[:-1]), "toColumn": col_data[-1]} for col_data in union_result]
+        return merged
+
+    @staticmethod
+    def _stored_sql_query(edge: Optional[Dict[str, Any]]) -> Optional[str]:  # noqa: UP006, UP045
+        return ((edge or {}).get("edge") or {}).get("sqlQuery")
+
+    @staticmethod
+    def _remember_edge(cache_key: str, existing: Optional[Dict[str, Any]], details: LineageDetails) -> None:  # noqa: UP006, UP045
+        """Keep the edge cache in step with what was just written. The lookup is LRU-cached, so
+        without this every later write of the same edge merges against a stale copy and the JSON
+        patch re-adds column pairs already stored - one duplicate per repeated statement."""
+        edge = dict((existing or {}).get("edge") or {})
+        edge["columnsLineage"] = [
+            column.model_dump(mode="json") if isinstance(column, ColumnLineage) else column
+            for column in details.columnsLineage or []
+        ]
+        if details.sqlQuery:
+            edge["sqlQuery"] = model_str(details.sqlQuery)
+        if details.pipeline:
+            edge["pipeline"] = details.pipeline.model_dump(mode="json")
+        search_cache.put(cache_key, {**(existing or {}), "edge": edge})
 
     def _update_cache(self, request: AddLineageRequest, response: Dict[str, Any]):  # noqa: UP006
         try:
@@ -250,6 +268,7 @@ class OMetaLineageMixin(Generic[T]):
         FQN (e.g. the metadata sink) get it rebuilt from the request they already hold.
         """
         data = deepcopy(data)
+        edge = None
         try:
             patch_op_success = False
             if check_patch and data.edge.lineageDetails:
@@ -265,9 +284,13 @@ class OMetaLineageMixin(Generic[T]):
                         if edge["edge"].get("pipeline")
                         else None
                     )
-                    # `original` mirrors `data`, so build_patch would see no sqlQuery diff. Null it so
-                    # the incoming query is added/updated, while a missing one keeps the stored value.
-                    original.edge.lineageDetails.sqlQuery = None  # pyright: ignore[reportOptionalMemberAccess]
+                    # `original` mirrors `data`, so build_patch would see no sqlQuery diff. Give it the
+                    # stored query so an incoming query is added or updated only when it differs, while
+                    # a missing incoming one keeps the stored value untouched.
+                    stored_query = self._stored_sql_query(edge) if data.edge.lineageDetails.sqlQuery else None
+                    original.edge.lineageDetails.sqlQuery = (  # pyright: ignore[reportOptionalMemberAccess]
+                        SqlQuery(stored_query) if stored_query else None
+                    )
                     # merge the original and new column level lineage
                     data.edge.lineageDetails.columnsLineage = self._merge_column_lineage(
                         original.edge.lineageDetails.columnsLineage,
@@ -294,6 +317,12 @@ class OMetaLineageMixin(Generic[T]):
 
             if patch_op_success is False:
                 self.client.put(self.get_suffix(AddLineageRequest), data=data.model_dump_json())
+            if check_patch and data.edge.lineageDetails:
+                self._remember_edge(
+                    self._lineage_edge_cache_key(data.edge.fromEntity, data.edge.toEntity),
+                    edge,
+                    data.edge.lineageDetails,
+                )
 
         except APIError as err:
             logger.debug(traceback.format_exc())
@@ -324,6 +353,7 @@ class OMetaLineageMixin(Generic[T]):
         return_lineage: bool = True,
     ) -> Dict[str, Any]:  # noqa: UP006
         lineage_details = deepcopy(lineage_details) if lineage_details else LineageDetails.model_validate({})
+        edge = None
         try:
             patch_op_success = False
             if check_patch and lineage_details:
@@ -340,14 +370,15 @@ class OMetaLineageMixin(Generic[T]):
                         if edge["edge"].get("pipeline")
                         else None
                     )
-                    # sqlQuery is intentionally left out so it defaults to None: that forces build_patch
-                    # to add/update the incoming query. Do not populate it from the stored edge here.
+                    # The stored query is set only when one is incoming, so build_patch adds or updates
+                    # it when it differs and leaves a stored query alone when the incoming one is empty.
                     original = LineageDetails.model_validate(
                         {
                             "columnsLineage": [
                                 ColumnLineage.model_validate(column_lineage) for column_lineage in original_columns
                             ],
                             "pipeline": original_pipeline,
+                            "sqlQuery": self._stored_sql_query(edge) if lineage_details.sqlQuery else None,
                         }
                     )
                     updated_columns = [
@@ -379,6 +410,12 @@ class OMetaLineageMixin(Generic[T]):
                     f"{LINEAGE_ROUTE}/"
                     f"{self._lineage_edge_path_by_name(from_entity_type, from_entity_fqn, to_entity_type, to_entity_fqn)}",
                     data=lineage_details.model_dump_json(),
+                )
+            if check_patch:
+                self._remember_edge(
+                    self._lineage_edge_name_cache_key(from_entity_type, from_entity_fqn, to_entity_type, to_entity_fqn),
+                    edge,
+                    lineage_details,
                 )
 
         except APIError as err:

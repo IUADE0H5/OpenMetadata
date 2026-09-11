@@ -15,6 +15,7 @@ to the OM API.
 """
 
 import json
+import threading
 import traceback
 from functools import singledispatchmethod
 from typing import Any, Optional, TypeVar, Union
@@ -170,6 +171,11 @@ class MetadataRestSinkConfig(ConfigModel):
     enable_async_pipeline: bool = True
     async_pipeline_workers: int = 2
     override_metadata: bool = False
+    # Lineage is written one edge at a time (no bulk lineage API). With check_patch on, every edge
+    # first does a getLineageEdge GET to merge column lineage; on a fresh/initial load that GET only
+    # ever 404s, doubling the round trips per edge. Set false for a first backfill to PUT directly;
+    # keep true for incremental re-runs that must preserve existing column-level lineage.
+    checkPatchLineage: bool = True  # noqa: N815
 
 
 class MetadataRestSink(Sink):  # pylint: disable=too-many-public-methods
@@ -203,6 +209,12 @@ class MetadataRestSink(Sink):  # pylint: disable=too-many-public-methods
         # of the generic entity bulk path.
         self.query_buffer: list[CreateQueryRequest] = []
         self.buffered_query_checksums: set[str] = set()
+        # Guards the entity/query buffers and their dedup sets so the sink can be driven by
+        # several consumer threads at once (see IngestionWorkflow concurrent lineage consume).
+        # The lineage write path itself (write_lineage -> add_lineage) takes no lock: it mutates
+        # only the already lock-guarded lineage edge cache, so parallel edge writes never contend
+        # on this lock. _flush_buffer / _flush_query_buffer run with this lock held by their caller.
+        self._buffer_lock = threading.Lock()
 
     @classmethod
     def create(
@@ -273,37 +285,38 @@ class MetadataRestSink(Sink):  # pylint: disable=too-many-public-methods
         ):
             return self.write_create_single_request(entity_request)
 
-        # Deduplicate entities by name to avoid duplicate FQN hash errors
-        # These are CreateRequest types that may have duplicate names from source systems
-        if isinstance(
-            entity_request,
-            (
-                CreateDashboardDataModelRequest,  # QuickSight: multiple tables with same DataSourceId
-            ),
-        ):
-            if self._is_duplicate_in_buffer(entity_request):
-                logger.debug(
-                    f"Skipping duplicate {type(entity_request).__name__} with name: {entity_request.name.root}"
-                )
+        with self._buffer_lock:
+            # Deduplicate entities by name to avoid duplicate FQN hash errors
+            # These are CreateRequest types that may have duplicate names from source systems
+            if isinstance(
+                entity_request,
+                (
+                    CreateDashboardDataModelRequest,  # QuickSight: multiple tables with same DataSourceId
+                ),
+            ):
+                if self._is_duplicate_in_buffer(entity_request):
+                    logger.debug(
+                        f"Skipping duplicate {type(entity_request).__name__} with name: {entity_request.name.root}"
+                    )
+                    return Either(right=None)  # pyright: ignore[reportCallIssue]
+
+                # Track this entity for future duplicate checks (only for types that need deduplication)
+                self._track_entity_in_buffer(entity_request)
+
+            self.buffer.append(entity_request)
+            try:
+                if len(self.buffer) >= self.config.bulk_sink_batch_size:
+                    return self._flush_buffer()
                 return Either(right=None)
-
-            # Track this entity for future duplicate checks (only for types that need deduplication)
-            self._track_entity_in_buffer(entity_request)
-
-        self.buffer.append(entity_request)
-        try:
-            if len(self.buffer) >= self.config.bulk_sink_batch_size:
-                return self._flush_buffer()
-            return Either(right=None)
-        except LimitsException as _:
-            self.limit_reached.add(type(entity_request).__name__)
-            return Either(
-                left=StackTraceError(
-                    name=type(entity_request).__name__,
-                    error=f"Limit reached for {type(entity_request).__name__}",
-                    stackTrace=None,
+            except LimitsException as _:
+                self.limit_reached.add(type(entity_request).__name__)
+                return Either(  # pyright: ignore[reportCallIssue]
+                    left=StackTraceError(
+                        name=type(entity_request).__name__,
+                        error=f"Limit reached for {type(entity_request).__name__}",
+                        stackTrace=None,
+                    )
                 )
-            )
 
     def _track_entity_in_buffer(self, entity_request) -> None:
         """
@@ -422,13 +435,14 @@ class MetadataRestSink(Sink):  # pylint: disable=too-many-public-methods
         """
         checksum = get_query_checksum(model_str(record.query))
         result = Either(right=None)  # pyright: ignore[reportCallIssue]
-        if checksum in self.buffered_query_checksums:
-            logger.debug(f"Skipping duplicate query with checksum {checksum}")
-        else:
-            self.buffered_query_checksums.add(checksum)
-            self.query_buffer.append(record)
-            if len(self.query_buffer) >= self.config.bulk_sink_batch_size:
-                result = self._flush_query_buffer()
+        with self._buffer_lock:
+            if checksum in self.buffered_query_checksums:
+                logger.debug(f"Skipping duplicate query with checksum {checksum}")
+            else:
+                self.buffered_query_checksums.add(checksum)
+                self.query_buffer.append(record)
+                if len(self.query_buffer) >= self.config.bulk_sink_batch_size:
+                    result = self._flush_query_buffer()
         return result
 
     def _flush_query_buffer(self) -> Either[Entity]:
@@ -561,7 +575,11 @@ class MetadataRestSink(Sink):  # pylint: disable=too-many-public-methods
     def write_lineage(self, add_lineage: AddLineageRequest) -> Either[str]:
         # return_lineage=False: we only need a status identifier below, so skip the expensive
         # per-edge full-graph GET that otherwise dominates lineage-heavy ingestions.
-        created_lineage = self.metadata.add_lineage(add_lineage, check_patch=True, return_lineage=False)
+        # check_patch is configurable: on a fresh/initial load the pre-write getLineageEdge GET only
+        # 404s, so checkPatchLineage=false halves the round trips per edge (no column-merge needed).
+        created_lineage = self.metadata.add_lineage(
+            add_lineage, check_patch=self.config.checkPatchLineage, return_lineage=False
+        )
         if created_lineage.get("error"):
             return Either(left=StackTraceError(name="AddLineageRequestError", error=created_lineage["error"]))
 
@@ -583,7 +601,7 @@ class MetadataRestSink(Sink):  # pylint: disable=too-many-public-methods
             to_entity_fqn=add_lineage.to_entity_fqn,
             to_entity_type=add_lineage.to_entity_type,
             lineage_details=add_lineage.lineage_details,
-            check_patch=True,
+            check_patch=self.config.checkPatchLineage,
             return_lineage=False,
         )
         if not created_lineage or created_lineage.get("error"):
