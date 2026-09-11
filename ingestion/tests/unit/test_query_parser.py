@@ -669,10 +669,19 @@ WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)
 """
 
 
-def test_a_parser_that_delivers_after_another_failed_is_a_successful_parse():
-    """collate-sqllineage 2.1.7's SqlGlot analyzer dies with KeyError 'type' on a MERGE whose USING
-    subquery selects * from a CTE; SqlFluff then parses it. That is a success with a story, not a
-    failure: the flag must say so, or the pool drops whatever the fallback produced."""
+class _BrokenAnalyzer:
+    """Stands in for the SqlGlot analyzer of collate-sqllineage 2.1.7, which died with KeyError
+    'type' on a MERGE whose USING subquery selects *; a fixed library parses that itself, so the
+    fallback is forced here rather than relied upon."""
+
+    def __init__(self, *args, **kwargs):
+        raise KeyError("type")
+
+
+def test_a_parser_that_delivers_after_another_failed_is_a_successful_parse(monkeypatch):
+    """SqlFluff parsing a statement SqlGlot gave up on is a success with a story, not a failure:
+    the flag must say so, or the pool drops whatever the fallback produced."""
+    monkeypatch.setattr("metadata.ingestion.lineage.parser.SqlGlotLineageAnalyzer", _BrokenAnalyzer)
     parser = LineageParser(MERGE_WITH_CTE_WILDCARD, dialect=Dialect.ATHENA)
     assert parser.query_parsing_success is True
     assert parser.query_parsing_failure_reason is None
@@ -681,10 +690,12 @@ def test_a_parser_that_delivers_after_another_failed_is_a_successful_parse():
     assert {str(t) for t in parser.source_tables} == {"raw.t"} and {str(t) for t in parser.target_tables} == {"cur.t"}
 
 
-def test_the_query_hash_never_changes_with_the_parser_chosen():
+def test_the_query_hash_never_changes_with_the_parser_chosen(monkeypatch):
     """One id per query in the logs, whichever parser ends up delivering."""
     plain = LineageParser("INSERT INTO cur.t SELECT id, v FROM raw.t", dialect=Dialect.ATHENA)
     assert plain.query_hash == LineageParser.get_query_hash(plain.query) and "-" not in plain.query_hash
     assert plain.parser_name == "SqlGlot" and plain.fallback_reason is None
+    monkeypatch.setattr("metadata.ingestion.lineage.parser.SqlGlotLineageAnalyzer", _BrokenAnalyzer)
     fallback = LineageParser(MERGE_WITH_CTE_WILDCARD, dialect=Dialect.ATHENA)
+    assert fallback.parser_name == "SqlFluff"
     assert fallback.query_hash == LineageParser.get_query_hash(fallback.query) and "-" not in fallback.query_hash
