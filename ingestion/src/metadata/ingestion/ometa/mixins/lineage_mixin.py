@@ -49,6 +49,23 @@ search_cache = LRUCache(LRU_CACHE_SIZE)
 LINEAGE_ROUTE = "/lineage"
 
 
+def _whole_list_column_ops(patch: Any, updated_columns: Any) -> Any:
+    """Send ``columnsLineage`` as one operation on the whole list instead of index-addressed ops.
+
+    ``build_patch`` diffs the list by index against the client's view of the stored edge. That view
+    and the server's list drift - a merge collapses a duplicate, the client-side edge cache holds
+    what was last sent, a concurrent writer appended - and then an op addresses an index past the
+    end and the whole patch is refused ("An array item index is out of range"). The merged list is
+    already the intended end state, so it is sent as such; the other fields keep their ops.
+    """
+    ops = [op for op in patch if not str(op.get("path", "")).startswith("/columnsLineage")]
+    touched = len(ops) != len(patch)
+    if touched:
+        columns = [c.model_dump(mode="json") if hasattr(c, "model_dump") else c for c in (updated_columns or [])]
+        ops.append({"op": "replace", "path": "/columnsLineage", "value": columns})
+    return ops
+
+
 def _api_error_message(err: APIError) -> str:
     """The server's own message for a failed call - a status code alone says nothing about which
     of the patch's operations was refused, and the traceback only reaches the log at DEBUG."""
@@ -496,10 +513,11 @@ class OMetaLineageMixin(Generic[T]):
                 remove_change_description=False,
             )
             if patch:
+                ops = _whole_list_column_ops(patch.patch, updated.edge.lineageDetails.columnsLineage)
                 self.client.patch(
                     f"{self.get_suffix(AddLineageRequest)}/"
                     f"{self._lineage_edge_path(original.edge.fromEntity, original.edge.toEntity)}",
-                    data=str(patch),
+                    data=json.dumps(ops),
                 )
             return True  # noqa: TRY300
         except APIError as err:
@@ -530,10 +548,11 @@ class OMetaLineageMixin(Generic[T]):
                 remove_change_description=False,
             )
             if patch:
+                ops = _whole_list_column_ops(patch.patch, updated.columnsLineage)
                 self.client.patch(
                     f"{LINEAGE_ROUTE}/"
                     f"{self._lineage_edge_path_by_name(from_entity_type, from_entity_fqn, to_entity_type, to_entity_fqn)}",
-                    data=str(patch),
+                    data=json.dumps(ops),
                 )
             return True  # noqa: TRY300
         except APIError as err:

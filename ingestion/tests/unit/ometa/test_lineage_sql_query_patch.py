@@ -236,3 +236,51 @@ class TestEntityRefSummary:
             "id": FROM_ID,
             "type": "table",
         }
+
+
+class TestColumnLineageIsPatchedAsAWholeList:
+    """build_patch diffs columnsLineage by index against the client's view of the stored edge; that
+    view and the server's list drift (a merge collapses a duplicate, the edge cache holds what was
+    last sent) and an index-addressed op then lands past the end: 400 "An array item index is out
+    of range. Index: 14, Size: 14" - seen on every repeated edge of a lineage run. The merged list
+    is the intended end state, so it goes as one replace."""
+
+    @staticmethod
+    def _pair(n):
+        return {"fromColumns": [f"svc.db.s.src.c{n}"], "toColumn": f"svc.db.s.tgt.c{n}"}
+
+    def _ops(self, stored_pairs, incoming_pairs):
+        from metadata.generated.schema.type.entityLineage import ColumnLineage
+
+        stubbed = StubbedLineage({"edge": {"columnsLineage": [self._pair(n) for n in stored_pairs]}})
+        details = LineageDetails(
+            source=LineageSource.QueryLineage,
+            columnsLineage=[ColumnLineage.model_validate(self._pair(n)) for n in incoming_pairs],
+        )
+        stubbed.add_lineage_by_name(
+            from_entity_fqn="svc.db.s.src",
+            from_entity_type="table",
+            to_entity_fqn="svc.db.s.tgt",
+            to_entity_type="table",
+            lineage_details=details,
+            check_patch=True,
+            return_lineage=False,
+        )
+        return json.loads(stubbed.client.patch.call_args.kwargs["data"]) if stubbed.client.patch.called else []
+
+    def test_a_new_pair_arrives_as_one_replace_of_the_whole_list(self):
+        ops = self._ops(stored_pairs=[1, 2], incoming_pairs=[3])
+        column_ops = [op for op in ops if op["path"].startswith("/columnsLineage")]
+        assert [(op["op"], op["path"]) for op in column_ops] == [("replace", "/columnsLineage")]
+        assert [p["toColumn"] for p in column_ops[0]["value"]] == [
+            "svc.db.s.tgt.c1",
+            "svc.db.s.tgt.c2",
+            "svc.db.s.tgt.c3",
+        ]
+
+    def test_no_index_addressed_column_ops_ever(self):
+        ops = self._ops(stored_pairs=[1, 2, 3], incoming_pairs=[2, 3, 4, 5])
+        assert not [op for op in ops if op["path"].startswith("/columnsLineage/")]
+
+    def test_nothing_new_means_no_patch(self):
+        assert self._ops(stored_pairs=[1, 2], incoming_pairs=[1, 2]) == []
