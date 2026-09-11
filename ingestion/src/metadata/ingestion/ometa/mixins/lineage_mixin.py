@@ -49,6 +49,15 @@ search_cache = LRUCache(LRU_CACHE_SIZE)
 LINEAGE_ROUTE = "/lineage"
 
 
+def _api_error_message(err: APIError) -> str:
+    """The server's own message for a failed call - a status code alone says nothing about which
+    of the patch's operations was refused, and the traceback only reaches the log at DEBUG."""
+    error = getattr(err, "_error", None)
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("error") or error)[:500]
+    return str(err)[:500]
+
+
 class OMetaLineageMixin(Generic[T]):
     """
     OpenMetadata API methods related to Lineage.
@@ -496,7 +505,8 @@ class OMetaLineageMixin(Generic[T]):
         except APIError as err:
             logger.debug(traceback.format_exc())
             logger.warning(
-                f"Error Patching Lineage Edge {err.status_code} for {original.edge.fromEntity.fullyQualifiedName}"
+                f"Error Patching Lineage Edge {err.status_code} for {original.edge.fromEntity.fullyQualifiedName}: "
+                f"{_api_error_message(err)}"
             )
         except ValueError as err:
             logger.debug(str(err))
@@ -530,7 +540,7 @@ class OMetaLineageMixin(Generic[T]):
             logger.debug(traceback.format_exc())
             logger.warning(
                 f"Error Patching Lineage Edge {err.status_code} for "
-                f"{from_entity_type}:{from_entity_fqn} -> {to_entity_type}:{to_entity_fqn}"
+                f"{from_entity_type}:{from_entity_fqn} -> {to_entity_type}:{to_entity_fqn}: {_api_error_message(err)}"
             )
         return False
 
