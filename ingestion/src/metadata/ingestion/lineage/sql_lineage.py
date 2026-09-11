@@ -1302,10 +1302,12 @@ def get_lineage_by_graph(
     Raises:
         Exception: If an error occurs during the lineage creation process, it logs the error.
     """
-    if graph is None:
+    if graph is None or graph.number_of_nodes() == 0:
         return
 
-    logger.info(f"Processing graph with {graph.number_of_nodes()} nodes and {graph.number_of_edges()} edges")
+    # Per-graph detail belongs at DEBUG: a session-scoped caller runs this once per session, and a
+    # line per session (most of them empty) is what a run log drowns in.
+    logger.debug(f"Processing graph with {graph.number_of_nodes()} nodes and {graph.number_of_edges()} edges")
     # Get all weakly connected components
     components = list(nx.weakly_connected_components(graph))
 

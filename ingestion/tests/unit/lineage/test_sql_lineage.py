@@ -505,3 +505,26 @@ class SqlLineageTest(TestCase):
                 len(parser.target_tables) > 0,
                 f"Expected target tables for query: {query}",
             )
+
+
+def test_get_lineage_by_graph_is_silent_on_an_empty_graph_and_quiet_otherwise(caplog):
+    """A session-scoped lineage run calls this once per session - tens of thousands of times - and
+    most sessions leave an empty graph. Nothing to say about those, and the size of a non-empty one
+    is detail, not run progress."""
+    import logging
+    from unittest.mock import MagicMock
+
+    import networkx as nx
+
+    from metadata.ingestion.lineage.sql_lineage import get_lineage_by_graph
+
+    with caplog.at_level(logging.DEBUG, logger="metadata.Utils"):
+        assert list(get_lineage_by_graph(graph=nx.DiGraph(), metadata=MagicMock()) or []) == []
+    assert not [r for r in caplog.records if "Processing graph" in r.getMessage()]
+
+    graph = nx.DiGraph()
+    graph.add_edge("a", "b")
+    with caplog.at_level(logging.DEBUG, logger="metadata.Utils"):
+        list(get_lineage_by_graph(graph=graph, metadata=MagicMock()) or [])
+    levels = {r.levelname for r in caplog.records if "Processing graph" in r.getMessage()}
+    assert levels == {"DEBUG"}
