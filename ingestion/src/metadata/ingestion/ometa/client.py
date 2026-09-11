@@ -25,7 +25,10 @@ from metadata.config.common import ConfigModel
 from metadata.ingestion import diagnostics
 from metadata.ingestion.diagnostics.collectors.http import get_global_tracker
 from metadata.ingestion.ometa.credentials import URL, get_api_version
-from metadata.ingestion.ometa.http_adapter import mount_resilient_adapter
+from metadata.ingestion.ometa.http_adapter import (
+    DEFAULT_POOL_MAXSIZE,
+    mount_resilient_adapter,
+)
 from metadata.ingestion.ometa.ttl_cache import TTLCache
 from metadata.ingestion.ometa.utils import sanitize_user_agent
 from metadata.utils.logger import ometa_logger
@@ -221,7 +224,8 @@ class REST:
         self._base_url: URL = URL(self.config.base_url)
         self._api_version = get_api_version(self.config.api_version)
         self._session = requests.Session()
-        mount_resilient_adapter(self._session)
+        self._pool_maxsize = DEFAULT_POOL_MAXSIZE
+        mount_resilient_adapter(self._session, pool_maxsize=self._pool_maxsize)
         user_agent = sanitize_user_agent(self.config.user_agent)
         if user_agent:
             self._session.headers["User-Agent"] = user_agent
@@ -242,6 +246,19 @@ class REST:
         self._timeout = self.config.timeout
 
         self._limits_reached = TTLCache(config.ttl_cache)
+
+    def ensure_pool_maxsize(self, maxsize: int) -> None:
+        """Grow the HTTP connection pool to hold at least ``maxsize`` connections.
+
+        A caller that is about to drive more concurrent requests than the pool holds (e.g. the
+        concurrent lineage consumer, whose peak is the consumer threads plus the producer's
+        table-resolution fan-out) calls this first, so connections are reused instead of being
+        opened and immediately discarded ("Connection pool is full, discarding connection").
+        Only ever grows the pool; a smaller request is a no-op.
+        """
+        if maxsize > self._pool_maxsize:
+            mount_resilient_adapter(self._session, pool_maxsize=maxsize)
+            self._pool_maxsize = maxsize
 
     def _request(  # noqa: C901, pylint: disable=too-many-arguments,too-many-branches
         self,

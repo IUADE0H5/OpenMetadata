@@ -69,6 +69,13 @@ PROCESS_TIMEOUT = CHUNK_SIZE * QUERY_PROCESSING_TIMEOUT
 
 MAX_ACTIVE_TIMED_OUT_THREADS = 10
 
+# Backpressure cap for the inter-stage queue: producer threads stop starting new chunks while this
+# many lineage/query results are already waiting for the sink to consume them. Without it a producer
+# that is much faster than the sink (the common case when the sink writes each edge over a remote
+# API) drains the whole query log into memory and can OOM a large run. A multiple of the chunk size
+# so a run always has more than one chunk of work buffered, never the whole backlog.
+MAX_QUEUED_LINEAGE_RESULTS = CHUNK_SIZE * 10
+
 
 class LineageSource(QueryParserSource, ABC):
     """
@@ -103,6 +110,7 @@ class LineageSource(QueryParserSource, ABC):
         chunk_size: int = CHUNK_SIZE,
         processor_timeout: int = PROCESS_TIMEOUT,
         max_threads: int = MAX_ACTIVE_TIMED_OUT_THREADS,
+        max_queued: int = MAX_QUEUED_LINEAGE_RESULTS,
     ):
         """
         Process data in separate processes with timeout control.
@@ -216,6 +224,12 @@ class LineageSource(QueryParserSource, ABC):
             else:  # noqa: RET505
                 return queue.has_tasks()
 
+        def queue_depth() -> int:
+            """Items waiting for the consumer, for backpressure."""
+            if multiprocessing_supported:
+                return queue.qsize()  # pyright: ignore[reportAttributeAccessIssue]
+            return queue.depth()  # pyright: ignore[reportAttributeAccessIssue]
+
         def process_queue_items():
             """Process items from queue based on queue type."""
             while queue_has_items():
@@ -271,8 +285,14 @@ class LineageSource(QueryParserSource, ABC):
 
             active_processes = still_active
 
-            # Start initial/next processes to fill available slots
+            # Start initial/next processes to fill available slots, unless the consumer is behind:
+            # while the output queue already holds max_queued results, stop starting new chunks so a
+            # fast producer cannot outrun a slow sink and grow the queue without bound. This only
+            # throttles - it never ends the run: once the consumer drains below the cap the next
+            # iteration starts chunks again. `active_processes` keeps draining meanwhile.
             while len(active_processes) < max_processes:
+                if queue_depth() >= max_queued:
+                    break
                 if start_next_process():
                     continue
                 chunks_exhausted = True
