@@ -212,6 +212,39 @@ class QueryParserTests(TestCase):
         self.assertEqual(sorted(str(t) for t in parser.source_tables), ["sales.accounts", "sales.trans"])
         self.assertEqual(parser.target_tables, [])
 
+    def test_reserved_alias_out_is_parsed_by_sqlglot_for_athena(self):
+        """
+        Athena accepts `out` as a subquery alias; SqlGlot reserves the word and parsed the whole
+        statement as an opaque command with no tables. The alias is quoted for SqlGlot only, never
+        inside a string literal, so the statement keeps its full column lineage.
+        """
+        query = """CREATE TABLE IF NOT EXISTS sales.money AS
+            SELECT inc.cust_id AS client_id, out.total AS total_out
+            FROM (SELECT cust_id, SUM(amt) AS total FROM sales.tx WHERE txt NOT LIKE '%out%' GROUP BY cust_id) inc
+            JOIN (SELECT cust_id, SUM(amt) AS total FROM sales.tx GROUP BY cust_id) out ON inc.cust_id = out.cust_id"""
+        parser = LineageParser(query, dialect=Dialect.ATHENA)
+        self.assertEqual(parser.parser_name, "SqlGlot")
+        self.assertEqual([str(t) for t in parser.target_tables], ["sales.money"])
+        self.assertEqual([str(t) for t in parser.source_tables], ["sales.tx"])
+        self.assertEqual(
+            sorted(str(dst) for _, dst in parser.column_lineage),
+            ["sales.money.client_id", "sales.money.total_out"],
+        )
+
+    def test_quote_reserved_identifiers_leaves_strings_and_other_dialects_alone(self):
+        from metadata.ingestion.lineage.parser import quote_reserved_identifiers
+
+        query = "SELECT out.a, 'out', 'it''s out' FROM t out WHERE out.b = 'x'"
+        self.assertEqual(
+            quote_reserved_identifiers(query, Dialect.ATHENA),
+            "SELECT \"out\".a, 'out', 'it''s out' FROM t \"out\" WHERE \"out\".b = 'x'",
+        )
+        self.assertEqual(quote_reserved_identifiers(query, Dialect.MYSQL), query)
+        self.assertEqual(
+            quote_reserved_identifiers("SELECT outer_id, output FROM t", Dialect.ATHENA),
+            "SELECT outer_id, output FROM t",
+        )
+
     def test_clean_raw_query_copy_from(self):
         """
         Validate COPY FROM query cleaning logic

@@ -67,6 +67,24 @@ LINEAGE_PARSING_TIMEOUT = 30
 LINEAGE_PARSING_MEMORY_LIMIT_MB = 100
 
 
+# Words SqlGlot tokenizes as keywords but these engines accept as bare identifiers; on a table or
+# subquery alias (`... ) out ON inc.id = out.id`) SqlGlot gives up on the whole statement and parses it
+# as an opaque command with no tables. They are quoted before the SqlGlot attempt only - the other
+# parsers see the query as written - and never inside string literals.
+_SQLGLOT_RESERVED_IDENTIFIERS = {Dialect.ATHENA: ("out",), Dialect.TRINO: ("out",)}
+_STRING_LITERAL = re.compile(r"('(?:[^']|'')*')")
+
+
+def quote_reserved_identifiers(query: str, dialect: Dialect) -> str:
+    words = _SQLGLOT_RESERVED_IDENTIFIERS.get(dialect)
+    if not words:
+        return query
+    pattern = re.compile(r'(?<![\w."`])(' + "|".join(words) + r')(?![\w"`])', re.IGNORECASE)
+    return "".join(
+        part if part.startswith("'") else pattern.sub(r'"\1"', part) for part in _STRING_LITERAL.split(query)
+    )
+
+
 class LineageParser:
     """
     Class that acts like a wrapper for the LineageRunner library usage
@@ -570,7 +588,7 @@ class LineageParser:
         # SqlGlot is enabled when query parser type is Auto or SqlGlot
         if parser_type in [QueryParserType.Auto, QueryParserType.SqlGlot]:
             try:
-                lr_sqlglot = get_sqlglot_lineage_runner(query, dialect.value)
+                lr_sqlglot = get_sqlglot_lineage_runner(quote_reserved_identifiers(query, dialect), dialect.value)
                 _ = len(lr_sqlglot.get_column_lineage()) + len(
                     set(lr_sqlglot.source_tables).union(
                         set(lr_sqlglot.target_tables).union(set(lr_sqlglot.intermediate_tables))
