@@ -145,3 +145,40 @@ def test_tables_are_resolved_once_each_before_the_record_loop(staging):
     # which here shows as the lookup function being called again per record - what matters is that
     # the warm-up saw each distinct table exactly once, before any record was processed
     assert sorted(seen[:2]) == ["t1", "t2"]
+
+
+def test_publish_queries_off_keeps_usage_joins_and_life_cycle_but_creates_no_queries(staging):
+    from metadata.generated.schema.api.data.createQuery import CreateQueryRequest
+    from metadata.generated.schema.type.basic import FullyQualifiedEntityName, SqlQuery, Timestamp
+
+    record = TableUsageCount(
+        table="t1",
+        date="1702000000000",
+        databaseName="db",
+        databaseSchema="s",
+        count=2,
+        joins=[],
+        serviceName="svc",
+        sqlQueries=[
+            CreateQueryRequest(
+                query=SqlQuery("SELECT a FROM s.t1"),
+                queryDate=Timestamp(1702000000000),
+                service=FullyQualifiedEntityName("svc"),
+                usedBy=["etl-role"],
+            )
+        ],
+    )
+    with (staging / "svc_1702000000000").open("w") as file:
+        file.write(json.dumps(record.model_dump_json()) + "\n")
+    sink = MetadataUsageBulkSink(
+        config=MetadataUsageSinkConfig(filename=str(staging), publish_queries=False), metadata=MagicMock()
+    )
+    sink.process_query_cost = False
+    with patch(
+        "metadata.ingestion.bulksink.metadata_usage.get_table_entities_from_query", return_value=[_entity("t1")]
+    ):
+        sink.run()
+
+    assert sink.metadata.publish_table_usage.call_count == 1
+    assert sink.metadata.patch_life_cycle.call_count == 1  # accessed-by-a-process still recorded
+    assert not sink.metadata.ingest_queries_bulk.called

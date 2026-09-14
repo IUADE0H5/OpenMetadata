@@ -86,6 +86,10 @@ class MetadataUsageSinkConfig(ConfigModel):
     # Concurrent HTTP writes (table usage, lifecycle, joins) at the end of each usage file.
     threads: int = 8
     processes: int = 4  # worker processes that mask the distinct statement shapes before queries are published
+    # Create Query entities (the table's Queries tab) from the attached statements. Off keeps usage
+    # counts, joined columns and life cycle - all derived from the same statements - and skips the
+    # masking and the one round trip per distinct statement that dominate a large day of usage.
+    publish_queries: bool = True
 
 
 class MetadataUsageBulkSink(BulkSink):
@@ -413,7 +417,8 @@ class MetadataUsageBulkSink(BulkSink):
                         )
 
                     if table_usage.sqlQueries:
-                        self._queue_queries(table_entity, table_usage.sqlQueries)
+                        if self.config.publish_queries:
+                            self._queue_queries(table_entity, table_usage.sqlQueries)
                         self._get_table_life_cycle_data(table_entity=table_entity, table_usage=table_usage)
                 except APIError as err:
                     if err.status_code == 409:
