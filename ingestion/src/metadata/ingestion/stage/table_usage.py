@@ -18,7 +18,9 @@ import csv
 import json
 import os
 import shutil
+import tempfile
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple  # noqa: UP035
 
@@ -56,7 +58,9 @@ class TableStageConfig(ConfigModel):
     transientTablePatterns: List[str] = Field(default_factory=list)  # noqa: N815, UP006
     # CSV appended with one row per (table, day, principal) and the number of statements counted -
     # what the published usage numbers are made of. Kept after the run (the staging directory is
-    # not), so a count that looks wrong can be traced to the principals behind it.
+    # not), so a count that looks wrong can be traced to the principals behind it. A local path, or
+    # `s3://bucket/key.csv` / `s3://bucket/prefix/` (then `usage_audit_<UTC time>.csv` under it) for
+    # runners whose filesystem ends with the pod; the upload happens when the stage closes.
     usageAuditFile: Optional[str] = None  # noqa: N815, UP045
 
     @property
@@ -91,6 +95,7 @@ class TableUsageStage(Stage):
         self.process_query_cost = True  # set by the usage workflow from the source's processQueryCostAnalysis
         self._batches = 0
         self._audit: Dict[Tuple[str, str, str], int] = {}  # noqa: UP006  # (table, date, principal) -> statements, per batch
+        self._audit_local = self._audit_local_path()
         # Query logs repeat a handful of principals thousands of times; without this the stage
         # spends most of a run on GET /users/name/{fqn}. Misses are cached too.
         self._user_lookup_cache: LRUCache = LRUCache(maxsize=1000)
@@ -279,8 +284,8 @@ class TableUsageStage(Stage):
         """
         Dump the table usage data to a file.
         """
-        if self.config.usageAuditFile and self._audit:
-            path = Path(self.config.usageAuditFile)
+        if self._audit_local and self._audit:
+            path = self._audit_local
             path.parent.mkdir(parents=True, exist_ok=True)
             new = not path.exists() or path.stat().st_size == 0
             with path.open("a", encoding=UTF_8, newline="") as file:
@@ -320,7 +325,39 @@ class TableUsageStage(Stage):
                     file.write(json.dumps(data))
                     file.write("\n")
 
+    def _audit_local_path(self) -> Optional[Path]:  # noqa: UP045
+        target = self.config.usageAuditFile
+        if not target:
+            return None
+        if not target.startswith("s3://"):
+            return Path(target)
+        handle, name = tempfile.mkstemp(prefix="usage_audit_", suffix=".csv")
+        os.close(handle)
+        return Path(name)
+
+    def _audit_s3_key(self) -> Tuple[str, str]:  # noqa: UP006
+        bucket, _, key = self.config.usageAuditFile[len("s3://") :].partition("/")
+        if not key or key.endswith("/"):
+            key = f"{key}usage_audit_{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H%M%SZ')}.csv"
+        return bucket, key
+
     def close(self) -> None:
-        """
-        Nothing to close. Data is being dumped inside a context manager
-        """
+        """Data is dumped per batch; only an S3 audit target has work left: the upload."""
+        target = self.config.usageAuditFile
+        if not target or not target.startswith("s3://") or self._audit_local is None:
+            return
+        try:
+            if self._audit_local.exists() and self._audit_local.stat().st_size > 0:
+                bucket, key = self._audit_s3_key()
+                _s3_client().upload_file(str(self._audit_local), bucket, key)
+                logger.info(f"Usage audit uploaded to s3://{bucket}/{key}")
+        except Exception as exc:
+            logger.warning(f"Usage audit upload to {target} failed: {exc}")
+        finally:
+            self._audit_local.unlink(missing_ok=True)
+
+
+def _s3_client():
+    import boto3  # base dependency (the secrets manager); imported here so the stage never needs it otherwise
+
+    return boto3.client("s3")

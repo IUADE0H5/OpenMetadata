@@ -239,3 +239,38 @@ def test_no_audit_file_by_default(tmp_path):
     stage = _stage(tmp_path)
     _run(stage, "SELECT a FROM s.t1")
     assert not [p for p in tmp_path.rglob("*.csv")]
+
+
+def test_s3_audit_target_is_uploaded_when_the_stage_closes(tmp_path, monkeypatch):
+    from metadata.ingestion.stage import table_usage as module
+
+    uploads = []
+
+    class _S3:
+        def upload_file(self, local, bucket, key):
+            uploads.append((open(local).read(), bucket, key))  # noqa: PTH123, SIM115
+
+    monkeypatch.setattr(module, "_s3_client", lambda: _S3())
+    stage = _stage(tmp_path, usageAuditFile="s3://audit-bucket/usage-audit/")
+    _run(stage, "SELECT a FROM s.t1")
+    local = stage._audit_local
+    assert local.exists() and local.read_text().startswith("service,table,date,principal,statements")
+
+    stage.close()
+    ((content, bucket, key),) = uploads
+    assert bucket == "audit-bucket" and key.startswith("usage-audit/usage_audit_") and key.endswith("Z.csv")
+    assert "s.t1,1701388800000,alice,1" in content or "s.t1," in content
+    assert not local.exists()  # the temp copy is gone once uploaded
+
+
+def test_s3_audit_target_with_a_key_is_used_as_given(tmp_path, monkeypatch):
+    from metadata.ingestion.stage import table_usage as module
+
+    uploads = []
+    monkeypatch.setattr(
+        module, "_s3_client", lambda: type("S3", (), {"upload_file": lambda self, l, b, k: uploads.append((b, k))})()
+    )
+    stage = _stage(tmp_path, usageAuditFile="s3://audit-bucket/runs/today.csv")
+    _run(stage, "SELECT a FROM s.t1")
+    stage.close()
+    assert uploads == [("audit-bucket", "runs/today.csv")]
