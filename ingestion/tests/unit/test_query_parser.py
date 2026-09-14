@@ -195,6 +195,23 @@ class QueryParserTests(TestCase):
             "/* comment */ merge into table_1 using (select a, b from table_2)",
         )
 
+    def test_clean_raw_query_unload_keeps_the_inner_read(self):
+        """
+        UNLOAD (query) TO 's3://...' WITH (...) writes files, not a table; only the inner query's
+        reads are metadata. Leading comments and nested parentheses in the query must not confuse it.
+        """
+        query = """/* {"app": "x"} */
+            UNLOAD (SELECT a.id, b.amount FROM sales.accounts a JOIN sales.trans b ON a.id = b.acc_id
+                    WHERE b.dt > DATE '2026-01-01' AND b.kind IN ('a', 'b'))
+            TO 's3://bucket/exports/accounts/'
+            WITH (format = 'PARQUET', compression = 'SNAPPY')"""
+        cleaned = LineageParser.clean_raw_query(query)
+        self.assertTrue(cleaned.startswith("SELECT a.id, b.amount FROM sales.accounts a"))
+        self.assertTrue(cleaned.endswith("AND b.kind IN ('a', 'b')"))
+        parser = LineageParser(query, dialect=Dialect.ATHENA)
+        self.assertEqual(sorted(str(t) for t in parser.source_tables), ["sales.accounts", "sales.trans"])
+        self.assertEqual(parser.target_tables, [])
+
     def test_clean_raw_query_copy_from(self):
         """
         Validate COPY FROM query cleaning logic

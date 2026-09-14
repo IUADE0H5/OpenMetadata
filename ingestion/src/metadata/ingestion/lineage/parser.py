@@ -501,6 +501,18 @@ class LineageParser:
         ):
             return None
 
+        # Athena/Redshift `UNLOAD (query) TO 's3://...' WITH (...)` writes files, not a table: the only
+        # metadata in it is the tables the inner query reads. SqlGlot has no grammar for it and parses
+        # the whole statement as an opaque command with no tables, which counted zero usage for the
+        # sources; unwrap to the inner query so it is parsed as the read it is.
+        unload = re.match(
+            r"^\s*(?:/\*.*?\*/\s*|--[^\n]*\n\s*)*UNLOAD\s*\((.*)\)\s*TO\s*'[^']*'",
+            clean_query,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if unload:
+            clean_query = unload.group(1).strip()
+
         # Filter out CREATE TRIGGER statements - they don't provide lineage information
         if insensitive_match(clean_query, r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+"):
             return None
