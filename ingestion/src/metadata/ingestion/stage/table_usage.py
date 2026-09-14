@@ -35,6 +35,7 @@ from metadata.generated.schema.type.tableUsageCount import TableColumnJoin, Tabl
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.api.steps import Stage
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
+from metadata.ingestion.progress.tracking import shared_progress
 from metadata.utils.constants import UTF_8
 from metadata.utils.helpers import (
     TRANSIENT_TABLE_PATTERNS,
@@ -82,6 +83,8 @@ class TableUsageStage(Stage):
         init_staging_dir(self.config.filename)
         self.wrote_something = False
         self.service_name = ""
+        self.process_query_cost = True  # set by the usage workflow from the source's processQueryCostAnalysis
+        self._batches = 0
         # Query logs repeat a handful of principals thousands of times; without this the stage
         # spends most of a run on GET /users/name/{fqn}. Misses are cached too.
         self._user_lookup_cache: LRUCache = LRUCache(maxsize=1000)
@@ -235,6 +238,9 @@ class TableUsageStage(Stage):
             return
         self.table_usage = {}
         self.table_queries = {}
+        # Reset with the other per-batch maps: kept across batches, every dump appended the earlier
+        # days' cost records to their files again, one more copy per batch.
+        self.query_cost = {}
         for parsed_data in record.parsedData:
             if parsed_data is None:
                 continue
@@ -243,8 +249,21 @@ class TableUsageStage(Stage):
                     logger.debug(f"Skipping transient table [{table}] in query [{parsed_data.sql}]")
                     continue
                 yield from self._handle_table_usage(parsed_data=parsed_data, table=table)
-            self._handle_query_cost(parsed_data)
+            if self.process_query_cost:
+                self._handle_query_cost(parsed_data)
         self.dump_data_to_file()
+        self._batches += 1
+        progress = shared_progress(self)
+        if progress is not None:  # the totals the sink will work through, known before it starts
+            progress.seed_scope_total("Usage records", f"batch {self._batches}", len(self.table_usage))
+            if self.process_query_cost:
+                progress.seed_scope_total("Query costs", f"batch {self._batches}", len(self.query_cost))
+        logger.info(
+            f"Staged {len(self.table_usage):,} table-day usage records"
+            + (f" and {len(self.query_cost):,} query-cost records" if self.process_query_cost else "")
+            + f" from {len(record.parsedData):,} parsed statements"
+        )
+        self.status.record_count += len(self.table_usage)  # the heartbeat shows table-days, not statement-table pairs
 
     def dump_data_to_file(self):
         """

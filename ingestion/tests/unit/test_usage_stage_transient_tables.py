@@ -182,3 +182,32 @@ def test_nothing_transient_reaches_the_staged_files_the_sink_reads(tmp_path):
     assert sorted(record["table"] for record in records) == ["gold.audit_log", "raw.events"]
     assert all(TEMP not in json.dumps(record["joins"]) for record in records)
     assert [len(record["sqlQueries"]) for record in records] == [1, 1]
+
+
+def test_query_cost_records_are_written_once_per_batch_and_only_when_the_flag_is_on(tmp_path):
+    stage = _stage(tmp_path)
+    _run(stage, "SELECT a FROM s.t1")
+    _run(stage, "SELECT a FROM s.t2")
+    cost_files = [f for f in (tmp_path / "stage").iterdir() if f.name.endswith("query")]
+    # two batches, two distinct statements: two cost lines, not 1 + 2 (the earlier batch appended again)
+    assert sum(len(f.read_text().splitlines()) for f in cost_files) == 2
+
+    off = _stage(tmp_path)
+    off.process_query_cost = False
+    _run(off, "SELECT a FROM s.t3")
+    assert not [f for f in (tmp_path / "stage").iterdir() if f.name.endswith("query")]
+
+
+def test_the_stage_seeds_the_sink_totals_and_counts_table_days(tmp_path):
+    from metadata.ingestion.progress.modes import ProgressMode
+    from metadata.ingestion.progress.tracking import share_progress_tracking
+
+    class _Source:
+        progress_mode = ProgressMode.MANUAL
+
+    source, stage = _Source(), _stage(tmp_path)
+    share_progress_tracking(source, stage)
+    _run(stage, "SELECT a FROM s.t1", "SELECT b FROM s.t1", "SELECT a FROM s.t2")
+
+    assert source._progress_tracking.registry.global_counters() == [("Usage records", 0, 2), ("Query costs", 0, 3)]
+    assert stage.status.record_count == 2  # table-days, not the three statement-table pairs

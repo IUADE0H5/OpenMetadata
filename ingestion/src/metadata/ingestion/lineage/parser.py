@@ -16,6 +16,7 @@ import hashlib
 import re
 import time
 import traceback
+import warnings
 from collections import defaultdict
 from copy import deepcopy
 from logging.config import DictConfigurator
@@ -66,6 +67,11 @@ LINEAGE_PARSING_TIMEOUT = 30
 # max memory in MB that lineage parsing can consume
 LINEAGE_PARSING_MEMORY_LIMIT_MB = 100
 
+
+# sqllineage warns through `warnings` when a Table is built from a `schema.table` name with a schema
+# argument as well - its own analyzers do exactly that on every qualified name, so the line is noise
+# printed straight to stderr, outside the log format, from every parser process.
+warnings.filterwarnings("ignore", message="Name is in schema.table format, schema param is ignored")
 
 # Words SqlGlot tokenizes as keywords but these engines accept as bare identifiers; on a table or
 # subquery alias (`... ) out ON inc.id = out.id`) SqlGlot gives up on the whole statement and parses it

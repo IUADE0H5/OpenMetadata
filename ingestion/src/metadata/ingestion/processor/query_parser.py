@@ -38,6 +38,7 @@ from metadata.ingestion.api.steps import Processor
 from metadata.ingestion.lineage.models import ConnectionTypeDialectMapper, Dialect
 from metadata.ingestion.lineage.parser import LineageParser
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
+from metadata.ingestion.progress.tracking import shared_progress
 from metadata.utils.helpers import TRANSIENT_TABLE_PATTERNS, is_transient_table_name
 from metadata.utils.logger import ingestion_logger
 from metadata.utils.time_utils import datetime_to_timestamp
@@ -326,14 +327,20 @@ class QueryParserProcessor(Processor):
                 keys[key] = query.query
         if len(keys) < PARALLEL_PARSE_THRESHOLD or self.processes <= 1:
             return batch_cache
-        logger.info(f"Parsing {len(keys)} distinct statements with {self.processes} processes")
+        logger.info(f"Parsing {len(keys):,} distinct statements with {self.processes} processes")
+        progress = shared_progress(self)
+        if progress is not None:
+            progress.seed_scope_total("Statements", f"batch {self.stats.batches}", len(keys))
         jobs = [(keys[key], key[1], key[2], self.transient_table_patterns) for key in keys]
         started = time.perf_counter()
+        # map() yields in order as chunks complete, so the counter moves while the pool works
         for key, parsed in zip(keys, self._workers().map(_parse_in_worker, jobs, chunksize=16), strict=True):
             if parsed is not None:
                 batch_cache[key] = parsed
                 self._parse_cache[key] = parsed
                 self.stats.parses += 1
+            if progress is not None:
+                progress.track("Statements")
         self.stats.parse_seconds += time.perf_counter() - started
         return batch_cache
 
@@ -355,7 +362,9 @@ class QueryParserProcessor(Processor):
         dialect = ConnectionTypeDialectMapper.dialect_of(self.connection_type)
         self.stats.batches += 1
         self.stats.statements += total_cnt
-        self.stats.distinct_statements += len({_parse_key(q, dialect, QueryParserType.Auto) for q in record.queries})
+        distinct = len({_parse_key(q, dialect, QueryParserType.Auto) for q in record.queries})
+        self.stats.distinct_statements += distinct
+        before = (self.stats.parses, self.stats.cache_hits, self.stats.no_tables, time.perf_counter())
         batch_cache: dict = {}
         try:
             batch_cache = self._prefill_cache(record.queries, dialect)
@@ -381,13 +390,15 @@ class QueryParserProcessor(Processor):
                 self.stats.failures += 1
                 logger.debug(traceback.format_exc())
                 logger.warning(f"Error processing query [{table_query.query}]: {exc}")
-            cur_total_cnt = success_cnt + failed_cnt
-            if cur_total_cnt % 1000 == 0 or cur_total_cnt == total_cnt:
-                logger.info(
-                    f"Total query count:{cur_total_cnt} / {total_cnt}."
-                    f" Current success count: {success_cnt}."
-                    f" Current failed count: {failed_cnt}."
-                )
+        # One line per batch instead of one per thousand rows: the rows after the pool are cache
+        # hits and take seconds, so the per-thousand lines arrived as a burst that said nothing.
+        parses, no_tables = self.stats.parses - before[0], self.stats.no_tables - before[2]
+        logger.info(
+            f"Parsed {total_cnt:,} statements ({distinct:,} distinct) in {time.perf_counter() - before[3]:.0f}s: "
+            f"{parses:,} parsed, {total_cnt - parses:,} served from cache, {no_tables:,} name no table, "
+            f"{failed_cnt:,} failed"
+        )
+        self.status.record_count += total_cnt  # the heartbeat shows statements, not batches
         return Either(right=QueryParserData(parsedData=data))
 
     def close(self):

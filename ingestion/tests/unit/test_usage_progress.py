@@ -14,6 +14,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from metadata.generated.schema.type.tableQuery import TableQueries, TableQuery
+from metadata.ingestion.api.status import Status
 from metadata.ingestion.source.database.usage_source import UsageSource
 
 
@@ -36,6 +37,7 @@ def _make_usage_source(batches, result_limit, start, end):
     source.start = start
     source.end = end
     source.get_table_query = lambda: iter(batches)
+    source.status = Status()
     return source
 
 
@@ -54,7 +56,8 @@ class TestUsageProgress:
 
         list(UsageSource._iter(source))
 
-        assert source.progress_tracking.registry.global_counters() == [("Queries", 3, 3)]
+        assert source.progress_tracking.registry.global_counters() == [("Days", 2, 2), ("Queries", 3, 3)]
+        assert source.status.record_count == 3  # the heartbeat shows entries read, not batches
 
     def test_ceiling_is_result_limit_times_days_before_reconcile(self):
         captured = {}
@@ -68,4 +71,20 @@ class TestUsageProgress:
         list(UsageSource._iter(source))
 
         # first observation: total seeded at resultLimit * 2 days = 2000
-        assert captured["mid"] == [("Queries", 0, 2000)]
+        assert captured["mid"] == [("Days", 0, 2), ("Queries", 0, 2000)]
+
+    def test_each_day_is_reconciled_as_soon_as_it_is_read(self):
+        seen = []
+
+        def batches():
+            yield TableQueries(queries=[_query(), _query()])
+            seen.append(source.progress_tracking.registry.global_counters())
+            yield TableQueries(queries=[_query()])
+
+        source = _make_usage_source(batches(), result_limit=1000, start=datetime(2026, 1, 1), end=datetime(2026, 1, 4))
+        list(UsageSource._iter(source))
+
+        # after day 1: its ceiling of 1000 became 2, the other two days still carry their ceiling
+        assert seen[0] == [("Days", 1, 3), ("Queries", 2, 2002)]
+        # day 3 never yielded: reconciled to zero, not left at its ceiling
+        assert source.progress_tracking.registry.global_counters() == [("Days", 2, 3), ("Queries", 3, 3)]

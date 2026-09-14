@@ -21,6 +21,7 @@ produced by the stage. At the end, the path is removed.
 import json
 import os
 import shutil
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -64,6 +65,7 @@ from metadata.ingestion.lineage.sql_lineage import (
 from metadata.ingestion.ometa.client import APIError
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
 from metadata.ingestion.ometa.utils import model_str
+from metadata.ingestion.progress.tracking import shared_progress
 from metadata.utils import fqn
 from metadata.utils.constants import UTF_8
 from metadata.utils.life_cycle_utils import get_query_type
@@ -112,6 +114,7 @@ class MetadataUsageBulkSink(BulkSink):
         self._user_ref_cache: LRUCache = LRUCache(maxsize=LRU_CACHE_SIZE)
         self._masked_text_cache: LRUCache = LRUCache(maxsize=LRU_CACHE_SIZE)
         self.today = datetime.today().strftime("%Y-%m-%d")
+        self.process_query_cost = True  # set by the usage workflow from the source's processQueryCostAnalysis
 
     @property
     def name(self) -> str:
@@ -151,7 +154,7 @@ class MetadataUsageBulkSink(BulkSink):
                 f"(+={table_usage.count}, total={self.table_usage_map[table_entity.id.root]['usage_count']})"
             )
 
-    def __publish_usage_records(self) -> None:
+    def __publish_usage_records(self) -> int:
         """
         Method to publish SQL Queries, Table Usage
         """
@@ -168,6 +171,7 @@ class MetadataUsageBulkSink(BulkSink):
                 continue
             jobs.append(self._publish_usage_job(value_dict["table_entity"], table_usage_request))
         self._run_concurrently(jobs)
+        return len(jobs)
 
     def _publish_usage_job(self, table_entity: Table, table_usage_request: UsageRequest) -> Callable[[], None]:
         name = table_entity.fullyQualifiedName.root
@@ -175,7 +179,7 @@ class MetadataUsageBulkSink(BulkSink):
         def job() -> None:
             try:
                 self.metadata.publish_table_usage(table_entity, table_usage_request)
-                logger.info(f"Successfully table usage published for {name}")
+                logger.debug(f"Table usage published for {name}")
                 self.status.scanned(f"Table: {name}")
             except Exception as exc:
                 error = f"Failed to update usage for {name} :{exc}"
@@ -246,12 +250,17 @@ class MetadataUsageBulkSink(BulkSink):
                         yield file
 
     def handle_table_usage(self) -> None:
-        """
-        Handle table usage.
-        """
+        """One staged file per day: resolve each table-day record against the catalogue, then publish
+        usage, joins, queries and life cycle for the day. A line per file says what happened to it."""
+        progress = shared_progress(self)
         for file_handler in self.iterate_files():
             self.table_usage_map = {}
+            started = time.perf_counter()
+            records = unresolved = 0
             for usage_record in file_handler.readlines():
+                records += 1
+                if progress is not None:
+                    progress.track("Usage records")
                 record = json.loads(usage_record)
                 table_usage = TableUsageCount(**json.loads(record))
 
@@ -278,24 +287,40 @@ class MetadataUsageBulkSink(BulkSink):
                     logger.warning(f"Cannot get table entities from query table {table_usage.table}: {exc}")
 
                 if not table_entities:
-                    logger.warning(f"Could not fetch table {table_usage.databaseName}.{table_usage.table}")
+                    unresolved += 1
+                    logger.debug(f"Could not fetch table {table_usage.databaseName}.{table_usage.table}")
                     continue
 
                 self.get_table_usage_and_joins(table_entities, table_usage)
 
+            resolved_at = time.perf_counter()
             self._flush_queries()
             self._flush_deferred_writes()
-            self.__publish_usage_records()
+            published = self.__publish_usage_records()
+            logger.info(
+                f"Usage file {os.path.basename(file_handler.name)}: {records:,} table-day records, "  # noqa: PTH119
+                f"{unresolved:,} not in the catalogue, {len(self.table_usage_map):,} tables resolved "
+                f"in {resolved_at - started:.0f}s; usage published for {published:,} tables "
+                f"in {time.perf_counter() - resolved_at:.0f}s"
+            )
 
     def handle_query_cost(self) -> None:
         """One cost record per (statement, day): the text is masked once per distinct statement and the
         records are posted concurrently."""
+        if not self.process_query_cost:
+            return
+        progress = shared_progress(self)
         for file_handler in self.iterate_files(usage_files=False):
+            started = time.perf_counter()
             jobs = []
             for usage_record in file_handler.readlines():
                 cost_record = QueryCostWrapper(**json.loads(usage_record))
-                jobs.append(self._query_cost_job(cost_record, self._masked_text(cost_record)))
+                jobs.append(self._query_cost_job(cost_record, self._masked_text(cost_record), progress))
             self._run_concurrently(jobs)
+            logger.info(
+                f"Query-cost file {os.path.basename(file_handler.name)}: {len(jobs):,} records "  # noqa: PTH119
+                f"published in {time.perf_counter() - started:.0f}s"
+            )
 
     def _masked_text(self, cost_record: QueryCostWrapper) -> str:
         key = (cost_record.query, cost_record.dialect)
@@ -303,8 +328,10 @@ class MetadataUsageBulkSink(BulkSink):
             self._masked_text_cache[key] = mask_query(cost_record.query, cost_record.dialect) or cost_record.query
         return self._masked_text_cache[key]
 
-    def _query_cost_job(self, cost_record: QueryCostWrapper, masked_query: str) -> Callable[[], None]:
+    def _query_cost_job(self, cost_record: QueryCostWrapper, masked_query: str, progress=None) -> Callable[[], None]:
         def job() -> None:
+            if progress is not None:
+                progress.track("Query costs")
             try:
                 self.metadata.publish_query_cost(cost_record, self.service_name, masked_query=masked_query)
             except Exception as exc:

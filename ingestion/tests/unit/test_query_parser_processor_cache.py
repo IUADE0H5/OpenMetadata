@@ -225,3 +225,34 @@ def test_the_worker_pool_is_created_once_and_shut_down_on_close():
     assert processor._workers() is first
     processor.close()
     assert processor._pool is None
+
+
+def test_a_batch_logs_one_summary_line_and_counts_statements_on_the_shared_progress(caplog):
+    import logging
+
+    from metadata.ingestion.processor.query_parser import PARALLEL_PARSE_THRESHOLD, QueryParserProcessorConfig
+    from metadata.ingestion.progress.modes import ProgressMode
+    from metadata.ingestion.progress.tracking import share_progress_tracking
+
+    class _Source:
+        progress_mode = ProgressMode.MANUAL
+
+    source = _Source()
+    processor = QueryParserProcessor(QueryParserProcessorConfig(processes=2), MagicMock(), "athena")
+    share_progress_tracking(source, processor)
+    rows = [_row(f"SELECT c FROM s.t{i} WHERE x = {i}", "u") for i in range(PARALLEL_PARSE_THRESHOLD)]
+    rows += [_row("SELECT c FROM s.t0 WHERE x = 0", "u")] * 3  # repeats: cache hits, not parses
+    with caplog.at_level(logging.INFO):
+        processor._run(TableQueries(queries=rows))
+    processor.close()
+
+    summary = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Parsed ")]
+    assert len(summary) == 1  # one line per batch, no per-thousand burst
+    assert f"Parsed {len(rows):,} statements ({PARALLEL_PARSE_THRESHOLD:,} distinct)" in summary[0]
+    assert f"{PARALLEL_PARSE_THRESHOLD:,} parsed, 3 served from cache, 0 name no table, 0 failed" in summary[0]
+    assert not [r for r in caplog.records if "Total query count" in r.getMessage()]
+    # the distinct statements were counted on the shared registry as the pool returned them
+    assert source._progress_tracking.registry.global_counters() == [
+        ("Statements", PARALLEL_PARSE_THRESHOLD, PARALLEL_PARSE_THRESHOLD)
+    ]
+    assert processor.status.record_count == len(rows)

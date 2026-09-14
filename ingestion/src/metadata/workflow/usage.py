@@ -14,6 +14,7 @@ Usage Workflow Definition
 
 from metadata.config.common import WorkflowExecutionError
 from metadata.ingestion.api.steps import BulkSink, Processor, Source, Stage
+from metadata.ingestion.progress.tracking import share_progress_tracking
 from metadata.utils.importer import (
     import_bulk_sink_type,
     import_processor_class,
@@ -38,6 +39,13 @@ class UsageWorkflow(IngestionWorkflow):
         bulk_sink = self._get_bulk_sink()
 
         self.steps = (processor, stage, bulk_sink)
+        share_progress_tracking(self.source, processor, stage, bulk_sink)
+        # `processQueryCostAnalysis` is a source setting the stage and sink never saw: both wrote and
+        # published one cost record per (statement, day) regardless - on a large log that is tens of
+        # thousands of writes the pipeline was told not to make.
+        cost = getattr(self.config.source.sourceConfig.config, "processQueryCostAnalysis", True)
+        stage.process_query_cost = cost is not False
+        bulk_sink.process_query_cost = cost is not False
 
     def _get_source(self) -> Source:
         # Source that we are ingesting, e.g., mysql, looker or kafka

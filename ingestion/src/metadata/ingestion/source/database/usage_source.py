@@ -14,6 +14,7 @@ Usage Source Module
 
 import csv
 import os
+import time
 import traceback
 from abc import ABC
 from datetime import datetime, timedelta, timezone
@@ -102,11 +103,10 @@ class UsageSource(QueryParserSource, ABC):
         """
         daydiff = self.end - self.start
         for days in range(daydiff.days):
-            logger.info(
-                f"Scanning query logs for {(self.start + timedelta(days=days)).date()} - "
-                f"{(self.start + timedelta(days=days + 1)).date()}"
-            )
+            day = (self.start + timedelta(days=days)).date()
+            logger.info(f"Reading query log day {days + 1}/{daydiff.days} ({day})")
             query = None
+            started = time.perf_counter()
             try:
                 for engine in self.get_engine():
                     query = self.get_sql_statement(
@@ -149,7 +149,10 @@ class UsageSource(QueryParserSource, ABC):
                             except Exception as exc:
                                 logger.debug(traceback.format_exc())
                                 logger.warning(f"Unexpected exception processing row [{row}]: {exc}")
-                    logger.info(f"Processed {row_count} query log entries for usage")
+                    logger.info(
+                        f"Query log day {days + 1}/{daydiff.days} ({day}): {row_count:,} entries read "
+                        f"in {time.perf_counter() - started:.0f}s"
+                    )
                     self.warn_if_query_log_truncated(row_count, "usage")
                     yield TableQueries(queries=queries)
             except Exception as exc:
@@ -164,15 +167,25 @@ class UsageSource(QueryParserSource, ABC):
                 logger.error(f"Source usage processing error: {exc}")
 
     def _iter(self, *_, **__) -> Iterable[Either[TableQuery]]:
+        """One batch per query-log day. The `Queries` total starts as the ceiling the log can return
+        (`resultLimit` per day) and each day's scope is reconciled to what the day really held as soon
+        as it is read, so the denominator stops being a guess after the first day instead of at the
+        end of the run; a day that yields nothing is reconciled to zero."""
+        progress = self.progress_tracking.manual
         days = max(1, (self.end - self.start).days)
         result_limit = self.source_config.resultLimit  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+        progress.set_total("Days", days)
         if result_limit is not None:
-            self.progress_tracking.manual.seed_scope_total("Queries", "run", result_limit * days)
-        processed = 0
-        for table_queries in self.get_table_query():
-            if table_queries:
-                count = len(table_queries.queries)  # pyright: ignore[reportAttributeAccessIssue]
-                self.progress_tracking.manual.track("Queries", count)
-                processed += count
+            for day in range(days):
+                progress.seed_scope_total("Queries", f"day {day}", result_limit)
+        for day, table_queries in enumerate(self.get_table_query()):
+            count = len(table_queries.queries) if table_queries and table_queries.queries else 0  # pyright: ignore[reportAttributeAccessIssue]
+            progress.reconcile_scope_total("Queries", f"day {day}", count)
+            progress.track("Days")
+            if count:
+                progress.track("Queries", count)
+                self.status.record_count += count  # the heartbeat shows entries read, not batches
                 yield Either(right=table_queries)
-        self.progress_tracking.manual.reconcile_scope_total("Queries", "run", processed)
+        day = -1
+        for missing in range(day + 1, days):
+            progress.reconcile_scope_total("Queries", f"day {missing}", 0)
