@@ -42,7 +42,7 @@ class CachedLineage(OMetaLineageMixin):
         self._server_edge = server_edge
         self.lookups = 0
 
-    def _get_lineage_edge_for_references(self, from_entity, to_entity):
+    def _get_lineage_edge_for_references(self, from_entity, to_entity, refresh=False):
         key = self._lineage_edge_cache_key(from_entity, to_entity)
         if key in search_cache:
             return search_cache.get(key)
@@ -51,7 +51,7 @@ class CachedLineage(OMetaLineageMixin):
             search_cache.put(key, self._server_edge)
         return self._server_edge
 
-    def get_lineage_edge_by_name(self, from_type, from_fqn, to_type, to_fqn):
+    def get_lineage_edge_by_name(self, from_type, from_fqn, to_type, to_fqn, refresh=False):
         key = self._lineage_edge_name_cache_key(from_type, from_fqn, to_type, to_fqn)
         if key in search_cache:
             return search_cache.get(key)

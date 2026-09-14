@@ -47,10 +47,10 @@ class StubbedLineage(OMetaLineageMixin):
         self.get_lineage_by_name = MagicMock(return_value={})
         self._update_cache = MagicMock(return_value=None)
 
-    def _get_lineage_edge_for_references(self, from_entity, to_entity):
+    def _get_lineage_edge_for_references(self, from_entity, to_entity, refresh=False):
         return self._existing_edge
 
-    def get_lineage_edge_by_name(self, *args, **kwargs):
+    def get_lineage_edge_by_name(self, *args, refresh=False, **kwargs):
         return self._existing_edge
 
     def get_suffix(self, entity):
@@ -271,8 +271,12 @@ class TestColumnLineageIsPatchedAsAWholeList:
     def test_a_new_pair_arrives_as_one_replace_of_the_whole_list(self):
         ops = self._ops(stored_pairs=[1, 2], incoming_pairs=[3])
         column_ops = [op for op in ops if op["path"].startswith("/columnsLineage")]
-        assert [(op["op"], op["path"]) for op in column_ops] == [("replace", "/columnsLineage")]
-        assert [p["toColumn"] for p in column_ops[0]["value"]] == [
+        # `test` guards the replace against another writer changing the list since it was read
+        assert [(op["op"], op["path"]) for op in column_ops] == [
+            ("test", "/columnsLineage"),
+            ("replace", "/columnsLineage"),
+        ]
+        assert [p["toColumn"] for p in column_ops[1]["value"]] == [
             "svc.db.s.tgt.c1",
             "svc.db.s.tgt.c2",
             "svc.db.s.tgt.c3",
@@ -284,3 +288,81 @@ class TestColumnLineageIsPatchedAsAWholeList:
 
     def test_nothing_new_means_no_patch(self):
         assert self._ops(stored_pairs=[1, 2], incoming_pairs=[1, 2]) == []
+
+
+class TestAnotherWritersPairsSurvive:
+    """The whole-list replace is guarded by a `test` on the list that was read. When another
+    pipeline added pairs between our read (possibly the client-side cache) and our patch, the server
+    refuses, the edge is re-read bypassing the cache, merged again, and patched with everyone's pairs."""
+
+    class MovingEdge(StubbedLineage):
+        def __init__(self, cached_view, fresh_view):
+            super().__init__(cached_view)
+            self.fresh_view = fresh_view
+            self.reads = []
+
+        def get_lineage_edge_by_name(self, *args, refresh=False, **kwargs):
+            self.reads.append(refresh)
+            return self.fresh_view if refresh else self._existing_edge
+
+    @staticmethod
+    def _pair(n):
+        return {"fromColumns": [f"svc.db.s.src.c{n}"], "toColumn": f"svc.db.s.tgt.c{n}"}
+
+    @staticmethod
+    def _refused_test():
+        from metadata.ingestion.ometa.client import APIError
+
+        http_error = MagicMock()
+        http_error.response.status_code = 400
+        return APIError({"code": 400, "message": "TEST operation failed on /columnsLineage"}, http_error)
+
+    def test_a_refused_test_leads_to_a_fresh_read_and_a_merge_with_the_concurrent_pairs(self):
+        from metadata.generated.schema.type.entityLineage import ColumnLineage
+
+        stubbed = self.MovingEdge(
+            cached_view={"edge": {"columnsLineage": [self._pair(1), self._pair(2)]}},
+            fresh_view={"edge": {"columnsLineage": [self._pair(1), self._pair(2), self._pair(9)]}},  # airflow added c9
+        )
+        stubbed.client.patch.side_effect = [self._refused_test(), {"ok": True}]
+        details = LineageDetails(
+            source=LineageSource.QueryLineage, columnsLineage=[ColumnLineage.model_validate(self._pair(3))]
+        )
+        stubbed.add_lineage_by_name(
+            from_entity_fqn="svc.db.s.src",
+            from_entity_type="table",
+            to_entity_fqn="svc.db.s.tgt",
+            to_entity_type="table",
+            lineage_details=details,
+            check_patch=True,
+            return_lineage=False,
+        )
+        assert stubbed.reads == [False, True]  # cache first, then the server
+        assert not stubbed.client.put.called  # no whole-edge PUT fallback
+        first, second = [json.loads(c.kwargs["data"]) for c in stubbed.client.patch.call_args_list]
+        assert [op["op"] for op in first if op["path"] == "/columnsLineage"] == ["test", "replace"]
+        assert [p["toColumn"][-2:] for p in first[0]["value"]] == ["c1", "c2"]  # tested against what was read
+        replaced = [op for op in second if op["op"] == "replace" and op["path"] == "/columnsLineage"][0]
+        assert sorted(p["toColumn"][-2:] for p in replaced["value"]) == ["c1", "c2", "c3", "c9"]
+
+    def test_a_second_refusal_falls_back_to_the_full_put_as_before(self):
+        from metadata.generated.schema.type.entityLineage import ColumnLineage
+
+        stubbed = self.MovingEdge(
+            cached_view={"edge": {"columnsLineage": [self._pair(1)]}},
+            fresh_view={"edge": {"columnsLineage": [self._pair(1)]}},
+        )
+        stubbed.client.patch.side_effect = self._refused_test()
+        details = LineageDetails(
+            source=LineageSource.QueryLineage, columnsLineage=[ColumnLineage.model_validate(self._pair(2))]
+        )
+        stubbed.add_lineage_by_name(
+            from_entity_fqn="svc.db.s.src",
+            from_entity_type="table",
+            to_entity_fqn="svc.db.s.tgt",
+            to_entity_type="table",
+            lineage_details=details,
+            check_patch=True,
+            return_lineage=False,
+        )
+        assert stubbed.client.patch.call_count == 2 and stubbed.client.put.called
