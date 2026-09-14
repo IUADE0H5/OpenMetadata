@@ -35,6 +35,7 @@ from metadata.generated.schema.type.tableQuery import TableQueries, TableQuery
 from metadata.generated.schema.type.tableUsageCount import TableColumnJoin
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.api.steps import Processor
+from metadata.ingestion.lineage.masker import statement_shape
 from metadata.ingestion.lineage.models import ConnectionTypeDialectMapper, Dialect
 from metadata.ingestion.lineage.parser import LineageParser
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
@@ -63,25 +64,6 @@ class QueryParserProcessorConfig(ConfigModel):
     @property
     def transient_table_patterns(self) -> Tuple[str, ...]:  # noqa: UP006
         return TRANSIENT_TABLE_PATTERNS + tuple(self.transientTablePatterns)
-
-
-_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
-_NUMBER_LITERAL = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])")
-_WHITESPACE = re.compile(r"\s+")
-
-
-def statement_shape(query: str) -> str:
-    """The statement with its literals replaced by `?` and whitespace collapsed.
-
-    The tables and joins a statement touches do not depend on its literals, and query logs are
-    dominated by the same statement re-issued with other partition values, ids or dates: one day of
-    the dev lake holds 21,140 statements, 8,079 distinct texts, but only 1,695 distinct shapes. Keying
-    the parse cache on the shape turns most of a day into cache hits. Identifiers are untouched:
-    quoted identifiers use double quotes, and numbers glued to a word (`table2`, `v1_2`) are kept.
-    """
-    shaped = _STRING_LITERAL.sub("?", query)
-    shaped = _NUMBER_LITERAL.sub("?", shaped)
-    return _WHITESPACE.sub(" ", shaped).strip()
 
 
 def _parse_key(record: TableQuery, dialect: Dialect, parser_type: QueryParserType) -> tuple:

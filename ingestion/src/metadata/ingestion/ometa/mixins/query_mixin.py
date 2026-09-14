@@ -16,10 +16,14 @@ To be used by OpenMetadata class
 
 import hashlib
 import json
+import time
 import traceback
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Tuple, Union  # noqa: UP035
+
+from cachetools import LRUCache
 
 from metadata.generated.schema.api.data.createQuery import CreateQueryRequest
 from metadata.generated.schema.api.data.createQueryCostRecord import (
@@ -32,7 +36,7 @@ from metadata.generated.schema.entity.data.table import Table
 from metadata.generated.schema.type.basic import SqlQuery, Uuid
 from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.generated.schema.type.tableUsageCount import QueryCostWrapper
-from metadata.ingestion.lineage.masker import mask_query
+from metadata.ingestion.lineage.masker import mask_query, statement_shape
 from metadata.ingestion.ometa.client import REST
 from metadata.ingestion.ometa.utils import model_str
 from metadata.utils.logger import ometa_logger
@@ -41,6 +45,17 @@ logger = ometa_logger()
 
 # Queries per PUT /queries/bulk call; query text can run to several KB each.
 QUERY_BULK_BATCH_SIZE = 100
+# (statement shape, dialect) -> masked text; bounded, shared by every flush of a run
+_masked_by_shape: LRUCache = LRUCache(maxsize=20_000)
+MASK_POOL_THRESHOLD = 64  # fewer new shapes than this and the pool start-up costs more than it saves
+
+
+def _mask_in_worker(args: Tuple[str, Optional[str]]) -> Optional[str]:  # noqa: UP006, UP045
+    text, dialect = args
+    try:
+        return mask_query(text, dialect)
+    except Exception:
+        return None
 
 
 @dataclass
@@ -124,9 +139,17 @@ class OMetaQueryMixin:
         self,
         queries: Iterable[Tuple[CreateQueryRequest, EntityReference]],  # noqa: UP006
         batch_size: int = QUERY_BULK_BATCH_SIZE,
+        threads: int = 1,
+        processes: int = 1,
     ) -> None:
         """
         Attach many (query, entity) pairs at once.
+
+        ``threads`` fans out the one lookup per distinct query (and the relation PUTs for queries
+        that already exist): each is a ~100 ms round trip and a day of usage holds tens of
+        thousands of distinct statements, so serially this step alone ran for hours. ``processes``
+        masks the distinct statement shapes in worker processes: masking is CPU-bound (tens of ms
+        per statement, hundreds for a long MERGE) and the GIL keeps threads from helping.
 
         The per-entity path (``ingest_entity_queries_data``) costs a lookup, a create and up to three
         relation PUTs for every pair, and a query that touches N tables is sent N times. Here each
@@ -134,15 +157,13 @@ class OMetaQueryMixin:
         usage, users and usedBy set at creation, and existing queries receive only the relations
         they lack, additively, so relations recorded by earlier runs are kept.
         """
+        queries = list(queries)
+        self._mask_shapes(queries, processes)
         pending: Dict[Tuple[Optional[str], str], _PendingQuery] = {}  # noqa: UP006, UP045
-        masked_by_text: Dict[Tuple[str, Optional[str]], Optional[str]] = {}  # noqa: UP006, UP045  - bounded by the batch
         for create_query, entity_ref in queries:
             if create_query.exclude_usage or create_query.query.root is None:
                 continue
-            text_key = (create_query.query.root, create_query.dialect)
-            if text_key not in masked_by_text:
-                masked_by_text[text_key] = mask_query(create_query.query.root, create_query.dialect)
-            masked = masked_by_text[text_key]
+            masked = self._masked(create_query.query.root, create_query.dialect)
             if masked is None:
                 continue
             service = model_str(create_query.service) if create_query.service else None
@@ -158,18 +179,76 @@ class OMetaQueryMixin:
             for used_by in create_query.usedBy or []:
                 entry.used_by.setdefault(used_by, None)
 
-        to_create: List[_PendingQuery] = []  # noqa: UP006
-        for (service, query_hash), entry in pending.items():
+        def _lookup(item: Tuple[Tuple[Optional[str], str], _PendingQuery]) -> Tuple[Optional[Query], _PendingQuery]:  # noqa: UP006, UP045
+            (service, query_hash), entry = item
             existing = self.get_by_name(
                 entity=Query, fqn=self._query_fqn(service, query_hash), fields=["queryUsedIn", "users"]
             )
-            if existing is None:
-                to_create.append(entry)
-            else:
+            if existing is not None:
                 self._attach_query_relations(existing, entry)
+            return existing, entry
+
+        to_create: List[_PendingQuery] = []  # noqa: UP006
+        if threads > 1 and len(pending) > 1:
+            with ThreadPoolExecutor(max_workers=threads) as pool:
+                results = list(pool.map(_lookup, pending.items()))
+        else:
+            results = [_lookup(item) for item in pending.items()]
+        to_create = [entry for existing, entry in results if existing is None]
 
         for start in range(0, len(to_create), batch_size):
             self._bulk_create_queries(to_create[start : start + batch_size])
+
+    def _mask_shapes(self, queries, processes: int) -> None:
+        """Fill the shape cache for every shape this flush needs and does not have yet, in
+        ``processes`` workers when there are enough of them to be worth the pool."""
+        todo: Dict[Tuple[str, Optional[str]], str] = {}  # noqa: UP006, UP045
+        for create_query, _ in queries:
+            text = create_query.query.root
+            if create_query.exclude_usage or text is None:
+                continue
+            key = (statement_shape(text), create_query.dialect)
+            if key not in _masked_by_shape and key not in todo:
+                todo[key] = text
+        if processes <= 1 or len(todo) < MASK_POOL_THRESHOLD:
+            return
+        keys = list(todo)
+        started = time.perf_counter()
+        masked = self._mask_pool(processes).map(_mask_in_worker, [(todo[key], key[1]) for key in keys], chunksize=8)
+        for key, result in zip(keys, masked, strict=True):
+            if result is not None:  # a worker failure is masked inline by _masked, with its logging
+                _masked_by_shape[key] = result
+        logger.info(
+            f"Masked {len(keys):,} new statement shapes for {len(queries):,} queries "
+            f"in {processes} processes, {time.perf_counter() - started:.0f}s"
+        )
+
+    def _mask_pool(self, processes: int) -> ProcessPoolExecutor:
+        """One pool per client for the run: spawning a worker imports the whole framework (about ten
+        seconds for eight of them) and the usage sink flushes queries every few thousand pairs, so a
+        pool per flush spent longer starting workers than masking."""
+        pool = getattr(self, "_query_mask_pool", None)
+        if pool is None:
+            pool = ProcessPoolExecutor(max_workers=processes)
+            self._query_mask_pool = pool
+        return pool
+
+    def close_query_mask_pool(self) -> None:
+        pool = getattr(self, "_query_mask_pool", None)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+            self._query_mask_pool = None
+
+    def _masked(self, text: str, dialect: Optional[str]) -> Optional[str]:  # noqa: UP045
+        """Masking is the cost of this path: tens of ms per statement, and a day of usage holds
+        tens of thousands of distinct texts that are the same statement re-issued with other
+        literals (measured: 14,553 texts, 2,039 shapes in 400 table-day records). Masking replaces
+        exactly those literals, so two statements with one shape mask to one text: mask once per
+        shape, and remember it across flushes and files."""
+        key = (statement_shape(text), dialect)
+        if key not in _masked_by_shape:
+            _masked_by_shape[key] = mask_query(text, dialect)
+        return _masked_by_shape[key]
 
     def _bulk_create_queries(self, batch: List[_PendingQuery]) -> None:  # noqa: UP006
         requests = [

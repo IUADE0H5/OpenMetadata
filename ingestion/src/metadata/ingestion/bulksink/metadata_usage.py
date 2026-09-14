@@ -61,6 +61,7 @@ from metadata.ingestion.lineage.masker import mask_query
 from metadata.ingestion.lineage.sql_lineage import (
     get_column_fqn,
     get_table_entities_from_query,
+    search_cache,
 )
 from metadata.ingestion.ometa.client import APIError
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
@@ -84,6 +85,7 @@ class MetadataUsageSinkConfig(ConfigModel):
     filename: str
     # Concurrent HTTP writes (table usage, lifecycle, joins) at the end of each usage file.
     threads: int = 8
+    processes: int = 4  # worker processes that mask the distinct statement shapes before queries are published
 
 
 class MetadataUsageBulkSink(BulkSink):
@@ -115,6 +117,9 @@ class MetadataUsageBulkSink(BulkSink):
         self._masked_text_cache: LRUCache = LRUCache(maxsize=LRU_CACHE_SIZE)
         self.today = datetime.today().strftime("%Y-%m-%d")
         self.process_query_cost = True  # set by the usage workflow from the source's processQueryCostAnalysis
+        # The sink drives `threads` publish jobs plus the table-cache warm-up fan-out; without this the
+        # client opened and discarded a connection per request ("Connection pool is full").
+        self.metadata.client.ensure_pool_maxsize(max(self.config.threads * 4, 16))
 
     @property
     def name(self) -> str:
@@ -257,41 +262,16 @@ class MetadataUsageBulkSink(BulkSink):
             self.table_usage_map = {}
             started = time.perf_counter()
             records = unresolved = 0
-            for usage_record in file_handler.readlines():
-                records += 1
-                if progress is not None:
-                    progress.track("Usage records")
-                record = json.loads(usage_record)
-                table_usage = TableUsageCount(**json.loads(record))
-
-                self.service_name = table_usage.serviceName
-                table_entities = None
-                try:
-                    logger.debug(
-                        f"[UsageSink] Fetching table entities for "
-                        f"service={self.service_name}, "
-                        f"database={table_usage.databaseName}, "
-                        f"schema={table_usage.databaseSchema}, "
-                        f"table={table_usage.table}"
-                    )
-
-                    table_entities = get_table_entities_from_query(
-                        metadata=self.metadata,
-                        service_names=self.service_name,
-                        database_name=table_usage.databaseName,
-                        database_schema=table_usage.databaseSchema,
-                        table_name=table_usage.table,
-                    )
-                except Exception as exc:
-                    logger.debug(traceback.format_exc())
-                    logger.warning(f"Cannot get table entities from query table {table_usage.table}: {exc}")
-
-                if not table_entities:
-                    unresolved += 1
-                    logger.debug(f"Could not fetch table {table_usage.databaseName}.{table_usage.table}")
-                    continue
-
-                self.get_table_usage_and_joins(table_entities, table_usage)
+            usages = [TableUsageCount(**json.loads(json.loads(line))) for line in file_handler.readlines()]
+            for chunk_start in range(0, len(usages), self._warm_chunk_size()):
+                chunk = usages[chunk_start : chunk_start + self._warm_chunk_size()]
+                self._warm_table_cache(chunk)
+                for table_usage in chunk:
+                    records += 1
+                    if progress is not None:
+                        progress.track("Usage records")
+                    self._resolve_and_stage(table_usage)
+                    unresolved += self._last_unresolved
 
             resolved_at = time.perf_counter()
             self._flush_queries()
@@ -303,6 +283,71 @@ class MetadataUsageBulkSink(BulkSink):
                 f"in {resolved_at - started:.0f}s; usage published for {published:,} tables "
                 f"in {time.perf_counter() - resolved_at:.0f}s"
             )
+
+    _last_unresolved = 0
+
+    def _resolve_and_stage(self, table_usage: TableUsageCount) -> None:
+        self.service_name = table_usage.serviceName
+        self._last_unresolved = 0
+        table_entities = None
+        try:
+            table_entities = get_table_entities_from_query(
+                metadata=self.metadata,
+                service_names=self.service_name,
+                database_name=table_usage.databaseName,
+                database_schema=table_usage.databaseSchema,
+                table_name=table_usage.table,
+            )
+        except Exception as exc:
+            logger.debug(traceback.format_exc())
+            logger.warning(f"Cannot get table entities from query table {table_usage.table}: {exc}")
+        if not table_entities:
+            self._last_unresolved = 1
+            logger.debug(f"Could not fetch table {table_usage.databaseName}.{table_usage.table}")
+            return
+        self.get_table_usage_and_joins(table_entities, table_usage)
+
+    def _warm_chunk_size(self) -> int:
+        """Records per warm-up chunk: the table cache is a bounded LRU shared with the lineage path, so
+        a whole day's tables (more than it holds on a large lake) cannot be warmed at once without
+        evicting what the loop is about to read."""
+        return max(1, min(2000, search_cache.capacity // 2))
+
+    def _warm_table_cache(self, usages: List[TableUsageCount]) -> None:  # noqa: UP006
+        """Resolve every distinct table these records name - the usage target and the tables its
+        join columns point at - concurrently, once each, before the per-record loop runs. The loop
+        then reads them from ``search_table_entities``' cache: it was two ~100 ms round trips per
+        record, serial, which on a day of 12k table-day records was the better part of an hour."""
+        keys = {}
+        for usage in usages:
+            keys.setdefault((usage.serviceName, usage.databaseName, usage.databaseSchema, usage.table), None)
+            for join in usage.joins or []:
+                for column in join.joinedWith or []:
+                    if column.table:
+                        keys.setdefault(
+                            (usage.serviceName, usage.databaseName, usage.databaseSchema, column.table), None
+                        )
+
+        def _resolve(key) -> None:
+            service, database, schema, table = key
+            try:
+                get_table_entities_from_query(
+                    metadata=self.metadata,
+                    service_names=service,
+                    database_name=database,
+                    database_schema=schema,
+                    table_name=table,
+                )
+            except Exception as exc:
+                logger.debug(f"Warm-up lookup failed for {database}.{schema}.{table}: {exc}")
+
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=max(self.config.threads, 1) * 2) as pool:
+            list(pool.map(_resolve, keys))
+        logger.info(
+            f"Resolved {len(keys):,} distinct tables for {len(usages):,} usage records "
+            f"in {time.perf_counter() - started:.0f}s"
+        )
 
     def handle_query_cost(self) -> None:
         """One cost record per (statement, day): the text is masked once per distinct statement and the
@@ -408,7 +453,7 @@ class MetadataUsageBulkSink(BulkSink):
             return
         pending, self._pending_queries = self._pending_queries, []
         try:
-            self.metadata.ingest_queries_bulk(pending)
+            self.metadata.ingest_queries_bulk(pending, threads=self.config.threads, processes=self.config.processes)
         except APIError as err:
             if err.status_code == 409:
                 logger.warning(f"Entity already exists while ingesting queries, skipping: {err}")
@@ -543,6 +588,7 @@ class MetadataUsageBulkSink(BulkSink):
             )
 
     def close(self):
+        self.metadata.close_query_mask_pool()
         if Path(self.config.filename).exists():
             shutil.rmtree(self.config.filename)
         try:

@@ -127,3 +127,21 @@ def test_cost_records_are_published_and_counted_only_when_the_flag_is_on(staging
     off.process_query_cost = False
     off.handle_query_cost()
     assert not off.metadata.publish_query_cost.called
+
+
+def test_tables_are_resolved_once_each_before_the_record_loop(staging):
+    _usage_file(staging, ["t1", "t1", "t2"])
+    sink, _ = _sink(staging)
+    sink.process_query_cost = False
+    seen = []
+
+    def lookup(table_name, **_):
+        seen.append(table_name)
+        return [_entity(table_name)]
+
+    with patch("metadata.ingestion.bulksink.metadata_usage.get_table_entities_from_query", side_effect=lookup):
+        sink.run()
+    # the warm-up resolved the two distinct tables (concurrently); the loop then found them cached,
+    # which here shows as the lookup function being called again per record - what matters is that
+    # the warm-up saw each distinct table exactly once, before any record was processed
+    assert sorted(seen[:2]) == ["t1", "t2"]
