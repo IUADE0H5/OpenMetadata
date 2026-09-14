@@ -14,12 +14,13 @@ in a temporary file (i.e., the stage)
 to be further processed by the BulkSink.
 """
 
+import csv
 import json
 import os
 import shutil
 import traceback
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple  # noqa: UP035
+from typing import Dict, Iterable, List, Optional, Tuple  # noqa: UP035
 
 from cachetools import LRUCache
 from pydantic import Field
@@ -53,6 +54,10 @@ class TableStageConfig(ConfigModel):
     # Regexes, matched in full against the table component of a parsed reference, naming tables that
     # never exist in the catalog; added to the built-in `TRANSIENT_TABLE_PATTERNS`.
     transientTablePatterns: List[str] = Field(default_factory=list)  # noqa: N815, UP006
+    # CSV appended with one row per (table, day, principal) and the number of statements counted -
+    # what the published usage numbers are made of. Kept after the run (the staging directory is
+    # not), so a count that looks wrong can be traced to the principals behind it.
+    usageAuditFile: Optional[str] = None  # noqa: N815, UP045
 
     @property
     def transient_table_patterns(self) -> Tuple[str, ...]:  # noqa: UP006
@@ -85,6 +90,7 @@ class TableUsageStage(Stage):
         self.service_name = ""
         self.process_query_cost = True  # set by the usage workflow from the source's processQueryCostAnalysis
         self._batches = 0
+        self._audit: Dict[Tuple[str, str, str], int] = {}  # noqa: UP006  # (table, date, principal) -> statements, per batch
         # Query logs repeat a handful of principals thousands of times; without this the stage
         # spends most of a run on GET /users/name/{fqn}. Misses are cached too.
         self._user_lookup_cache: LRUCache = LRUCache(maxsize=1000)
@@ -179,6 +185,9 @@ class TableUsageStage(Stage):
         table_joins = self._catalog_joins(parsed_data.joins.get(table))
         try:
             self._add_sql_query(record=parsed_data, table=table)
+            if self.config.usageAuditFile:
+                key = (table, parsed_data.date, parsed_data.userName or "")
+                self._audit[key] = self._audit.get(key, 0) + 1
             table_usage_count = self.table_usage.get((table, parsed_data.date))
             if table_usage_count is not None:
                 table_usage_count.count = table_usage_count.count + 1
@@ -238,6 +247,7 @@ class TableUsageStage(Stage):
             return
         self.table_usage = {}
         self.table_queries = {}
+        self._audit = {}
         # Reset with the other per-batch maps: kept across batches, every dump appended the earlier
         # days' cost records to their files again, one more copy per batch.
         self.query_cost = {}
@@ -269,6 +279,16 @@ class TableUsageStage(Stage):
         """
         Dump the table usage data to a file.
         """
+        if self.config.usageAuditFile and self._audit:
+            path = Path(self.config.usageAuditFile)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            new = not path.exists() or path.stat().st_size == 0
+            with path.open("a", encoding=UTF_8, newline="") as file:
+                writer = csv.writer(file)
+                if new:
+                    writer.writerow(["service", "table", "date", "principal", "statements"])
+                for (table, date, principal), count in sorted(self._audit.items()):
+                    writer.writerow([self.service_name, table, date, principal, count])
         for key, value in self.table_usage.items():
             if value:
                 value.sqlQueries = self.table_queries.get(key, [])

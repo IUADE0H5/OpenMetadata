@@ -211,3 +211,31 @@ def test_the_stage_seeds_the_sink_totals_and_counts_table_days(tmp_path):
 
     assert source._progress_tracking.registry.global_counters() == [("Usage records", 0, 2), ("Query costs", 0, 3)]
     assert stage.status.record_count == 2  # table-days, not the three statement-table pairs
+
+
+def test_usage_audit_file_records_statements_per_table_day_and_principal(tmp_path):
+    import csv
+
+    audit = tmp_path / "audit" / "usage_audit.csv"
+    stage = _stage(tmp_path, usageAuditFile=str(audit))
+    first = _parsed("SELECT a FROM s.t1")
+    second = _parsed("SELECT b FROM s.t1")
+    other = _parsed("SELECT a FROM s.t2")
+    first.userName = second.userName = "etl-role"
+    other.userName = "analyst"  # the fixture's default user is "alice": the second batch keeps it
+    list(stage._run(QueryParserData(parsedData=[first, second, other])))
+    list(stage._run(QueryParserData(parsedData=[_parsed("SELECT c FROM s.t1")])))  # second batch appends, no new header
+
+    rows = list(csv.DictReader(audit.open()))
+    assert [(r["table"], r["principal"], r["statements"]) for r in rows] == [
+        ("s.t1", "etl-role", "2"),
+        ("s.t2", "analyst", "1"),
+        ("s.t1", "alice", "1"),
+    ]
+    assert audit.read_text().count("service,table,date,principal,statements") == 1
+
+
+def test_no_audit_file_by_default(tmp_path):
+    stage = _stage(tmp_path)
+    _run(stage, "SELECT a FROM s.t1")
+    assert not [p for p in tmp_path.rglob("*.csv")]
