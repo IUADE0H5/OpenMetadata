@@ -90,6 +90,9 @@ class MetadataUsageSinkConfig(ConfigModel):
     # counts, joined columns and life cycle - all derived from the same statements - and skips the
     # masking and the one round trip per distinct statement that dominate a large day of usage.
     publish_queries: bool = True
+    # Ask the server to recompute usage percentiles for tables, schemas and databases at the end.
+    # One heavy synchronous job per type; off when another pipeline (or a nightly job) does it.
+    compute_percentiles: bool = True
 
 
 class MetadataUsageBulkSink(BulkSink):
@@ -596,12 +599,12 @@ class MetadataUsageBulkSink(BulkSink):
         self.metadata.close_query_mask_pool()
         if Path(self.config.filename).exists():
             shutil.rmtree(self.config.filename)
-        try:
-            self.metadata.compute_percentile(Table, self.today)
-            self.metadata.compute_percentile(DatabaseSchema, self.today)
-            self.metadata.compute_percentile(Database, self.today)
-        except APIError as err:
-            logger.debug(traceback.format_exc())
-            logger.error(f"Failed to publish compute.percentile: {err}")
+        if self.config.compute_percentiles:
+            for entity in (Table, DatabaseSchema, Database):
+                try:
+                    self.metadata.compute_percentile(entity, self.today)
+                except APIError as err:
+                    logger.debug(traceback.format_exc())
+                    logger.error(f"Failed to publish compute.percentile for {entity.__name__}: {err}")
 
         self.metadata.close()

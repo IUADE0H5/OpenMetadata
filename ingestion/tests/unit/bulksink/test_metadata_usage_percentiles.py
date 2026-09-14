@@ -34,3 +34,28 @@ def test_close_computes_percentiles_for_tables_schemas_and_databases(tmp_path):
     requested = {call.args[0] for call in sink.metadata.compute_percentile.call_args_list}
     assert requested == {Table, DatabaseSchema, Database}
     assert all(call.args[1] == "2026-09-02" for call in sink.metadata.compute_percentile.call_args_list)
+
+
+def test_percentiles_can_be_turned_off(tmp_path):
+    from unittest.mock import MagicMock
+
+    from metadata.ingestion.bulksink.metadata_usage import MetadataUsageBulkSink, MetadataUsageSinkConfig
+
+    sink = MetadataUsageBulkSink(
+        config=MetadataUsageSinkConfig(filename=str(tmp_path / "stage"), compute_percentiles=False),
+        metadata=MagicMock(),
+    )
+    sink.close()
+    assert not sink.metadata.compute_percentile.called
+
+
+def test_a_failed_percentile_for_one_type_does_not_skip_the_others(tmp_path):
+    from unittest.mock import MagicMock
+
+    from metadata.ingestion.bulksink.metadata_usage import MetadataUsageBulkSink, MetadataUsageSinkConfig
+    from metadata.ingestion.ometa.client import APIError
+
+    sink = MetadataUsageBulkSink(config=MetadataUsageSinkConfig(filename=str(tmp_path / "stage")), metadata=MagicMock())
+    sink.metadata.compute_percentile.side_effect = [APIError({"code": 500, "message": "boom"}), None, None]
+    sink.close()
+    assert sink.metadata.compute_percentile.call_count == 3
