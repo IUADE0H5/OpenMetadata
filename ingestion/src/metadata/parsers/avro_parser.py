@@ -235,7 +235,10 @@ def parse_avro_schema(schema: str, cls: Type[BaseModel] = FieldModel) -> Optiona
     Method to parse the avro schema
     """
     try:
-        parsed_schema = avroschema.parse(schema)
+        # Debezium and other registries derive record namespaces from topic names, which may
+        # carry characters the Avro name grammar forbids (hyphens above all). The schema is
+        # still unambiguous; strict validation would only drop every field of such a topic.
+        parsed_schema = avroschema.parse(schema, validate_names=False)
         models = [
             cls(
                 name=parsed_schema.name,
