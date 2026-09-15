@@ -89,7 +89,34 @@ because the callback runs from that queue and AdminClient results are resolved o
 
 ## Permissions needed
 
-Kafka ACLs or, on MSK IAM, `kafka-cluster:` actions: `Connect` and `DescribeCluster` on the
-cluster, `DescribeTopic` and `DescribeTopicDynamicConfiguration` on the topics. Sample data adds
-`ReadData` on the topics and `DescribeGroup` plus `AlterGroup` on the consumer group. The
-registry needs read access to `/subjects`.
+The same rights expressed for both authorization models: IAM actions for MSK IAM, Kafka ACLs for
+clusters where the client is a certificate (mTLS) or a SASL user. On MSK the mapping is the one
+AWS documents for `kafka-cluster:`; on other Kafka distributions the ACL column is what to grant.
+
+| Connector step | MSK IAM action (resource) | Kafka ACL (resource) |
+|---|---|---|
+| open a connection | `Connect` (cluster) | none, authentication is enough |
+| `list_topics` | `DescribeCluster` (cluster), `DescribeTopic` (topic/*) | `Describe` on Cluster, `Describe` on Topic `*` |
+| `describe_configs` | `DescribeTopicDynamicConfiguration` (topic/*) | `DescribeConfigs` on Topic `*` |
+| sample data: join the group | `DescribeGroup`, `AlterGroup` (group/openmetadata-consumer) | `Describe` and `Read` on Group `openmetadata-consumer` |
+| sample data: read messages | `ReadData` (topic/*) | `Read` on Topic `*` |
+
+For a certificate principal the ACLs, without sample data, are:
+
+```bash
+kafka-acls.sh --bootstrap-server <broker:9094> --command-config <admin.properties> --add \
+  --allow-principal "User:CN=openmetadata-ingestion,OU=...,O=..." \
+  --operation Describe --cluster
+kafka-acls.sh --bootstrap-server <broker:9094> --command-config <admin.properties> --add \
+  --allow-principal "User:CN=openmetadata-ingestion,OU=...,O=..." \
+  --operation Describe --operation DescribeConfigs --topic '*'
+```
+
+Sample data adds `--operation Read --topic '*'` and `--operation Describe --operation Read --group openmetadata-consumer`.
+The principal string is the certificate's full distinguished name unless the cluster maps it with
+`ssl.principal.mapping.rules`; on MSK mTLS clusters with no ACLs at all, `allow.everyone.if.no.acl.found`
+is true and every authenticated certificate can already describe and read. The service connection
+for that case is `securityProtocol: SSL` with the client certificate and key in `consumerConfigSSL`.
+
+The registry needs read access to `/subjects`, which basic auth or the client certificate grants
+on the registry side; there is no Kafka ACL involved.
