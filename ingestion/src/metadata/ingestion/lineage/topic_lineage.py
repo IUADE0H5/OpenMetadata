@@ -25,6 +25,24 @@ from metadata.utils.logger import ingestion_logger
 logger = ingestion_logger()
 
 CDC_ENVELOPE_FIELDS = {"after", "before", "op"}
+CDC_STATE_FIELDS = {"after", "before"}
+
+
+def is_cdc_envelope(field_names) -> bool:
+    """A Debezium envelope carries ``op`` and at least one row state. ``before`` is
+    routinely dropped by a ``ReplaceField`` transform, so requiring it would miss
+    every connector configured that way."""
+    names = set(field_names)
+    return "op" in names and bool(names & CDC_STATE_FIELDS)
+
+
+def unwrap_record(field):
+    """Look through a nullable wrapper: Avro ``["null", {record}]`` parses into a field
+    whose only child is the record, and the columns sit one level further down."""
+    children = field.children or []
+    if len(children) == 1 and children[0].children:
+        return children[0]
+    return field
 
 
 def get_topic_field_fqn(topic_entity: Topic, field_name: str) -> Optional[str]:  # noqa: C901, UP045
@@ -59,7 +77,7 @@ def get_topic_field_fqn(topic_entity: Topic, field_name: str) -> Optional[str]: 
             # Debezium: 'after' holds post-change state, prefer it over 'before'
             for cdc_child in [after_child, before_child]:
                 if cdc_child and cdc_child.children:
-                    for grandchild in cdc_child.children:
+                    for grandchild in unwrap_record(cdc_child).children:
                         if model_str(grandchild.name) == field_name:
                             return grandchild.fullyQualifiedName.root if grandchild.fullyQualifiedName else None
 
