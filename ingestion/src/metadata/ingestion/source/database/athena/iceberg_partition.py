@@ -17,19 +17,17 @@ Iceberg partitioning is hidden: Glue's `PartitionKeys` is empty and the transfor
 a predicate that prunes.
 """
 
-import json
-import re
 from typing import Any, List, Optional  # noqa: UP035
 
 from metadata.generated.schema.entity.data.table import (
     PartitionColumnDetails,
     PartitionIntervalTypes,
 )
+from metadata.utils.glue_catalog import load_catalog_table
 from metadata.utils.logger import ingestion_logger
 
 logger = ingestion_logger()
 
-_S3_URI = re.compile(r"^s3a?://([^/]+)/(.+)$")
 _TIME_TRANSFORMS = {"year", "month", "day", "hour"}
 
 
@@ -76,19 +74,10 @@ def get_iceberg_partition_columns(
     Returns None when the table has no readable Iceberg metadata (not Iceberg, no
     `metadata_location`, unreadable object) and an empty list for an unpartitioned table.
     """
-    params = {"DatabaseName": database, "Name": table}
-    if catalog_id:
-        params["CatalogId"] = catalog_id
-    location = ((glue_client.get_table(**params).get("Table") or {}).get("Parameters") or {}).get("metadata_location")
-    match = _S3_URI.match(location or "")
-    if not match:
+    catalog = load_catalog_table(glue_client, s3_client, database, table, catalog_id=catalog_id)
+    if catalog is None or catalog.iceberg is None:
         return None
-    try:
-        body = s3_client.get_object(Bucket=match.group(1), Key=match.group(2))["Body"].read()
-        metadata = json.loads(body)
-    except Exception as exc:
-        logger.warning(f"Could not read Iceberg metadata for {database}.{table} at {location}: {exc}")
-        return None
+    metadata = catalog.iceberg
 
     fields = _current_fields(metadata)
     columns: List[PartitionColumnDetails] = []  # noqa: UP006
