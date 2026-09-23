@@ -71,6 +71,14 @@ class WorkspaceState:
         self._column_usage_computed: bool = False
         self._report_last_updated: dict[str, str | None] | None = None
         self._semantic_model_last_updated: dict[str, str | None] | None = None
+        # (from_id, to_id) pairs a column-carrying lineage edge has already been
+        # written for, this workspace, this run. `create_datamodel_report_lineage`
+        # and `_emit_om_target_lineage` re-process the same edges many times over
+        # (once per report x db-service-prefix), and `addLineage` replaces an
+        # edge's whole `columnsLineage` on every call rather than merging - so a
+        # second, columnless pass over an edge already written with columns would
+        # silently wipe them. Bounded per CLAUDE.md's cache rule.
+        self._emitted_column_lineage_edges: set[tuple[str, str]] = set()
 
     def enter(self, workspace: Group) -> None:
         """Activate `workspace` and build its per-workspace caches.
@@ -100,6 +108,7 @@ class WorkspaceState:
         self._column_usage_computed = False
         self._report_last_updated = None
         self._semantic_model_last_updated = None
+        self._emitted_column_lineage_edges = set()
         for report in workspace.reports or []:
             self._known_report_ids.add(report.id)
 
@@ -123,6 +132,7 @@ class WorkspaceState:
         self._column_usage_computed = False
         self._report_last_updated = None
         self._semantic_model_last_updated = None
+        self._emitted_column_lineage_edges = set()
 
     @property
     def current(self) -> Group:
@@ -287,3 +297,16 @@ class WorkspaceState:
     def semantic_model_last_updated(self) -> dict[str, str | None] | None:
         """Memoised semantic-model lastUpdatedTimeUtc map; `None` until populated via setter."""
         return self._semantic_model_last_updated
+
+    # --- Column-lineage edge dedup: write-once per (from_id, to_id), this workspace -
+
+    def has_emitted_column_lineage_edge(self, from_id: str, to_id: str) -> bool:
+        """True if a column-carrying lineage edge for `(from_id, to_id)` has already
+        been written in the current workspace this run - a later write must not be
+        attempted (see `_emitted_column_lineage_edges`'s field comment for why)."""
+        return (from_id, to_id) in self._emitted_column_lineage_edges
+
+    def mark_column_lineage_edge_emitted(self, from_id: str, to_id: str) -> None:
+        """Record that `(from_id, to_id)` has now been written with its full
+        `columnsLineage`, for the current workspace."""
+        self._emitted_column_lineage_edges.add((from_id, to_id))

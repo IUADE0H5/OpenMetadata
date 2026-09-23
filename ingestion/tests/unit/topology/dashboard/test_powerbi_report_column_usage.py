@@ -26,11 +26,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from metadata.generated.schema.entity.data.chart import ChartType
+from metadata.generated.schema.entity.data.dashboard import Dashboard
 from metadata.generated.schema.entity.data.dashboardDataModel import DashboardDataModel
 from metadata.generated.schema.entity.data.table import Column, DataType
 from metadata.generated.schema.metadataIngestion.workflow import (
     OpenMetadataWorkflowConfig,
 )
+from metadata.generated.schema.type.entityLineage import ColumnLineage
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
 from metadata.ingestion.source.dashboard.powerbi.column_usage import (
     ColumnUse,
@@ -147,6 +149,18 @@ def _col(name: str, fqn_: str, data_type=DataType.NUMBER, children=None) -> Colu
     if children is not None:
         payload["children"] = children
     return Column.model_validate(payload)
+
+
+def _dashboard(id_: str, name: str, fqn_: str) -> Dashboard:
+    """Build a `Dashboard` via `.model_validate` - see `_dm`."""
+    return Dashboard.model_validate(
+        {
+            "id": id_,
+            "name": name,
+            "fullyQualifiedName": fqn_,
+            "service": {"id": "22222222-2222-2222-2222-222222222222", "type": "dashboardService"},
+        }
+    )
 
 
 @pytest.fixture
@@ -551,6 +565,34 @@ class TestModelColumnUsageComputation:
         assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_REFS_DANGLING] == 1
         assert any("rep-1" in message and "NoSuchColumn" in message for message in caplog.messages)
 
+    def test_repeated_dangling_ref_counted_and_logged_once(self, enabled_source, caplog):
+        """The same (kind, table, name) can appear more than once in one report's
+        dangling list (once per context - filter/projection/sort/...); it must be
+        counted and logged once, not once per raw occurrence."""
+        dataset, report = self._dataset_and_report(enabled_source)
+        enabled_source.state.cache_semantic_model_definition(dataset.id, SemanticModelDefinition())
+        enabled_source.state.cache_report_definition(report.id, ReportDefinition(format="legacy"))
+        repeated_ref_a = FieldRef("column", "Ghost", "NoSuchColumn", context="projection")
+        repeated_ref_b = FieldRef("column", "Ghost", "NoSuchColumn", context="filter@visual")
+        distinct_ref = FieldRef("measure", "Ghost", "NoSuchMeasure")
+        usage = ModelColumnUsage(
+            business_columns=frozenset(),
+            used=frozenset(),
+            unused=frozenset(),
+            wholly_unused_tables=frozenset(),
+            dangling={"rep-1": [repeated_ref_a, repeated_ref_b, distinct_ref]},
+        )
+        enabled_source._compute_column_usage = MagicMock(return_value=usage)
+        enabled_source.metadata.get_by_name = MagicMock(return_value=None)
+
+        with caplog.at_level("INFO"):
+            enabled_source._ensure_column_usage_computed()
+
+        # 2 distinct (kind, table, name) triples, not 3 raw occurrences.
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_REFS_DANGLING] == 2
+        dangling_log_lines = [m for m in caplog.messages if "NoSuchColumn" in m or "NoSuchMeasure" in m]
+        assert len(dangling_log_lines) == 2
+
 
 class TestDatamodelReportColumnLineage:
     def test_direct_and_measure_refs_both_emitted_never_merged(self, enabled_source):
@@ -599,6 +641,53 @@ class TestDatamodelReportColumnLineage:
         assert all(entry.toColumn.root == "svc.rep-1_v1" for entry in column_lineage)
         functions = sorted((str(e.function.root) if e.function else "") for e in column_lineage)
         assert functions == ["", "measure:Avg Sales", "measure:Total Sales"]
+
+    def test_repeated_ref_within_one_visual_is_deduped(self, enabled_source):
+        """The raw report JSON can repeat the same field ref inside one visual
+        (e.g. a slicer's cachedFilterDisplayItems re-references the column it
+        projects) - column_usage.py's per_visual list can carry that duplicate
+        straight through; this must collapse to one ColumnLineage entry."""
+        datamodel_entity = _dm(
+            "11111111-1111-1111-1111-111111111111",
+            "ds-1",
+            "svc.ds-1",
+            columns=[
+                _col(
+                    "Sales",
+                    "svc.ds-1.Sales",
+                    data_type=DataType.TABLE,
+                    children=[_col("Amount", "svc.ds-1.Sales.Amount")],
+                )
+            ],
+        )
+        usage = ModelColumnUsage(
+            business_columns=frozenset(),
+            used=frozenset(),
+            unused=frozenset(),
+            wholly_unused_tables=frozenset(),
+            per_visual={
+                ("rep-1", "v1"): [
+                    ColumnUse(table="Sales", column="Amount", via_measure=None),
+                    # Same (table, column, via_measure) triple again - e.g. the
+                    # slicer's own projection plus its cachedFilterDisplayItems.
+                    ColumnUse(table="Sales", column="Amount", via_measure=None),
+                ]
+            },
+        )
+        chart_entity = MagicMock()
+        chart_entity.fullyQualifiedName.root = "svc.rep-1_v1"
+        enabled_source.metadata.get_by_name = MagicMock(return_value=chart_entity)
+
+        with patch(
+            "metadata.ingestion.source.dashboard.powerbi.metadata.fqn.build",
+            side_effect=lambda *a, **kw: kw.get("chart_name"),
+        ):
+            column_lineage = enabled_source._create_datamodel_report_column_lineage(
+                datamodel_entity=datamodel_entity, report_id="rep-1", usage=usage
+            )
+
+        assert len(column_lineage) == 1
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_REFS_RESOLVED] == 1
 
     def test_visual_from_other_report_excluded(self, enabled_source):
         datamodel_entity = _dm("11111111-1111-1111-1111-111111111111", "ds-1", "svc.ds-1")
@@ -725,6 +814,170 @@ class TestDataflowModelColumnLineage:
         )
 
         assert column_lineage == []
+
+
+class TestColumnLineageEdgeDedup:
+    """`yield_dashboard_lineage_details` re-processes every report x
+    db-service-prefix pair, so `create_datamodel_report_lineage` /
+    `_emit_om_target_lineage` get called many times for the same edge. A
+    column-carrying edge must be written once per workspace; a later re-visit
+    must be skipped entirely (never rewritten columnless - `addLineage`
+    replaces `lineageDetails` wholesale, so a columnless rewrite would erase the
+    columns the first write set)."""
+
+    def test_model_report_edge_written_once_across_redundant_calls(self, enabled_source):
+        report = PowerBIReport(id="rep-1", name="R", datasetId="ds-1")
+        datamodel_entity = _dm(
+            "11111111-1111-1111-1111-111111111111",
+            "ds-1",
+            "svc.ds-1",
+            columns=[
+                _col(
+                    "Sales",
+                    "svc.ds-1.Sales",
+                    data_type=DataType.TABLE,
+                    children=[_col("Amount", "svc.ds-1.Sales.Amount")],
+                )
+            ],
+        )
+        report_entity = _dashboard("22222222-2222-2222-2222-222222222222", "rep-1", "svc.rep-1")
+        chart_entity = MagicMock()
+        chart_entity.fullyQualifiedName.root = "svc.rep-1_v1"
+        usage = ModelColumnUsage(
+            business_columns=frozenset(),
+            used=frozenset(),
+            unused=frozenset(),
+            wholly_unused_tables=frozenset(),
+            per_visual={("rep-1", "v1"): [ColumnUse(table="Sales", column="Amount")]},
+        )
+        enabled_source.state.cache_column_usage("ds-1", usage)
+
+        def get_by_name(entity, fqn):
+            if entity is Dashboard:
+                return report_entity
+            if entity is DashboardDataModel:
+                return datamodel_entity
+            return chart_entity
+
+        enabled_source.metadata.get_by_name = MagicMock(side_effect=get_by_name)
+
+        with patch(
+            "metadata.ingestion.source.dashboard.powerbi.metadata.fqn.build",
+            side_effect=lambda *a, **kw: kw.get("chart_name") or "some-fqn",
+        ):
+            # Two calls, as the redundant per-(report, db-service-prefix) loop
+            # would produce for one report with two configured prefixes.
+            first_pass = list(enabled_source.create_datamodel_report_lineage(None, report))
+            second_pass = list(enabled_source.create_datamodel_report_lineage("some_prefix", report))
+
+        first_requests = [e.right for e in first_pass if e.right is not None]
+        second_requests = [e.right for e in second_pass if e.right is not None]
+        assert len(first_requests) == 1
+        assert first_requests[0].edge.lineageDetails.columnsLineage
+        # The redundant second pass writes nothing at all for this edge.
+        assert second_requests == []
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_LINEAGE_EDGES_WRITTEN_MODEL_REPORT] == 1
+        assert len(enabled_source._pending_column_lineage_edges) == 1  # pylint: disable=protected-access
+
+    def test_dataflow_dataset_edge_written_once_across_redundant_calls(self, enabled_source):
+        dataset = Dataset.model_validate(
+            {
+                "id": "ds-1",
+                "name": "Sales Model",
+                "upstreamDataflows": [{"groupId": "ws-1", "targetDataflowId": "df-1"}],
+            }
+        )
+        datamodel_entity = _dm("11111111-1111-1111-1111-111111111111", "ds-1", "svc.ds-1")
+        dataflow_entity = _dm("33333333-3333-3333-3333-333333333333", "df-1", "svc.df-1")
+        enabled_source.metadata.get_by_name = MagicMock(return_value=dataflow_entity)
+        enabled_source._create_dataset_upstream_dataflow_column_lineage = MagicMock(
+            return_value=[
+                ColumnLineage.model_validate(
+                    {"fromColumns": ["svc.df-1.Sales.Amount"], "toColumn": "svc.ds-1.Sales.Amount"}
+                )
+            ]
+        )
+
+        with patch(
+            "metadata.ingestion.source.dashboard.powerbi.metadata.fqn.build",
+            return_value="some-fqn",
+        ):
+            first_pass = list(enabled_source.create_dataset_upstream_dataflow_lineage(dataset, datamodel_entity))
+            second_pass = list(enabled_source.create_dataset_upstream_dataflow_lineage(dataset, datamodel_entity))
+
+        first_requests = [e.right for e in first_pass if e.right is not None]
+        second_requests = [e.right for e in second_pass if e.right is not None]
+        assert len(first_requests) == 1
+        assert second_requests == []
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_LINEAGE_EDGES_WRITTEN_DATAFLOW_DATASET] == 1
+
+
+class TestColumnLineageReadBackVerification:
+    def test_verify_bypasses_get_lineage_edge_cache(self, enabled_source):
+        """Must read via `self.metadata.client.get(...)` directly, never through
+        `OpenMetadata.get_lineage_edge` - that method's `search_cache` is never
+        invalidated on write and can hand back a pre-write value."""
+        datamodel_entity = _dm("11111111-1111-1111-1111-111111111111", "ds-1", "svc.ds-1")
+        report_entity = _dashboard("22222222-2222-2222-2222-222222222222", "rep-1", "svc.rep-1")
+        enabled_source._track_column_lineage_edge(
+            from_entity=datamodel_entity,
+            to_entity=report_entity,
+            edge_kind=PowerbiSource.EDGE_KIND_MODEL_REPORT,
+            emitted_count=2,
+        )
+        enabled_source.metadata.get_lineage_edge = MagicMock(
+            side_effect=AssertionError("must not use the cached get_lineage_edge")
+        )
+        enabled_source.metadata.get_suffix = MagicMock(return_value="/lineage")
+        enabled_source.metadata.client = MagicMock()
+        enabled_source.metadata.client.get.return_value = {
+            "lineageDetails": {"columnsLineage": [{"toColumn": "x"}, {"toColumn": "y"}]}
+        }
+
+        enabled_source._verify_column_lineage_edges()
+
+        enabled_source.metadata.client.get.assert_called_once()
+        called_path = enabled_source.metadata.client.get.call_args.args[0]
+        assert "getLineageEdge" in called_path
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_LINEAGE_VERIFIED] == 2
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_LINEAGE_ENTRIES_VERIFIED_MODEL_REPORT] == 2
+
+    def test_dropped_by_server_counted_per_kind(self, enabled_source):
+        datamodel_entity = _dm("11111111-1111-1111-1111-111111111111", "ds-1", "svc.ds-1")
+        dataflow_entity = _dm("33333333-3333-3333-3333-333333333333", "df-1", "svc.df-1")
+        enabled_source._track_column_lineage_edge(
+            from_entity=dataflow_entity,
+            to_entity=datamodel_entity,
+            edge_kind=PowerbiSource.EDGE_KIND_DATAFLOW_DATASET,
+            emitted_count=3,
+        )
+        enabled_source.metadata.get_suffix = MagicMock(return_value="/lineage")
+        enabled_source.metadata.client = MagicMock()
+        # Server kept only 1 of the 3 emitted entries.
+        enabled_source.metadata.client.get.return_value = {"lineageDetails": {"columnsLineage": [{"toColumn": "x"}]}}
+
+        enabled_source._verify_column_lineage_edges()
+
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_LINEAGE_VERIFIED] == 1
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_LINEAGE_DROPPED_BY_SERVER] == 2
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_LINEAGE_ENTRIES_DROPPED_DATAFLOW_DATASET] == 2
+
+    def test_pending_edges_drained_after_verification(self, enabled_source):
+        datamodel_entity = _dm("11111111-1111-1111-1111-111111111111", "ds-1", "svc.ds-1")
+        report_entity = _dashboard("22222222-2222-2222-2222-222222222222", "rep-1", "svc.rep-1")
+        enabled_source._track_column_lineage_edge(
+            from_entity=datamodel_entity,
+            to_entity=report_entity,
+            edge_kind=PowerbiSource.EDGE_KIND_MODEL_REPORT,
+            emitted_count=1,
+        )
+        enabled_source.metadata.get_suffix = MagicMock(return_value="/lineage")
+        enabled_source.metadata.client = MagicMock()
+        enabled_source.metadata.client.get.return_value = {"lineageDetails": {"columnsLineage": [{"toColumn": "x"}]}}
+
+        enabled_source._verify_column_lineage_edges()
+
+        assert enabled_source._pending_column_lineage_edges == []  # pylint: disable=protected-access
 
 
 class TestDeferredImportsRealModulesPresent:

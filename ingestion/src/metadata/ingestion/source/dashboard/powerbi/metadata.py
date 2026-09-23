@@ -76,6 +76,7 @@ from metadata.ingestion.lineage.models import Dialect
 from metadata.ingestion.lineage.parser import LineageParser
 from metadata.ingestion.lineage.sql_lineage import get_column_fqn
 from metadata.ingestion.models.barrier import Barrier
+from metadata.ingestion.ometa.client import APIError
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
 from metadata.ingestion.ometa.utils import model_str
 from metadata.ingestion.progress.modes import ProgressMode
@@ -308,6 +309,26 @@ class PowerbiSource(DashboardServiceSource):
     METRIC_DATAFLOW_MODEL_COLUMNS_UNMAPPED = "dataflow_model_columns_unmapped"
     METRIC_MODEL_COLUMNS_USED = "model_columns_used"
     METRIC_MODEL_COLUMNS_UNUSED = "model_columns_unused"
+    # Per-edge-kind breakdown, so a dev run can reconcile
+    # entries_emitted == entries_verified + entries_dropped, per kind - the
+    # METRIC_COLUMN_LINEAGE_* trio above stays as the cross-kind aggregate.
+    # "Edges written" counts distinct (from, to) pairs (post-dedup - see
+    # `WorkspaceState.has_emitted_column_lineage_edge`), never re-emissions.
+    METRIC_COLUMN_LINEAGE_EDGES_WRITTEN_MODEL_REPORT = "column_lineage_edges_written_model_report"
+    METRIC_COLUMN_LINEAGE_ENTRIES_EMITTED_MODEL_REPORT = "column_lineage_entries_emitted_model_report"
+    METRIC_COLUMN_LINEAGE_ENTRIES_VERIFIED_MODEL_REPORT = "column_lineage_entries_verified_model_report"
+    METRIC_COLUMN_LINEAGE_ENTRIES_DROPPED_MODEL_REPORT = "column_lineage_entries_dropped_model_report"
+    METRIC_COLUMN_LINEAGE_EDGES_WRITTEN_DATAFLOW_DATASET = "column_lineage_edges_written_dataflow_dataset"
+    METRIC_COLUMN_LINEAGE_ENTRIES_EMITTED_DATAFLOW_DATASET = "column_lineage_entries_emitted_dataflow_dataset"
+    METRIC_COLUMN_LINEAGE_ENTRIES_VERIFIED_DATAFLOW_DATASET = "column_lineage_entries_verified_dataflow_dataset"
+    METRIC_COLUMN_LINEAGE_ENTRIES_DROPPED_DATAFLOW_DATASET = "column_lineage_entries_dropped_dataflow_dataset"
+
+    # Canonical `edge_kind` values `_track_column_lineage_edge`/`_verify_column_lineage_edges`
+    # dispatch the per-kind metrics above on - distinct from `error_name` (which is
+    # free-text, used in log messages and shared by edge kinds this dedup doesn't
+    # cover, e.g. dataset-upstream-dataset).
+    EDGE_KIND_MODEL_REPORT = "model_report"
+    EDGE_KIND_DATAFLOW_DATASET = "dataflow_dataset"
 
     # Report -> semantic-model column usage: fetches report/model definitions from
     # Fabric (`fabric_client.py`), ingests model columns from TMDL instead of the
@@ -1650,6 +1671,26 @@ class PowerbiSource(DashboardServiceSource):
                             f"Data model entity not found for dataset_id={str(dataset_id)} while creating lineage with report={str(dashboard_details.id)}"  # noqa: RUF010
                         )
                     if datamodel_entity and report_entity:
+                        edge_already_written = (
+                            self.report_column_usage_enabled
+                            and self.state.has_emitted_column_lineage_edge(
+                                str(datamodel_entity.id.root), str(report_entity.id.root)
+                            )
+                        )
+                        if edge_already_written:
+                            # This exact (datamodel, report) edge was already
+                            # written once, in full, earlier in this workspace -
+                            # `yield_dashboard_lineage_details` re-processes every
+                            # report x db-service-prefix pair, so without this the
+                            # same edge gets rewritten repeatedly. A later
+                            # columnless rewrite of the same edge would silently
+                            # erase the columnsLineage the first write set, since
+                            # `addLineage` replaces an edge's lineageDetails wholesale
+                            # rather than merging - so once written, skip entirely.
+                            logger.debug(
+                                f"Skipping repeat datamodel-report lineage write for datamodel={dataset_id} report={dashboard_details.id} (already written this workspace)"
+                            )
+                            continue
                         logger.debug(
                             f"Creating lineage between datamodel={str(dataset_id)} and report={str(dashboard_details.id)}"  # noqa: RUF010
                         )
@@ -1667,13 +1708,17 @@ class PowerbiSource(DashboardServiceSource):
                             from_entity=datamodel_entity,
                             column_lineage=column_lineage,  # pyright: ignore[reportArgumentType]
                         )
-                        if column_lineage:
-                            self._track_column_lineage_edge(
-                                from_entity=datamodel_entity,
-                                to_entity=report_entity,
-                                edge_kind="datamodel_report",
-                                emitted_count=len(column_lineage),
+                        if self.report_column_usage_enabled:
+                            self.state.mark_column_lineage_edge_emitted(
+                                str(datamodel_entity.id.root), str(report_entity.id.root)
                             )
+                            if column_lineage:
+                                self._track_column_lineage_edge(
+                                    from_entity=datamodel_entity,
+                                    to_entity=report_entity,
+                                    edge_kind=self.EDGE_KIND_MODEL_REPORT,
+                                    emitted_count=len(column_lineage),
+                                )
                         if lineage_request is not None:
                             yield lineage_request
             else:
@@ -1725,7 +1770,19 @@ class PowerbiSource(DashboardServiceSource):
             if not chart_entity:
                 continue
             to_column = chart_entity.fullyQualifiedName.root
+            # The raw report JSON can repeat the same field ref inside one visual
+            # (e.g. a slicer's `cachedFilterDisplayItems` re-references the same
+            # column the slicer itself projects) - dedupe on (table, column,
+            # via_measure) per visual before building entries, reset per visual
+            # since the same physical column legitimately appears once per visual
+            # it's actually used in.
+            seen_in_visual: set = set()
             for use in column_uses or []:
+                via_measure = getattr(use, "via_measure", None)
+                dedupe_key = (use.table, use.column, via_measure)
+                if dedupe_key in seen_in_visual:
+                    continue
+                seen_in_visual.add(dedupe_key)
                 from_column_fqn = self._get_downstream_data_model_column_fqn(
                     data_model_entity=datamodel_entity,
                     table_name=use.table,
@@ -1735,7 +1792,6 @@ class PowerbiSource(DashboardServiceSource):
                     self._metrics[self.METRIC_COLUMN_REFS_DANGLING] += 1
                     continue
                 self._metrics[self.METRIC_COLUMN_REFS_RESOLVED] += 1
-                via_measure = getattr(use, "via_measure", None)
                 entry_kwargs: dict = {"fromColumns": [from_column_fqn], "toColumn": to_column}
                 if via_measure:
                     entry_kwargs["function"] = f"measure:{via_measure}"
@@ -1753,33 +1809,68 @@ class PowerbiSource(DashboardServiceSource):
     ) -> None:
         """Remember one column-lineage edge so `_verify_column_lineage_edges` can read
         it back, once this workspace's lineage writes have flushed, and compare what
-        the server actually stored against what was emitted.
+        the server actually stored against what was emitted. Called at most once per
+        distinct (from, to) edge per workspace (see `has_emitted_column_lineage_edge`),
+        so "edges written" here is always a distinct-edge count, never an emission count.
         """
         self._pending_column_lineage_edges.append(
             (str(from_entity.id.root), str(to_entity.id.root), edge_kind, emitted_count)
         )
+        if edge_kind == self.EDGE_KIND_MODEL_REPORT:
+            self._metrics[self.METRIC_COLUMN_LINEAGE_EDGES_WRITTEN_MODEL_REPORT] += 1
+            self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_EMITTED_MODEL_REPORT] += emitted_count
+        elif edge_kind == self.EDGE_KIND_DATAFLOW_DATASET:
+            self._metrics[self.METRIC_COLUMN_LINEAGE_EDGES_WRITTEN_DATAFLOW_DATASET] += 1
+            self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_EMITTED_DATAFLOW_DATASET] += emitted_count
+
+    def _get_lineage_edge_bypass_cache(self, from_id: str, to_id: str) -> Optional[Any]:  # noqa: UP045
+        """Read one lineage edge straight from the API, bypassing
+        `OpenMetadata.get_lineage_edge`'s module-level `search_cache`
+        (`lineage_mixin.py`), which is never invalidated on write and can hand back
+        a pre-write value read right after this run's own `addLineage` call -
+        exactly the case read-back verification exists to catch.
+        """
+        path = f"{self.metadata.get_suffix(AddLineageRequest)}/getLineageEdge/{from_id}/{to_id}"
+        try:
+            return self.metadata.client.get(path)
+        except APIError as err:
+            if err.status_code != 404:
+                logger.warning(f"Error reading back column lineage edge {from_id}->{to_id}: {err}")
+                logger.debug(traceback.format_exc())
+            return None
 
     def _verify_column_lineage_edges(self) -> None:
-        """Read back every tracked column-lineage edge and compare its stored
-        `columnsLineage` length against what was emitted, counting the difference as
-        server-side drops (a `fromColumn`/`toColumn` `validateLineageDetails` filtered
-        out - see `_create_datamodel_report_column_lineage`'s docstring). Clears the
-        pending list either way, so a verification pass never double-counts.
+        """Read back every tracked column-lineage edge - once each, since
+        `_track_column_lineage_edge` is only ever called once per distinct edge per
+        workspace - and compare its stored `columnsLineage` length against what was
+        emitted, counting the difference as server-side drops (a `fromColumn`/
+        `toColumn` `validateLineageDetails` filtered out - see
+        `_create_datamodel_report_column_lineage`'s docstring). Clears the pending
+        list either way, so a verification pass never double-counts.
         """
         pending = self._pending_column_lineage_edges
         self._pending_column_lineage_edges = []
-        for from_id, to_id, _edge_kind, emitted_count in pending:
+        for from_id, to_id, edge_kind, emitted_count in pending:
             try:
-                edge = self.metadata.get_lineage_edge(from_id, to_id)
+                edge = self._get_lineage_edge_bypass_cache(from_id, to_id)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning(f"Error reading back column lineage edge {from_id}->{to_id}: {exc}")
                 logger.debug(traceback.format_exc())
                 continue
             stored_count = len((edge or {}).get("lineageDetails", {}).get("columnsLineage") or [])
             verified = min(stored_count, emitted_count)
+            dropped = max(emitted_count - stored_count, 0)
             self._metrics[self.METRIC_COLUMN_LINEAGE_VERIFIED] += verified
-            if stored_count < emitted_count:
-                self._metrics[self.METRIC_COLUMN_LINEAGE_DROPPED_BY_SERVER] += emitted_count - stored_count
+            if dropped:
+                self._metrics[self.METRIC_COLUMN_LINEAGE_DROPPED_BY_SERVER] += dropped
+            if edge_kind == self.EDGE_KIND_MODEL_REPORT:
+                self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_VERIFIED_MODEL_REPORT] += verified
+                if dropped:
+                    self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_DROPPED_MODEL_REPORT] += dropped
+            elif edge_kind == self.EDGE_KIND_DATAFLOW_DATASET:
+                self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_VERIFIED_DATAFLOW_DATASET] += verified
+                if dropped:
+                    self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_DROPPED_DATAFLOW_DATASET] += dropped
 
     @staticmethod
     def _get_data_model_column_fqn(data_model_entity: DashboardDataModel, column: str) -> Optional[str]:  # noqa: UP045
@@ -2533,10 +2624,19 @@ class PowerbiSource(DashboardServiceSource):
         target: LineageTargetSpec,
         error_name: str,
         column_lineage_builder: Optional[Callable[..., Optional[List[ColumnLineage]]]] = None,  # noqa: UP006, UP045
+        column_lineage_edge_kind: Optional[str] = None,  # noqa: UP045
     ) -> Iterable[Either[AddLineageRequest]]:
         """Resolve target entities in OM and yield lineage from each into `to_entity`.
 
         Silent skip on falsy or missing target; failures surface as `Either.left`.
+
+        When `column_lineage_builder` is set and the feature is on, an edge already
+        written once (with its full `columnsLineage`) earlier in this workspace is
+        skipped entirely on every later encounter, never rewritten columnless -
+        `yield_dashboard_lineage_details` re-processes every report/datamodel x
+        db-service-prefix pair, and `addLineage` replaces an edge's whole
+        `lineageDetails` per call rather than merging, so a later columnless pass
+        over the same edge would erase what the first pass wrote.
         """
         service_name = self.context.get().dashboard_service  # pyright: ignore[reportAttributeAccessIssue]
         for target_id in target_ids:
@@ -2575,6 +2675,17 @@ class PowerbiSource(DashboardServiceSource):
                         to_entity.name.root,
                     )
                     continue
+                dedupe_column_edges = self.report_column_usage_enabled and column_lineage_builder is not None
+                if dedupe_column_edges and self.state.has_emitted_column_lineage_edge(
+                    str(target_entity.id.root), str(to_entity.id.root)
+                ):
+                    logger.debug(
+                        "Skipping repeat %s write for target=%s to=%s (already written this workspace)",
+                        error_name,
+                        target_entity.name.root,
+                        to_entity.name.root,
+                    )
+                    continue
                 column_lineage = column_lineage_builder(to_entity, target_entity) if column_lineage_builder else None
                 lineage_request = self._get_add_lineage_request(
                     from_entity=target_entity,
@@ -2589,13 +2700,15 @@ class PowerbiSource(DashboardServiceSource):
                         to_entity.name.root,
                     )
                     continue
-                if self.report_column_usage_enabled and column_lineage:
-                    self._track_column_lineage_edge(
-                        from_entity=target_entity,
-                        to_entity=to_entity,
-                        edge_kind=error_name,
-                        emitted_count=len(column_lineage),
-                    )
+                if dedupe_column_edges:
+                    self.state.mark_column_lineage_edge_emitted(str(target_entity.id.root), str(to_entity.id.root))
+                    if column_lineage:
+                        self._track_column_lineage_edge(
+                            from_entity=target_entity,
+                            to_entity=to_entity,
+                            edge_kind=column_lineage_edge_kind or error_name,
+                            emitted_count=len(column_lineage),
+                        )
                 yield lineage_request
             except Exception as exc:  # pylint: disable=broad-except
                 yield Either(
@@ -2622,6 +2735,7 @@ class PowerbiSource(DashboardServiceSource):
             target=DATAMODEL_TARGET,
             error_name="Dataset and UpstreamDataflow Lineage",
             column_lineage_builder=column_lineage_builder,
+            column_lineage_edge_kind=self.EDGE_KIND_DATAFLOW_DATASET,
         )
 
     def _parse_dataflow_source_ref(self, m_expression: str) -> Optional[Any]:  # noqa: UP045
@@ -3253,14 +3367,23 @@ class PowerbiSource(DashboardServiceSource):
             self._metrics[self.METRIC_MODEL_COLUMNS_UNUSED] += len(usage.unused or frozenset())
             self._metrics[self.METRIC_DAX_UNRESOLVED] += len(usage.dax_unresolved or set())
             for report_id, dangling_refs in (usage.dangling or {}).items():
+                # The same (kind, table, name) dangling ref can appear more than
+                # once per report (once per context it's referenced in - filter,
+                # projection, sort, ...); count and log each distinct triple once
+                # per report, not once per raw occurrence.
+                seen_this_report: set = set()
                 for ref in dangling_refs or []:
+                    key = (getattr(ref, "kind", None), getattr(ref, "table", None), getattr(ref, "name", None))
+                    if key in seen_this_report:
+                        continue
+                    seen_this_report.add(key)
                     self._metrics[self.METRIC_COLUMN_REFS_DANGLING] += 1
                     logger.info(
                         "Dangling column/measure reference in report [%s]: table=%s name=%s (kind=%s)",
                         report_id,
-                        getattr(ref, "table", None),
-                        getattr(ref, "name", None),
-                        getattr(ref, "kind", None),
+                        key[1],
+                        key[2],
+                        key[0],
                     )
             datamodel_fqn = fqn.build(
                 self.metadata,
