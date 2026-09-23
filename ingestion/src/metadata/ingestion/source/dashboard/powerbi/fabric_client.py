@@ -63,6 +63,7 @@ MAX_POLL_ATTEMPTS = 60
 POST_TIMEOUT_SECONDS = 120
 POLL_TIMEOUT_SECONDS = 120
 RESULT_TIMEOUT_SECONDS = 120
+LIST_TIMEOUT_SECONDS = 60
 
 # The whole getDefinition operation (POST + poll + result) is retried on a transport
 # error - a `ReadTimeout` mid-poll has been observed live - rather than any single HTTP
@@ -105,23 +106,34 @@ class FabricApiClient:
     def __init__(self, config: PowerBIConnection, base_url: str = FABRIC_API_BASE_URL) -> None:
         self.config = config
         self._base_url = base_url.rstrip("/")
-        self.msal_client = msal.ConfidentialClientApplication(
-            client_id=config.clientId,
-            client_credential=config.clientSecret.get_secret_value(),
-            authority=(config.authorityURI or "") + config.tenantId,
-            # Skips MSAL's authority-metadata discovery call (a network round trip
-            # to the authority host) at construction time. `PowerBiApiClient`
-            # (client.py) doesn't need this because its construction already sits
-            # behind the connection-test lifecycle; this client is built eagerly in
-            # `PowerbiSource.__init__` (see the comment there), before any
-            # connection test runs, so it must not do network I/O just to exist.
-            validate_authority=False,
-        )
+        self._msal_client = None
         self._session = requests.Session()
         mount_resilient_adapter(self._session)
         # Keyed by (item_id, lastUpdatedTimeUtc): unchanged items are skipped within a
         # run without a network call.
         self._definitions_cache: LRUCache[tuple, Mapping[str, bytes]] = LRUCache(maxsize=_MAX_CACHED_DEFINITIONS)
+
+    @property
+    def msal_client(self):
+        """Built on first access, not at construction.
+
+        `msal.ConfidentialClientApplication.__init__` always performs a tenant
+        OIDC-discovery network call (`Authority.__init__`'s own docstring: "We
+        always do a tenant discovery" - `validate_authority=False` only skips the
+        separate *instance* discovery, not this one). This client is built eagerly
+        in `PowerbiSource.__init__`, before any connection test runs, so
+        constructing it must never touch the network on its own - only an actual
+        token request (`_get_auth_token`, called from `get_report_definition` /
+        `get_semantic_model_definition`) should.
+        """
+        if self._msal_client is None:
+            self._msal_client = msal.ConfidentialClientApplication(
+                client_id=self.config.clientId,
+                client_credential=self.config.clientSecret.get_secret_value(),
+                authority=(self.config.authorityURI or "") + self.config.tenantId,
+                validate_authority=False,
+            )
+        return self._msal_client
 
     # --- auth -----------------------------------------------------------------
 
@@ -183,6 +195,43 @@ class FabricApiClient:
         """Fetch a semantic model's `getDefinition` (TMDL) parts, cached by (model_id, lastUpdatedTimeUtc)."""
         path = f"/workspaces/{workspace_id}/semanticModels/{model_id}/getDefinition?format=TMDL"
         return self._get_definition_cached(model_id, last_updated_time_utc, path)
+
+    def list_reports_last_updated(self, workspace_id: str) -> Optional[Mapping[str, Optional[str]]]:  # noqa: UP045
+        """`{report id: lastUpdatedTimeUtc}` for every report in the workspace, one
+        paginated listing call. `None` on failure (never a partial mapping - a
+        caller can't tell "this item wasn't in a partial page" from "this item was
+        deleted" if it got one back); an item that itself lacks the field is kept
+        with a `None` value rather than dropped or guessed at.
+        """
+        return self._list_items_last_updated(f"/workspaces/{workspace_id}/reports")
+
+    def list_semantic_models_last_updated(self, workspace_id: str) -> Optional[Mapping[str, Optional[str]]]:  # noqa: UP045
+        """`{model id: lastUpdatedTimeUtc}` for every semantic model in the workspace - see `list_reports_last_updated`."""
+        return self._list_items_last_updated(f"/workspaces/{workspace_id}/semanticModels")
+
+    def _list_items_last_updated(self, path: str) -> Optional[Mapping[str, Optional[str]]]:  # noqa: UP045
+        headers = self._auth_headers()
+        if not headers:
+            return None
+        result: dict = {}
+        url: Optional[str] = f"{self._base_url}{path}"  # noqa: UP045
+        try:
+            while url:
+                response = self._session.get(url, headers=headers, timeout=LIST_TIMEOUT_SECONDS)
+                response.raise_for_status()
+                body = response.json() or {}
+                for item in body.get("value") or []:
+                    item_id = item.get("id")
+                    if item_id:
+                        result[item_id] = item.get("lastUpdatedTimeUtc")
+                # Fabric hands back a ready-to-call absolute URL for the next page;
+                # its absence means this was the last one.
+                url = body.get("continuationUri") or None
+        except requests.exceptions.RequestException as exc:
+            logger.warning(f"Error listing {path}: {exc}")
+            logger.debug(traceback.format_exc())
+            return None
+        return result
 
     def fetch_definitions(
         self,

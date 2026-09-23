@@ -62,12 +62,33 @@ def _definition_body(parts):
 
 @pytest.fixture
 def client():
+    connection = PowerBIConnection.model_validate(CONNECTION_CONFIG)
+    api_client = FabricApiClient(connection)
+    # `msal_client` is built lazily (see its docstring) - patch `msal` before this
+    # first access so building it can't make a real network call in a test.
     with patch("metadata.ingestion.source.dashboard.powerbi.fabric_client.msal"):
-        connection = PowerBIConnection.model_validate(CONNECTION_CONFIG)
-        api_client = FabricApiClient(connection)
-    api_client.msal_client.acquire_token_silent = MagicMock(return_value={"access_token": "tok"})
+        api_client.msal_client.acquire_token_silent = MagicMock(return_value={"access_token": "tok"})
     api_client._session = MagicMock()  # pylint: disable=protected-access
     return api_client
+
+
+class TestMsalClientIsLazy:
+    def test_construction_never_builds_msal_client(self):
+        """`FabricApiClient.__init__` must do zero network I/O - `msal` is not
+        patched here at all, so if construction touched it, this would hang or
+        fail against the real Microsoft endpoint instead of just passing."""
+        connection = PowerBIConnection.model_validate(CONNECTION_CONFIG)
+        api_client = FabricApiClient(connection)
+        assert api_client._msal_client is None  # pylint: disable=protected-access
+
+    def test_msal_client_built_once_on_first_access(self):
+        connection = PowerBIConnection.model_validate(CONNECTION_CONFIG)
+        api_client = FabricApiClient(connection)
+        with patch("metadata.ingestion.source.dashboard.powerbi.fabric_client.msal") as mock_msal:
+            first = api_client.msal_client
+            second = api_client.msal_client
+        assert first is second
+        mock_msal.ConfidentialClientApplication.assert_called_once()
 
 
 class TestGetDefinitionSync:
@@ -250,3 +271,64 @@ class TestDecodeParts:
     def test_missing_definition_decodes_empty(self, client):
         assert client._decode_parts({}) == {}  # pylint: disable=protected-access
         assert client._decode_parts(None) == {}  # pylint: disable=protected-access
+
+
+class TestListLastUpdated:
+    """`list_reports_last_updated` / `list_semantic_models_last_updated`: pagination
+    via `continuationUri`, honest reporting of a missing field, and a clean `None`
+    (never a partial mapping) on failure."""
+
+    def test_single_page(self, client):
+        client._session.get.return_value = _response(
+            200,
+            {"value": [{"id": "r1", "lastUpdatedTimeUtc": "2026-01-01T00:00:00Z"}, {"id": "r2"}]},
+        )
+
+        result = client.list_reports_last_updated("ws1")
+
+        assert result == {"r1": "2026-01-01T00:00:00Z", "r2": None}
+        client._session.get.assert_called_once_with(
+            "https://api.fabric.microsoft.com/v1/workspaces/ws1/reports",
+            headers={"Authorization": "Bearer tok"},
+            timeout=60,
+        )
+
+    def test_follows_continuation_uri_across_pages(self, client):
+        page1 = _response(
+            200,
+            {
+                "value": [{"id": "m1", "lastUpdatedTimeUtc": "t1"}],
+                "continuationUri": "https://api.fabric.microsoft.com/v1/workspaces/ws1/semanticModels?token=abc",
+            },
+        )
+        page2 = _response(200, {"value": [{"id": "m2", "lastUpdatedTimeUtc": "t2"}]})
+        client._session.get.side_effect = [page1, page2]
+
+        result = client.list_semantic_models_last_updated("ws1")
+
+        assert result == {"m1": "t1", "m2": "t2"}
+        assert client._session.get.call_count == 2
+        second_call_url = client._session.get.call_args_list[1].args[0]
+        assert second_call_url == "https://api.fabric.microsoft.com/v1/workspaces/ws1/semanticModels?token=abc"
+
+    def test_transport_error_returns_none_not_partial(self, client):
+        page1 = _response(200, {"value": [{"id": "r1", "lastUpdatedTimeUtc": "t1"}], "continuationUri": "https://x"})
+        client._session.get.side_effect = [page1, requests.exceptions.ConnectionError("refused")]
+
+        result = client.list_reports_last_updated("ws1")
+
+        assert result is None
+
+    def test_http_error_returns_none(self, client):
+        resp = _response(500, {})
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError("500")
+        client._session.get.return_value = resp
+
+        assert client.list_reports_last_updated("ws1") is None
+
+    def test_no_auth_token_returns_none_without_a_call(self, client):
+        client.msal_client.acquire_token_silent = MagicMock(return_value=None)
+        client.msal_client.acquire_token_for_client = MagicMock(return_value=None)
+
+        assert client.list_reports_last_updated("ws1") is None
+        client._session.get.assert_not_called()

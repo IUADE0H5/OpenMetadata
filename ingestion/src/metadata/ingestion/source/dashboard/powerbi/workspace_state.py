@@ -69,6 +69,8 @@ class WorkspaceState:
         self._semantic_model_definitions: dict[str, object] = {}
         self._column_usage: dict[str, object] = {}
         self._column_usage_computed: bool = False
+        self._report_last_updated: dict[str, str | None] | None = None
+        self._semantic_model_last_updated: dict[str, str | None] | None = None
 
     def enter(self, workspace: Group) -> None:
         """Activate `workspace` and build its per-workspace caches.
@@ -96,6 +98,8 @@ class WorkspaceState:
         self._semantic_model_definitions = {}
         self._column_usage = {}
         self._column_usage_computed = False
+        self._report_last_updated = None
+        self._semantic_model_last_updated = None
         for report in workspace.reports or []:
             self._known_report_ids.add(report.id)
 
@@ -117,6 +121,8 @@ class WorkspaceState:
         self._semantic_model_definitions = {}
         self._column_usage = {}
         self._column_usage_computed = False
+        self._report_last_updated = None
+        self._semantic_model_last_updated = None
 
     @property
     def current(self) -> Group:
@@ -255,3 +261,29 @@ class WorkspaceState:
     def mark_column_usage_computed(self) -> None:
         """Record that column usage has been computed for every dataset in the current workspace."""
         self._column_usage_computed = True
+
+    # --- Report/model lastUpdatedTimeUtc listings: write-once (lazy memo) -----------
+    #
+    # One `FabricApiClient.list_*_last_updated` call per workspace per run, not one per
+    # item - same lazy-memo shape as `filtered_datamodels`. `None` until populated;
+    # populated with `{}` (not left `None`) when the listing call itself failed, so a
+    # miss reads the same as "not in this workspace" rather than triggering a re-fetch
+    # per item for the rest of the run.
+
+    def set_report_last_updated(self, mapping: dict[str, str | None]) -> None:
+        """Populate the memoised report-id -> lastUpdatedTimeUtc map for the current workspace."""
+        self._report_last_updated = mapping
+
+    @property
+    def report_last_updated(self) -> dict[str, str | None] | None:
+        """Memoised report lastUpdatedTimeUtc map; `None` until populated via setter."""
+        return self._report_last_updated
+
+    def set_semantic_model_last_updated(self, mapping: dict[str, str | None]) -> None:
+        """Populate the memoised model-id -> lastUpdatedTimeUtc map for the current workspace."""
+        self._semantic_model_last_updated = mapping
+
+    @property
+    def semantic_model_last_updated(self) -> dict[str, str | None] | None:
+        """Memoised semantic-model lastUpdatedTimeUtc map; `None` until populated via setter."""
+        return self._semantic_model_last_updated

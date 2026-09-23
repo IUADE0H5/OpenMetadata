@@ -112,6 +112,14 @@ def _build_source(cls=PowerbiSource):
     mock_context.workspace = Group(id="ws-1", name="Test Workspace")
     mock_context.dashboard_service = "test_powerbi_service"
     source.context.get = MagicMock(return_value=mock_context)
+    if source.fabric_client is not None:
+        # Hermetic by default: `_get_report_definition`/`_get_semantic_model_definition`
+        # always resolve `lastUpdatedTimeUtc` via these before fetching a definition,
+        # and the real `FabricApiClient` would otherwise reach for a real (lazily
+        # built, unmocked here) msal client - i.e. a real network call. Tests that
+        # care about this listing override these mocks themselves.
+        source.fabric_client.list_reports_last_updated = MagicMock(return_value={})
+        source.fabric_client.list_semantic_models_last_updated = MagicMock(return_value={})
     return source
 
 
@@ -359,6 +367,77 @@ class TestFabricFetchOrchestration:
 
         assert enabled_source.metric_values()[PowerbiSource.METRIC_REPORT_DEFINITIONS_CACHE_SKIPPED] == 1
         assert enabled_source.metric_values()[PowerbiSource.METRIC_REPORT_DEFINITIONS_FETCHED] == 0
+
+
+class TestLastUpdatedListing:
+    """`_get_report_last_updated` / `_get_semantic_model_last_updated`: one Fabric
+    listing call per workspace per run, threaded into the getDefinition cache key."""
+
+    def test_last_updated_is_looked_up_and_passed_through(self, enabled_source):
+        report = PowerBIReport(id="rep-1", name="R")
+        enabled_source.fabric_client.list_reports_last_updated = MagicMock(
+            return_value={"rep-1": "2026-01-01T00:00:00Z"}
+        )
+        enabled_source.fabric_client.get_report_definition = MagicMock(
+            return_value=FabricDefinitionResult(parts={"report.json": b"{}"}, from_cache=False)
+        )
+        enabled_source._parse_report_definition = MagicMock(return_value=ReportDefinition(format="legacy"))
+
+        enabled_source._get_report_definition(report, "ws-1")
+
+        enabled_source.fabric_client.get_report_definition.assert_called_once_with(
+            "ws-1", "rep-1", "2026-01-01T00:00:00Z"
+        )
+
+    def test_listing_called_once_per_workspace_not_per_report(self, enabled_source):
+        report_a = PowerBIReport(id="rep-a", name="A")
+        report_b = PowerBIReport(id="rep-b", name="B")
+        enabled_source.fabric_client.list_reports_last_updated = MagicMock(return_value={})
+        enabled_source.fabric_client.get_report_definition = MagicMock(return_value=None)
+
+        enabled_source._get_report_definition(report_a, "ws-1")
+        enabled_source._get_report_definition(report_b, "ws-1")
+
+        enabled_source.fabric_client.list_reports_last_updated.assert_called_once_with("ws-1")
+
+    def test_listing_failure_falls_back_to_none_and_counts_metric(self, enabled_source):
+        report = PowerBIReport(id="rep-1", name="R")
+        enabled_source.fabric_client.list_reports_last_updated = MagicMock(return_value=None)
+        enabled_source.fabric_client.get_report_definition = MagicMock(return_value=None)
+
+        enabled_source._get_report_definition(report, "ws-1")
+
+        enabled_source.fabric_client.get_report_definition.assert_called_once_with("ws-1", "rep-1", None)
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_REPORT_LAST_UPDATED_LISTING_FAILED] == 1
+
+    def test_item_missing_the_field_is_recorded_as_none_not_fabricated(self, enabled_source):
+        enabled_source.fabric_client.list_reports_last_updated = MagicMock(return_value={"rep-1": None})
+
+        mapping = enabled_source._get_report_last_updated("ws-1")
+
+        assert mapping == {"rep-1": None}
+
+    def test_model_last_updated_looked_up_and_passed_through(self, enabled_source):
+        dataset = Dataset(id="ds-1", name="Sales Model")
+        enabled_source.fabric_client.list_semantic_models_last_updated = MagicMock(
+            return_value={"ds-1": "2026-02-01T00:00:00Z"}
+        )
+        enabled_source.fabric_client.get_semantic_model_definition = MagicMock(return_value=None)
+
+        enabled_source._get_semantic_model_definition(dataset, "ws-1")
+
+        enabled_source.fabric_client.get_semantic_model_definition.assert_called_once_with(
+            "ws-1", "ds-1", "2026-02-01T00:00:00Z"
+        )
+
+    def test_model_listing_failure_falls_back_to_none_and_counts_metric(self, enabled_source):
+        dataset = Dataset(id="ds-1", name="Sales Model")
+        enabled_source.fabric_client.list_semantic_models_last_updated = MagicMock(return_value=None)
+        enabled_source.fabric_client.get_semantic_model_definition = MagicMock(return_value=None)
+
+        enabled_source._get_semantic_model_definition(dataset, "ws-1")
+
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_MODEL_LAST_UPDATED_LISTING_FAILED] == 1
 
 
 class TestTmdlAdapter:

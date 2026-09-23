@@ -283,6 +283,11 @@ class PowerbiSource(DashboardServiceSource):
     METRIC_MODEL_DEFINITIONS_FETCHED = "model_definitions_fetched"
     METRIC_MODEL_DEFINITIONS_CACHE_SKIPPED = "model_definitions_cache_skipped"
     METRIC_MODEL_DEFINITIONS_FAILED = "model_definitions_failed"
+    # `list_reports_last_updated`/`list_semantic_models_last_updated` (one call per
+    # workspace per run) failing - the cache key then falls back to `None` for that
+    # workspace's items, degrading to within-run-only dedup for it.
+    METRIC_REPORT_LAST_UPDATED_LISTING_FAILED = "report_last_updated_listing_failed"
+    METRIC_MODEL_LAST_UPDATED_LISTING_FAILED = "model_last_updated_listing_failed"
     METRIC_REPORTS_FORMAT_LEGACY = "reports_format_legacy"
     METRIC_REPORTS_FORMAT_PBIR = "reports_format_pbir"
     METRIC_REPORTS_FORMAT_UNKNOWN = "reports_format_unknown"
@@ -346,13 +351,13 @@ class PowerbiSource(DashboardServiceSource):
         self._unresolved_logged_count = 0
         # Fabric client for report/model `getDefinition` calls - only constructed
         # when the feature is switched on, so a connector run with it off never even
-        # builds the extra msal client. Built eagerly here (not lazily on first use)
-        # so a config problem surfaces once, consistently, rather than differently
-        # depending on which workspace happens to hit it first - but unlike
-        # `PowerBiApiClient` (client.py), which sits behind the connection-test
-        # lifecycle (`connection.py`'s `PowerBIConnection._get_client`), this
-        # constructor runs before `test_connection()` and must never let a bad SPN
-        # or an unreachable tenant abort `__init__` itself: every consumer already
+        # builds one. `FabricApiClient.__init__` itself does no network I/O (its
+        # msal client is built lazily, on first token request - see its docstring),
+        # so building it here eagerly is safe even though - unlike `PowerBiApiClient`
+        # (client.py), which sits behind the connection-test lifecycle
+        # (`connection.py`'s `PowerBIConnection._get_client`) - this constructor runs
+        # before `test_connection()`. The try/except is still worth keeping as a
+        # last-resort guard against a malformed config value: every consumer already
         # treats `fabric_client is None` as "feature unavailable this run" (logs +
         # a `*_failed` metric), the same degrade-gracefully contract as an
         # individual fetch failing.
@@ -998,6 +1003,26 @@ class PowerbiSource(DashboardServiceSource):
             f"{workspace_id}/{DEFAULT_REPORTS_PREFIX}/{report_id}{page_suffix}?experience=power-bi"
         )
 
+    def _get_report_last_updated(self, workspace_id: str) -> Mapping[str, Optional[str]]:  # noqa: UP045
+        """`{report id: lastUpdatedTimeUtc}` for the current workspace - one Fabric
+        listing call per workspace per run (`WorkspaceState.report_last_updated` is a
+        write-once memo), not one per report. `{}` - not `None` - once resolved,
+        whether the listing succeeded empty or failed outright, so a lookup miss
+        never re-triggers the listing call for the rest of this workspace.
+        """
+        cached = self.state.report_last_updated
+        if cached is not None:
+            return cached
+        mapping: dict = {}
+        if self.fabric_client:
+            fetched = self.fabric_client.list_reports_last_updated(workspace_id)
+            if fetched is None:
+                self._metrics[self.METRIC_REPORT_LAST_UPDATED_LISTING_FAILED] += 1
+            else:
+                mapping = dict(fetched)
+        self.state.set_report_last_updated(mapping)
+        return mapping
+
     def _get_report_definition(
         self, dashboard_details: PowerBIReport, workspace_id: str
     ) -> Optional[ReportDefinitionLike]:  # noqa: UP045
@@ -1011,7 +1036,8 @@ class PowerbiSource(DashboardServiceSource):
             return cached  # pyright: ignore[reportReturnType]
         if not self.fabric_client:
             return None
-        result = self.fabric_client.get_report_definition(workspace_id, dashboard_details.id)
+        last_updated = self._get_report_last_updated(workspace_id).get(dashboard_details.id)
+        result = self.fabric_client.get_report_definition(workspace_id, dashboard_details.id, last_updated)
         if result is None:
             self._metrics[self.METRIC_REPORT_DEFINITIONS_FAILED] += 1
             return None
@@ -1276,6 +1302,21 @@ class PowerbiSource(DashboardServiceSource):
         self.state.set_filtered_datamodels(filtered)
         return filtered
 
+    def _get_semantic_model_last_updated(self, workspace_id: str) -> Mapping[str, Optional[str]]:  # noqa: UP045
+        """`{model id: lastUpdatedTimeUtc}` for the current workspace - see `_get_report_last_updated`."""
+        cached = self.state.semantic_model_last_updated
+        if cached is not None:
+            return cached
+        mapping: dict = {}
+        if self.fabric_client:
+            fetched = self.fabric_client.list_semantic_models_last_updated(workspace_id)
+            if fetched is None:
+                self._metrics[self.METRIC_MODEL_LAST_UPDATED_LISTING_FAILED] += 1
+            else:
+                mapping = dict(fetched)
+        self.state.set_semantic_model_last_updated(mapping)
+        return mapping
+
     def _get_semantic_model_definition(self, dataset: Dataset, workspace_id: str) -> Optional[object]:  # noqa: UP045
         """Fetch (Fabric TMDL, cached by lastUpdatedTimeUtc within this run) and parse
         a semantic model's definition. `None` on any failure - no Fabric client, the
@@ -1286,7 +1327,8 @@ class PowerbiSource(DashboardServiceSource):
             return cached
         if not self.fabric_client:
             return None
-        result = self.fabric_client.get_semantic_model_definition(workspace_id, dataset.id)
+        last_updated = self._get_semantic_model_last_updated(workspace_id).get(dataset.id)
+        result = self.fabric_client.get_semantic_model_definition(workspace_id, dataset.id, last_updated)
         if result is None:
             self._metrics[self.METRIC_MODEL_DEFINITIONS_FAILED] += 1
             return None
