@@ -35,10 +35,13 @@ from metadata.ingestion.source.dashboard.powerbi.models import (
     Group,
     PowerBiColumns,
     PowerBIDashboard,
+    PowerBIDatasetUser,
+    PowerBIPrincipal,
     PowerBIReport,
     PowerBiTable,
     PowerBITableSource,
     PowerBIUser,
+    PowerBIWorkspaceUser,
     ReportPage,
     Tile,
     UpstreaDataflow,
@@ -903,6 +906,36 @@ MOCK_DATAFLOW_EXPORT_DUPLICATE_REF = DataflowExportResponse(
             queriesMetadata=MOCK_DATAFLOW_DUPLICATE_REF_QUERIES_METADATA,
         )
     },
+)
+
+
+# --- Non-admin owner resolution fixtures (neutral names) ---
+
+MOCK_WORKSPACE_USER_CONTRIBUTOR = PowerBIWorkspaceUser(
+    identifier="ada@example.com",
+    principalType="User",
+    displayName="Ada",
+    emailAddress="ada@example.com",
+    groupUserAccessRight="Contributor",
+)
+MOCK_WORKSPACE_USER_VIEWER = PowerBIWorkspaceUser(
+    identifier="viewer@example.com",
+    principalType="User",
+    displayName="Viewer",
+    emailAddress="viewer@example.com",
+    groupUserAccessRight="Viewer",
+)
+MOCK_WORKSPACE_GROUP = PowerBIWorkspaceUser(
+    identifier="group-object-id",
+    principalType="Group",
+    displayName="Analytics Team",
+    groupUserAccessRight="Member",
+)
+MOCK_WORKSPACE_APP = PowerBIWorkspaceUser(
+    identifier="app-object-id",
+    principalType="App",
+    displayName="Some App",
+    groupUserAccessRight="Admin",
 )
 
 
@@ -3330,3 +3363,323 @@ class PowerBIUnitTest(TestCase):
         assert resolved_workspace.datasets[0].upstreamDataflows[0].targetDataflowId == "cross-workspace-dataflow"
         metrics = self.powerbi.metric_values()
         assert metrics.get(PowerbiSource.METRIC_UPSTREAM_LINKS_OUTSIDE_SCOPE, 0) == 0
+
+    # -- Non-admin owner resolution -------------------------------------
+
+    @pytest.mark.order(78)
+    def test_principal_normalization_parses_user_group_and_app(self):
+        """`PowerBIPrincipal.from_workspace_user`/`from_dataset_user` normalize
+        both non-admin endpoints' rows, including Group and App principal
+        types the admin-scan-shaped `PowerBIUser` has no equivalent for.
+        """
+        user_principal = PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_CONTRIBUTOR)
+        assert user_principal == PowerBIPrincipal(
+            principal_type="User",
+            identifier="ada@example.com",
+            email="ada@example.com",
+            display_name="Ada",
+            access_right="Contributor",
+        )
+
+        group_principal = PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_GROUP)
+        assert group_principal.principal_type == "Group"
+        assert group_principal.display_name == "Analytics Team"
+        assert group_principal.email is None
+
+        app_principal = PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_APP)
+        assert app_principal.principal_type == "App"
+
+        # Dataset ACL rows carry no email/displayName - a User's `identifier`
+        # (documented as its UPN) is used as the email fallback, a Group's is not.
+        dataset_user = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(identifier="ada@example.com", principalType="User", datasetUserAccessRight="ReadWrite")
+        )
+        assert dataset_user.email == "ada@example.com"
+        dataset_group = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(identifier="group-object-id", principalType="Group", datasetUserAccessRight="ReadWrite")
+        )
+        assert dataset_group.email is None
+
+    @pytest.mark.order(79)
+    def test_non_admin_dataflow_owner_from_configured_by(self):
+        """Dataflow owners include `configuredBy` (the non-admin field the
+        `Dataflow` model previously never read - see `models.py`).
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow", configuredBy="ada@example.com")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is not None
+        assert len(result.root) == 1
+        assert result.root[0].name == "Ada"
+        mock_get_ref.assert_called_once_with("ada@example.com")
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_DATAFLOWS] == 1
+
+    @pytest.mark.order(80)
+    def test_non_admin_dataflow_excludes_viewer_includes_contributor(self):
+        """Contributor is the lowest workspace role that can write; Viewer
+        never becomes an owner (see the constants' generic-vs-policy note).
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[
+                PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_CONTRIBUTOR),
+                PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_VIEWER),
+            ],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is not None
+        assert len(result.root) == 1
+        assert result.root[0].name == "Ada"
+        mock_get_ref.assert_called_once_with("ada@example.com")
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 1
+
+    @pytest.mark.order(81)
+    def test_non_admin_datamodel_owners_from_dataset_acl_write_right_only(self):
+        """Dataset-ACL principals with a write-level right become owners;
+        read-only ACL principals are excluded.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="ada@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadWrite",
+                    )
+                ),
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="reader@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="Read",
+                    )
+                ),
+            ],
+        )
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(dataset)
+
+        assert result is not None
+        assert len(result.root) == 1
+        mock_get_ref.assert_called_once_with("ada@example.com")
+
+    @pytest.mark.order(82)
+    def test_non_admin_report_owners_inherit_from_dataset(self):
+        """Reports have no owner endpoint in non-admin mode (404) - they
+        inherit their semantic model's owners via `datasetId`.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataset = Dataset(id="dataset-1", name="Sales Semantic Model", configuredBy="ada@example.com")
+        workspace = Group(id="ws-a", name="Analytics Workspace", datasets=[dataset])
+        self.powerbi.state.enter(workspace)
+        report = PowerBIReport(id="report-1", name="Sales Report", datasetId="dataset-1")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(report)
+
+        assert result is not None
+        assert len(result.root) == 1
+        assert result.root[0].name == "Ada"
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_REPORTS] == 1
+
+    @pytest.mark.order(83)
+    def test_non_admin_dashboard_owners_union_reports(self):
+        """Dashboards have no owner endpoint in non-admin mode either - they
+        union the owners of every report behind their tiles.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataset_a = Dataset(id="dataset-a", name="Model A", configuredBy="ada@example.com")
+        dataset_b = Dataset(id="dataset-b", name="Model B", configuredBy="grace@example.com")
+        report_a = PowerBIReport(id="report-a", name="Report A", datasetId="dataset-a")
+        report_b = PowerBIReport(id="report-b", name="Report B", datasetId="dataset-b")
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            datasets=[dataset_a, dataset_b],
+            reports=[report_a, report_b],
+        )
+        self.powerbi.state.enter(workspace)
+        dashboard = PowerBIDashboard(
+            id="dashboard-1",
+            displayName="Executive Dashboard",
+            tiles=[
+                Tile(id="tile-1", reportId="report-a"),
+                Tile(id="tile-2", reportId="report-b"),
+            ],
+        )
+
+        def fake_get_reference_by_email(email):
+            name = {"ada@example.com": "Ada", "grace@example.com": "Grace"}[email]
+            return EntityReferenceList(root=[EntityReference(id=uuid.uuid4(), name=name, type="user")])
+
+        with patch.object(
+            self.powerbi.metadata,
+            "get_reference_by_email",
+            side_effect=fake_get_reference_by_email,
+        ):
+            result = self.powerbi.get_owner_ref(dashboard)
+
+        assert result is not None
+        assert {ref.name for ref in result.root} == {"Ada", "Grace"}
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_DASHBOARDS] == 1
+
+    @pytest.mark.order(84)
+    def test_non_admin_app_principal_never_resolved(self):
+        """`App` principals are never owners, regardless of their access right."""
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_APP)],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+
+        with (
+            patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref_email,
+            patch.object(self.powerbi.metadata, "get_reference_by_name") as mock_get_ref_name,
+        ):
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is None
+        mock_get_ref_email.assert_not_called()
+        mock_get_ref_name.assert_not_called()
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
+        assert metrics[PowerbiSource.METRIC_ASSETS_WITHOUT_OWNER] == 1
+
+    @pytest.mark.order(85)
+    def test_non_admin_unresolved_principal_leaves_asset_ownerless_and_counted(self):
+        """`resolve_owner_principal` returning None leaves the asset owner-less
+        and is counted, never treated as an error.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_CONTRIBUTOR)],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email", return_value=None):
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is None
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_UNRESOLVED] == 1
+        assert metrics[PowerbiSource.METRIC_ASSETS_WITHOUT_OWNER] == 1
+
+    @pytest.mark.order(86)
+    def test_non_admin_group_principal_resolved_via_is_owner_team_lookup(self):
+        """A `Group` principal is resolved as a Team by name with `is_owner=True`
+        (rejects a same-named Team of the wrong type - see `get_reference_by_name`).
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_GROUP)],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_name") as mock_get_ref_name:
+            mock_get_ref_name.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Analytics Team", type="team")]
+            )
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is not None
+        assert result.root[0].name == "Analytics Team"
+        mock_get_ref_name.assert_called_once_with(name="Analytics Team", is_owner=True)
+
+    @pytest.mark.order(87)
+    def test_resolve_owner_principal_override_is_honoured(self):
+        """`resolve_owner_principal` is the seam a subclass overrides to
+        provision missing principals; generic ingestion must call it (not
+        create users/teams directly), so an override changes the outcome.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_CONTRIBUTOR)],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+        provisioned_ref = EntityReference(id=uuid.uuid4(), name="Provisioned Ada", type="user")
+
+        with (
+            patch.object(self.powerbi, "resolve_owner_principal", return_value=provisioned_ref) as mock_override,
+            patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref,
+        ):
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is not None
+        assert result.root[0] == provisioned_ref
+        assert mock_override.called
+        # Generic ingestion never calls OpenMetadata directly once the seam is overridden.
+        mock_get_ref.assert_not_called()
+
+    @pytest.mark.order(88)
+    @patch("metadata.ingestion.ometa.ometa_api.OpenMetadata.get_reference_by_email")
+    def test_admin_mode_owner_resolution_is_unaffected(self, get_reference_by_email):
+        """`useAdminApis=True` (the mock config's default) still dispatches to
+        the admin-mode owner path, byte-for-byte the pre-existing behaviour.
+        """
+        assert self.powerbi.service_connection.useAdminApis is True
+        self.powerbi.metadata.get_reference_by_email.side_effect = [
+            MOCK_USER_1_ENITYTY_REF_LIST,
+            MOCK_USER_2_ENITYTY_REF_LIST,
+        ]
+        dashboard = PowerBIDashboard.model_validate(MOCK_DASHBOARD_WITH_OWNERS)
+
+        with patch.object(self.powerbi, "_get_owner_ref_non_admin") as mock_non_admin:
+            result = self.powerbi.get_owner_ref(dashboard)
+
+        assert result is not None
+        assert len(result.root) == 2
+        mock_non_admin.assert_not_called()
