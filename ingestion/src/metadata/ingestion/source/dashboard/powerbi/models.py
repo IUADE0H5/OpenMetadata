@@ -275,6 +275,55 @@ class Dataflow(BaseModel):
     upstreamDataflows: Optional[List[UpstreaDataflow]] = []  # noqa: N815, UP006, UP045
 
 
+class DataflowsResponse(BaseModel):
+    """
+    PowerBI DataflowsResponse Model (non-admin, workspace-scoped)
+    Definition: https://learn.microsoft.com/en-us/rest/api/power-bi/dataflows/get-dataflows
+    """
+
+    odata_context: str = Field(alias="@odata.context")
+    value: List[Dataflow]  # noqa: UP006
+
+
+class UpstreamDataflowsResponse(BaseModel):
+    """
+    PowerBI dataflow upstreamDataflows response (non-admin, per-dataflow)
+    Definition: https://learn.microsoft.com/en-us/rest/api/power-bi/dataflows/get-upstream-dataflows-in-group
+    """
+
+    odata_context: str = Field(alias="@odata.context")
+    value: List[UpstreaDataflow]  # noqa: UP006
+
+
+class DatasetUpstreamDataflowLink(BaseModel):
+    """
+    PowerBI dataset->dataflow link row (non-admin, workspace-wide)
+    API: GET /myorg/groups/{groupId}/datasets/upstreamDataflows
+
+    Unlike the per-dataflow `UpstreaDataflow` shape (`groupId`,
+    `targetDataflowId`), this endpoint is workspace-wide (covers every dataset
+    in the workspace in one call) and its rows use a different shape entirely:
+    `{datasetObjectId, dataflowObjectId, workspaceObjectId}`. `workspaceObjectId`
+    is the dataflow's own workspace, which can differ from the workspace this
+    call was made against - a dataset can link to a dataflow in another
+    workspace.
+    """
+
+    datasetObjectId: Optional[str] = None  # noqa: N815, UP045
+    dataflowObjectId: Optional[str] = None  # noqa: N815, UP045
+    workspaceObjectId: Optional[str] = None  # noqa: N815, UP045
+
+
+class DatasetUpstreamDataflowLinksResponse(BaseModel):
+    """
+    PowerBI DatasetUpstreamDataflowLinksResponse Model
+    Definition: https://learn.microsoft.com/en-us/rest/api/power-bi/datasets/get-dataset-to-dataflows-links-in-group
+    """
+
+    odata_context: str = Field(alias="@odata.context")
+    value: List[DatasetUpstreamDataflowLink]  # noqa: UP006
+
+
 class Datamart(BaseModel):
     """
     PowerBI Datamart Model
@@ -396,10 +445,26 @@ class DatasourceConnectionDetails(BaseModel):
     """
     PowerBI Datasource Connection Details
     Definition: https://learn.microsoft.com/en-us/rest/api/power-bi/reports/get-datasources-in-group#datasourceconnectiondetails
+
+    Datasource rows carry the connector's DSN/connection string in fields this
+    base shape (`server`/`database`) drops - e.g. Extension datasources report
+    `{"extensionDataSourceKind": "AmazonAthena", "extensionDataSourcePath": "<dsn>"}`
+    and ODBC ones report `{"connectionString": "dsn=<dsn>"}`.
     """
 
     server: Optional[str] = None  # noqa: UP045
     database: Optional[str] = None  # noqa: UP045
+    account: Optional[str] = None  # noqa: UP045
+    classInfo: Optional[str] = None  # noqa: N815, UP045
+    domain: Optional[str] = None  # noqa: UP045
+    emailAddress: Optional[str] = None  # noqa: N815, UP045
+    kind: Optional[str] = None  # noqa: UP045
+    loginServer: Optional[str] = None  # noqa: N815, UP045
+    path: Optional[str] = None  # noqa: UP045
+    url: Optional[str] = None  # noqa: UP045
+    connectionString: Optional[str] = None  # noqa: N815, UP045
+    extensionDataSourceKind: Optional[str] = None  # noqa: N815, UP045
+    extensionDataSourcePath: Optional[str] = None  # noqa: N815, UP045
 
 
 class Datasource(BaseModel):
