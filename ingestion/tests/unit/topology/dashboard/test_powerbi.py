@@ -19,7 +19,10 @@ from metadata.generated.schema.type.filterPattern import FilterPattern
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.models.barrier import Barrier
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
-from metadata.ingestion.source.dashboard.powerbi.constants import is_write_dataset_right
+from metadata.ingestion.source.dashboard.powerbi.constants import (
+    POWERBI_WRITE_WORKSPACE_ROLES,
+    is_write_dataset_right,
+)
 from metadata.ingestion.source.dashboard.powerbi.metadata import PowerbiSource
 from metadata.ingestion.source.dashboard.powerbi.models import (
     Dataflow,
@@ -4069,3 +4072,219 @@ class PowerBIUnitTest(TestCase):
 
         assert result_b is None
         mock_get_ref.assert_not_called()
+
+    # -- Owner judged by best row across sources, not first-seen row --------
+
+    @staticmethod
+    def _dataset_is_write_right(right):
+        return right in POWERBI_WRITE_WORKSPACE_ROLES or is_write_dataset_right(right)
+
+    @pytest.mark.order(99)
+    def test_dataset_acl_write_row_wins_over_workspace_viewer_row(self):
+        """A principal seen first as a workspace Viewer, but who also holds a
+        write-level dataset-ACL right (an ordinary setup: a workspace Viewer
+        with `ReadWriteReshareExplore` on one dataset), must be resolved as
+        an owner - judged by its best row across every source, not by
+        whichever row the dedup happened to see first. Must fail before the
+        group-then-judge fix (the Viewer row alone used to win and discard
+        the later write-level row).
+        """
+        self.powerbi._metrics.clear()
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+        viewer_row = PowerBIPrincipal.from_workspace_user(
+            PowerBIWorkspaceUser(
+                identifier="ada@example.com",
+                principalType="User",
+                displayName="Ada",
+                emailAddress="ada@example.com",
+                groupUserAccessRight="Viewer",
+            )
+        )
+        write_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="ada@example.com",
+                principalType="User",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            owner_refs = self.powerbi._resolve_write_principals([viewer_row, write_row], self._dataset_is_write_right)
+
+        assert len(owner_refs) == 1
+        assert owner_refs[0].name == "Ada"
+        mock_get_ref.assert_called_once_with("ada@example.com")
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0
+
+    @pytest.mark.order(100)
+    def test_workspace_write_role_wins_even_with_read_only_dataset_row(self):
+        """The reverse of the above: a workspace Member (write-capable at the
+        workspace level) who only has read-only `Read` on this particular
+        dataset is still an owner - the workspace row's write right is
+        enough on its own, the dataset row does not need to agree.
+        """
+        self.powerbi._metrics.clear()
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+        member_row = PowerBIPrincipal.from_workspace_user(
+            PowerBIWorkspaceUser(
+                identifier="ada@example.com",
+                principalType="User",
+                displayName="Ada",
+                emailAddress="ada@example.com",
+                groupUserAccessRight="Member",
+            )
+        )
+        read_only_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="ada@example.com",
+                principalType="User",
+                datasetUserAccessRight="Read",
+            )
+        )
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            owner_refs = self.powerbi._resolve_write_principals(
+                [member_row, read_only_row], self._dataset_is_write_right
+            )
+
+        assert len(owner_refs) == 1
+        assert owner_refs[0].name == "Ada"
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0
+
+    @pytest.mark.order(101)
+    def test_app_skipped_regardless_of_which_source_holds_the_write_right(self):
+        """An `App` principal holding a write-level right - whether on the
+        workspace-role row or the dataset-ACL row - is still skipped as App,
+        never resolved: apps are excluded by principal type, not by right.
+        """
+        self.powerbi._metrics.clear()
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+        workspace_admin_row = PowerBIPrincipal.from_workspace_user(
+            PowerBIWorkspaceUser(
+                identifier="app-object-id",
+                principalType="App",
+                displayName="Some App",
+                groupUserAccessRight="Admin",
+            )
+        )
+        dataset_write_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="app-object-id",
+                principalType="App",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+
+        with (
+            patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref_email,
+            patch.object(self.powerbi.metadata, "get_reference_by_name") as mock_get_ref_name,
+        ):
+            owner_refs = self.powerbi._resolve_write_principals(
+                [workspace_admin_row, dataset_write_row], self._dataset_is_write_right
+            )
+
+        assert owner_refs == []
+        mock_get_ref_email.assert_not_called()
+        mock_get_ref_name.assert_not_called()
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0
+
+    @pytest.mark.order(102)
+    def test_same_upn_different_case_counts_as_one_principal(self):
+        """A Power BI UPN is case-insensitive; two rows for the same person
+        returned with different casing by the two endpoints must count as
+        one principal, not two, and must not let a lower-privilege row in
+        one case discard a write-level row in another.
+        """
+        self.powerbi._metrics.clear()
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+        lowercase_viewer_row = PowerBIPrincipal.from_workspace_user(
+            PowerBIWorkspaceUser(
+                identifier="ada@example.com",
+                principalType="User",
+                displayName="Ada",
+                emailAddress="ada@example.com",
+                groupUserAccessRight="Viewer",
+            )
+        )
+        uppercase_write_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="ADA@EXAMPLE.COM",
+                principalType="User",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            owner_refs = self.powerbi._resolve_write_principals(
+                [lowercase_viewer_row, uppercase_write_row], self._dataset_is_write_right
+            )
+
+        assert len(owner_refs) == 1
+        # Exactly one resolution call, not two - proof the two differently-cased
+        # rows were treated as a single principal.
+        assert mock_get_ref.call_count == 1
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0
+
+    @pytest.mark.order(103)
+    def test_owner_resolution_is_independent_of_row_order(self):
+        """The same two rows (a Viewer row and a write-level row for the same
+        principal, plus an unrelated App row), in reversed order, must
+        produce the same owner set and the same counters - the fix must not
+        merely happen to work for one ordering.
+        """
+        viewer_row = PowerBIPrincipal.from_workspace_user(
+            PowerBIWorkspaceUser(
+                identifier="ada@example.com",
+                principalType="User",
+                displayName="Ada",
+                emailAddress="ada@example.com",
+                groupUserAccessRight="Viewer",
+            )
+        )
+        write_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="ada@example.com",
+                principalType="User",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+        app_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="app-object-id",
+                principalType="App",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+
+        def _run(rows):
+            self.powerbi._metrics.clear()
+            self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+            with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+                mock_get_ref.return_value = EntityReferenceList(
+                    root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+                )
+                owner_refs = self.powerbi._resolve_write_principals(rows, self._dataset_is_write_right)
+            return {ref.name for ref in owner_refs}, dict(self.powerbi.metric_values())
+
+        forward_owners, forward_metrics = _run([viewer_row, write_row, app_row])
+        reversed_owners, reversed_metrics = _run([app_row, write_row, viewer_row])
+
+        assert forward_owners == reversed_owners == {"Ada"}
+        assert forward_metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
+        assert reversed_metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
+        assert forward_metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0
+        assert reversed_metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0

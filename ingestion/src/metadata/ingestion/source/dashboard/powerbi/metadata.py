@@ -2754,28 +2754,40 @@ class PowerbiSource(DashboardServiceSource):
         to provision missing users/teams). Viewer-level and unresolved
         principals are counted, never treated as owners; `App` principals are
         never resolved at all - a Power BI app is not a person or a team.
-        De-duplicates by (principal_type, identifier) so a principal reached
-        from two sources (e.g. a workspace member who is also on a dataset's
-        ACL) is only resolved once.
 
-        `is_write_right` decides write-capability from `principal.access_right`
-        (a workspace role or a dataset right, depending on where the principal
-        came from) - a predicate, not a fixed set, because a dataset right is
-        not exact-matched (see `is_write_dataset_right`'s docstring).
+        Groups every row by `(principal_type, identifier)` first - the
+        identifier lower-cased, since a Power BI UPN is case-insensitive and
+        the two source endpoints are not guaranteed to agree on case (not
+        observed to actually differ live; defensive) - and only then decides
+        write-capability, across every row in the group. A principal reached
+        from two sources (e.g. a workspace member who also has a row on a
+        dataset's ACL) can hold a low-privilege row from one and a
+        write-level row from the other (a workspace Viewer with
+        `ReadWriteReshareExplore` on the dataset is an ordinary setup); it
+        must be judged an owner by its best row, not by whichever row the
+        dedup happened to see first - grouping before judging makes the
+        outcome independent of input order.
+
+        `is_write_right` decides write-capability from a row's own
+        `access_right` (a workspace role or a dataset right, depending on
+        where that row came from) - a predicate, not a fixed set, because a
+        dataset right is not exact-matched (see `is_write_dataset_right`'s
+        docstring).
         """
-        owner_refs: List[EntityReference] = []  # noqa: UP006
-        seen: set = set()
+        groups: dict[tuple[str, str], List[PowerBIPrincipal]] = {}  # noqa: UP006
         for principal in principals:
-            key = (principal.principal_type, principal.identifier)
-            if key in seen:
-                continue
-            seen.add(key)
-            if principal.principal_type == POWERBI_APP_PRINCIPAL_TYPE:
+            key = (principal.principal_type, principal.identifier.lower())
+            groups.setdefault(key, []).append(principal)
+
+        owner_refs: List[EntityReference] = []  # noqa: UP006
+        for (principal_type, _), rows in groups.items():
+            if principal_type == POWERBI_APP_PRINCIPAL_TYPE:
                 self._metrics[self.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] += 1
                 continue
-            if not is_write_right(principal.access_right):
+            if not any(is_write_right(row.access_right) for row in rows):
                 self._metrics[self.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] += 1
                 continue
+            principal = self._merge_principal_rows(rows)
             try:
                 owner_ref = self.resolve_owner_principal(principal)
             except Exception as err:
@@ -2786,6 +2798,25 @@ class PowerbiSource(DashboardServiceSource):
                 continue
             owner_refs.append(owner_ref)
         return owner_refs
+
+    @staticmethod
+    def _merge_principal_rows(rows: List[PowerBIPrincipal]) -> PowerBIPrincipal:  # noqa: UP006
+        """One principal can surface as more than one row - a workspace-member
+        row and a dataset-ACL row for the same `(principal_type, identifier)`
+        - and the two endpoints don't carry the same fields (the dataset-ACL
+        endpoint has no email or display name at all for a `Group`; see
+        `PowerBIPrincipal.from_dataset_user`). Merge every row's identifying
+        info before resolving, so resolution has whatever any row provides,
+        not just whichever row happened to be the write-capable one.
+        """
+        base = rows[0]
+        return PowerBIPrincipal(
+            principal_type=base.principal_type,
+            identifier=base.identifier,
+            email=next((row.email for row in rows if row.email), None),
+            display_name=next((row.display_name for row in rows if row.display_name), None),
+            access_right=base.access_right,
+        )
 
     def _collect_non_admin_owners(
         self,
