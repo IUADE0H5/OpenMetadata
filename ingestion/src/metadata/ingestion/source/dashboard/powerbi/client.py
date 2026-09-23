@@ -39,14 +39,17 @@ from metadata.ingestion.source.dashboard.powerbi.models import (
     DatasetResponse,
     DatasetUpstreamDataflowLink,
     DatasetUpstreamDataflowLinksResponse,
+    DatasetUsersResponse,
     Datasource,
     DatasourcesResponse,
     Group,
     GroupsResponse,
     PowerBIDashboard,
+    PowerBIDatasetUser,
     PowerBIReport,
     PowerBiTable,
     PowerBiToken,
+    PowerBIWorkspaceUser,
     ReportPagesAPIResponse,
     ReportsResponse,
     TablesResponse,
@@ -56,6 +59,7 @@ from metadata.ingestion.source.dashboard.powerbi.models import (
     UpstreamDataflowsResponse,
     Workspaces,
     WorkSpaceScanResponse,
+    WorkspaceUsersResponse,
 )
 from metadata.utils.filters import validate_regex
 from metadata.utils.helpers import clean_uri
@@ -387,6 +391,50 @@ class PowerBiApiClient:
         except Exception as exc:  # pylint: disable=broad-except
             logger.debug(traceback.format_exc())
             logger.warning(f"Error fetching dataset-to-dataflow links: {exc}")
+
+        return None
+
+    def fetch_group_users(self, group_id: str) -> Optional[List[PowerBIWorkspaceUser]]:  # noqa: UP006, UP045
+        """Method to fetch a workspace's members (non-admin)
+        API: https://learn.microsoft.com/en-us/rest/api/power-bi/groups/get-group-users
+        Returns:
+            List[PowerBIWorkspaceUser]
+        """
+        try:
+            path = f"/myorg/groups/{group_id}/users"
+            logger.debug(
+                f"Calling the API({str(self.client._base_url)}{path})"  # pylint: disable=protected-access  # noqa: RUF010
+                " to get workspace users"
+            )
+            response_data = self.client.get(path)
+            if response_data:
+                response = WorkspaceUsersResponse.model_validate(response_data)
+                return response.value
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug(traceback.format_exc())
+            logger.warning(f"Error fetching workspace users for group {group_id}: {exc}")
+
+        return None
+
+    def fetch_dataset_users(self, group_id: str, dataset_id: str) -> Optional[List[PowerBIDatasetUser]]:  # noqa: UP006, UP045
+        """Method to fetch a dataset's ACL (non-admin)
+        API: https://learn.microsoft.com/en-us/rest/api/power-bi/datasets/get-dataset-users-in-group
+        Returns:
+            List[PowerBIDatasetUser]
+        """
+        try:
+            path = f"/myorg/groups/{group_id}/datasets/{dataset_id}/users"
+            logger.debug(
+                f"Calling the API({str(self.client._base_url)}{path})"  # pylint: disable=protected-access  # noqa: RUF010
+                " to get dataset users"
+            )
+            response_data = self.client.get(path)
+            if response_data:
+                response = DatasetUsersResponse.model_validate(response_data)
+                return response.value
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug(traceback.format_exc())
+            logger.warning(f"Error fetching dataset users for dataset {dataset_id}: {exc}")
 
         return None
 

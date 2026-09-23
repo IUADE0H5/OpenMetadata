@@ -18,6 +18,10 @@ from typing import List, Optional, Union  # noqa: UP035
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing_extensions import Annotated  # noqa: UP035
 
+from metadata.ingestion.source.dashboard.powerbi.constants import (
+    POWERBI_USER_PRINCIPAL_TYPE,
+)
+
 
 class Tile(BaseModel):
     """
@@ -46,6 +50,100 @@ class PowerBIUser(BaseModel):
     dataflowUserAccessRight: Optional[str] = None  # noqa: N815, UP045
     dashboardUserAccessRight: Optional[str] = None  # noqa: N815, UP045
     datamartUserAccessRight: Optional[str] = None  # noqa: N815, UP045
+
+
+class PowerBIWorkspaceUser(BaseModel):
+    """
+    PowerBI non-admin workspace membership row.
+    API: GET /myorg/groups/{groupId}/users
+    Definition: https://learn.microsoft.com/en-us/rest/api/power-bi/groups/get-group-users
+    """
+
+    identifier: Optional[str] = None  # noqa: UP045
+    principalType: Optional[str] = None  # noqa: N815, UP045
+    displayName: Optional[str] = None  # noqa: N815, UP045
+    emailAddress: Optional[str] = None  # noqa: N815, UP045
+    groupUserAccessRight: Optional[str] = None  # noqa: N815, UP045
+
+
+class WorkspaceUsersResponse(BaseModel):
+    """
+    Response envelope for GET /myorg/groups/{groupId}/users
+    """
+
+    odata_context: Optional[str] = Field(alias="@odata.context", default=None)  # noqa: UP045
+    value: List[PowerBIWorkspaceUser]  # noqa: UP006
+
+
+class PowerBIDatasetUser(BaseModel):
+    """
+    PowerBI non-admin dataset ACL row. May include principals who are not
+    workspace members (e.g. a user shared the dataset with directly).
+    API: GET /myorg/groups/{groupId}/datasets/{datasetId}/users
+    Definition: https://learn.microsoft.com/en-us/rest/api/power-bi/datasets/get-dataset-users-in-group
+    """
+
+    identifier: Optional[str] = None  # noqa: UP045
+    principalType: Optional[str] = None  # noqa: N815, UP045
+    datasetUserAccessRight: Optional[str] = None  # noqa: N815, UP045
+
+
+class DatasetUsersResponse(BaseModel):
+    """
+    Response envelope for GET /myorg/groups/{groupId}/datasets/{datasetId}/users
+    """
+
+    odata_context: Optional[str] = Field(alias="@odata.context", default=None)  # noqa: UP045
+    value: List[PowerBIDatasetUser]  # noqa: UP006
+
+
+class PowerBIPrincipal(BaseModel):
+    """
+    A Power BI principal (user, security group or app), normalized from
+    either non-admin endpoint that carries one (`PowerBIWorkspaceUser` or
+    `PowerBIDatasetUser`). `access_right` carries that endpoint's own right
+    string verbatim (a workspace role or a dataset access right) -
+    unfiltered; filtering against a write-rights set happens where the
+    principal is turned into an owner, not here.
+    """
+
+    principal_type: str
+    identifier: str
+    email: Optional[str] = None  # noqa: UP045
+    display_name: Optional[str] = None  # noqa: UP045
+    access_right: Optional[str] = None  # noqa: UP045
+
+    @classmethod
+    def from_workspace_user(cls, user: PowerBIWorkspaceUser) -> Optional["PowerBIPrincipal"]:
+        """Normalize one row of GET /myorg/groups/{groupId}/users."""
+        if not user.identifier or not user.principalType:
+            return None
+        return cls(
+            principal_type=user.principalType,
+            identifier=user.identifier,
+            email=user.emailAddress,
+            display_name=user.displayName,
+            access_right=user.groupUserAccessRight,
+        )
+
+    @classmethod
+    def from_dataset_user(cls, user: PowerBIDatasetUser) -> Optional["PowerBIPrincipal"]:
+        """Normalize one row of GET /myorg/groups/{groupId}/datasets/{datasetId}/users.
+
+        This endpoint carries no email or display name, only `identifier` and
+        the access right. For a `User` principal, `identifier` is documented
+        as the UPN, which doubles as the email address for lookup purposes;
+        for `Group`/`App` principals it is an object id and is not usable as
+        an email.
+        """
+        if not user.identifier or not user.principalType:
+            return None
+        return cls(
+            principal_type=user.principalType,
+            identifier=user.identifier,
+            email=(user.identifier if user.principalType == POWERBI_USER_PRINCIPAL_TYPE else None),
+            access_right=user.datasetUserAccessRight,
+        )
 
 
 class PowerBIDashboard(BaseModel):
@@ -254,6 +352,10 @@ class Dataset(BaseModel):
     configuredBy: Optional[str] = None  # noqa: N815, UP045
     upstreamDataflows: Optional[List[UpstreaDataflow]] = []  # noqa: N815, UP006, UP045
     upstreamDatasets: Optional[List[UpstreaDataset]] = []  # noqa: N815, UP006, UP045
+    # Non-admin only: this dataset's ACL, fetched separately via
+    # `fetch_dataset_users` and attached during `get_org_workspace_data`
+    # (never populated by the admin scan, which uses `users` instead).
+    dataset_principals: Optional[List[PowerBIPrincipal]] = []  # noqa: UP006, UP045
 
 
 class DatasetResponse(BaseModel):
@@ -272,6 +374,10 @@ class Dataflow(BaseModel):
     description: Optional[str] = None  # noqa: UP045
     users: Optional[List[PowerBIUser]] = []  # noqa: UP006, UP045
     modifiedBy: Optional[str] = None  # noqa: N815, UP045
+    # Non-admin dataflows expose `configuredBy`, not `modifiedBy` (that field
+    # is admin-scan-only and always absent here) - see `configuredBy` on
+    # `Dataset` for the equivalent non-admin field on datasets.
+    configuredBy: Optional[str] = None  # noqa: N815, UP045
     upstreamDataflows: Optional[List[UpstreaDataflow]] = []  # noqa: N815, UP006, UP045
 
 
@@ -354,6 +460,10 @@ class Group(BaseModel):
     datasets: Optional[List[Dataset]] = []  # noqa: UP006, UP045
     dataflows: Optional[List[Dataflow]] = []  # noqa: UP006, UP045
     datamarts: Optional[List[Datamart]] = []  # noqa: UP006, UP045
+    # Non-admin only: this workspace's membership, fetched separately via
+    # `fetch_group_users` and attached during `get_org_workspace_data` (the
+    # admin scan never populates this - it uses each entity's own `users`).
+    workspace_principals: Optional[List[PowerBIPrincipal]] = []  # noqa: UP006, UP045
 
 
 class GroupsResponse(BaseModel):

@@ -55,6 +55,7 @@ from metadata.generated.schema.type.basic import (
     SourceUrl,
 )
 from metadata.generated.schema.type.entityLineage import ColumnLineage
+from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.generated.schema.type.entityReferenceList import EntityReferenceList
 from metadata.generated.schema.type.filterPattern import FilterPattern
 from metadata.ingestion.api.models import Either
@@ -77,6 +78,11 @@ from metadata.ingestion.source.dashboard.powerbi.constants import (
     ODBC_DATASOURCE_EXPRESSION_KW,
     ODBC_QUERY_EXPRESSION_KW,
     OWNER_ACCESS_RIGHTS_KEYWORDS,
+    POWERBI_APP_PRINCIPAL_TYPE,
+    POWERBI_GROUP_PRINCIPAL_TYPE,
+    POWERBI_USER_PRINCIPAL_TYPE,
+    POWERBI_WRITE_DATASET_RIGHTS,
+    POWERBI_WRITE_WORKSPACE_ROLES,
     RDL_REPORT_FORMAT,
     RDL_REPORTS_PREFIX,
     SNOWFLAKE_QUERY_EXPRESSION_KW,
@@ -94,6 +100,7 @@ from metadata.ingestion.source.dashboard.powerbi.models import (
     Group,
     PowerBIDashboard,
     PowerBiMeasureModel,
+    PowerBIPrincipal,
     PowerBIReport,
     PowerBiTable,
     ReportPage,
@@ -163,6 +170,23 @@ class PowerbiSource(DashboardServiceSource):
     # workspaces this run processed (outside projectFilterPattern, or not
     # visible to the caller); never resolved, logged once per foreign workspace.
     METRIC_UPSTREAM_LINKS_OUTSIDE_SCOPE = "upstream_links_outside_scope"
+
+    # Non-admin owner resolution (`_get_owner_ref_non_admin`) only - the admin
+    # scan's owner path (`_get_owner_ref_admin`) isn't metered, it always had
+    # the entity's `users` inline.
+    METRIC_OWNERS_ASSIGNED_DATAMODELS = "owners_assigned_datamodels"
+    METRIC_OWNERS_ASSIGNED_DATAFLOWS = "owners_assigned_dataflows"
+    METRIC_OWNERS_ASSIGNED_REPORTS = "owners_assigned_reports"
+    METRIC_OWNERS_ASSIGNED_DASHBOARDS = "owners_assigned_dashboards"
+    # Per-principal-evaluation counters: how many times a principal was seen
+    # while resolving one asset's owners, not how many distinct principals
+    # exist - the same tenant-wide Viewer is counted once per asset it is
+    # evaluated against (a dataset and its dataflow in the same workspace
+    # each count it separately).
+    METRIC_OWNER_PRINCIPALS_SKIPPED_APP = "owner_principals_skipped_app"
+    METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER = "owner_principals_skipped_viewer"
+    METRIC_OWNER_PRINCIPALS_UNRESOLVED = "owner_principals_unresolved"
+    METRIC_ASSETS_WITHOUT_OWNER = "assets_without_owner"
 
     # Bounded per CLAUDE.md's cache rule: this de-dupes (data model, table
     # reference) pairs for one connector run. A tenant's total distinct
@@ -278,6 +302,33 @@ class PowerbiSource(DashboardServiceSource):
                             self.client.api_client.fetch_dataset_tables(group_id=workspace.id, dataset_id=dataset.id)
                             or []
                         )
+                        # add this dataset's ACL, for non-admin owner resolution
+                        # (see `_compute_datamodel_owner_refs`) - this endpoint
+                        # may list principals who aren't workspace members.
+                        dataset.dataset_principals = [
+                            principal
+                            for principal in (
+                                PowerBIPrincipal.from_dataset_user(user)
+                                for user in self.client.api_client.fetch_dataset_users(
+                                    group_id=workspace.id, dataset_id=dataset.id
+                                )
+                                or []
+                            )
+                            if principal
+                        ]
+
+                    # add this workspace's membership, for non-admin owner
+                    # resolution (see `_compute_dataflow_owner_refs` and
+                    # `_compute_datamodel_owner_refs`) - non-admin entities
+                    # never carry `users` inline the way the admin scan does.
+                    workspace.workspace_principals = [
+                        principal
+                        for principal in (
+                            PowerBIPrincipal.from_workspace_user(user)
+                            for user in self.client.api_client.fetch_group_users(group_id=workspace.id) or []
+                        )
+                        if principal
+                    ]
 
                     # add the dataflows to the workspace, and each dataflow's own
                     # upstream dataflows (non-admin has no bulk equivalent of the
@@ -2535,9 +2586,7 @@ class PowerbiSource(DashboardServiceSource):
             logger.warning(f"Error fetching project name for {dashboard_details.id}: {exc}")
         return None
 
-    def get_owner_ref(  # pylint: disable=unused-argument, useless-return  # noqa: C901
-        self, dashboard_details: Any
-    ) -> Optional[EntityReferenceList]:  # noqa: UP045
+    def get_owner_ref(self, dashboard_details: Any) -> Optional[EntityReferenceList]:  # noqa: UP045
         """
         Method to process the dashboard owners
         """
@@ -2545,74 +2594,281 @@ class PowerbiSource(DashboardServiceSource):
             if not self.source_config.includeOwners:
                 logger.debug(f"Skipping owner processing for {dashboard_details.id} as includeOwners is False")
                 return None
-            owner_ref_list = []  # to assign multiple owners to entity if they exist
-            for owner in dashboard_details.users or []:
-                owner_ref = None
-                # put filtering conditions
-                if isinstance(dashboard_details, Dataset):
-                    access_right = owner.datasetUserAccessRight
-                elif isinstance(dashboard_details, Dataflow):
-                    access_right = owner.dataflowUserAccessRight
-                elif isinstance(dashboard_details, Datamart):
-                    access_right = owner.datamartUserAccessRight
-                elif isinstance(dashboard_details, PowerBIReport):
-                    access_right = owner.reportUserAccessRight
-                elif isinstance(dashboard_details, PowerBIDashboard):
-                    access_right = owner.dashboardUserAccessRight
-
-                if owner.userType != "Member":
-                    logger.debug(
-                        f"User is not a member of {dashboard_details.id}: ({owner.displayName}, {owner.email})"
-                    )
-                    continue
-                if access_right and any(keyword in access_right.lower() for keyword in OWNER_ACCESS_RIGHTS_KEYWORDS):
-                    if owner.email:
-                        try:
-                            owner_email = EmailStr._validate(owner.email)
-                        except PydanticCustomError:
-                            logger.debug(f"Invalid email for owner: {owner.email}")
-                            owner_email = None
-                        if owner_email:
-                            try:
-                                owner_ref = self.metadata.get_reference_by_email(owner_email.lower())
-                            except Exception as err:
-                                logger.debug(
-                                    f"Could not process owner data with email"
-                                    f" {owner.email} in {dashboard_details.id}: {err}"
-                                )
-                    elif owner.displayName:
-                        try:
-                            owner_ref = self.metadata.get_reference_by_name(name=owner.displayName)
-                        except Exception as err:
-                            logger.debug(
-                                f"Could not process owner data with name"
-                                f" {owner.displayName} in {dashboard_details.id}: {err}"
-                            )
-                    if owner_ref:
-                        owner_ref_list.append(owner_ref.root[0])
-                else:
-                    logger.debug(
-                        f"User does not have owner, admin or write access to"
-                        f" {dashboard_details.id}: ({owner.displayName}, {owner.email})"
-                    )
-            # check for last modified, configuredBy user
-            current_active_user = None
-            if isinstance(dashboard_details, Dataset):
-                current_active_user = dashboard_details.configuredBy
-            elif isinstance(dashboard_details, (Dataflow, PowerBIReport, Datamart)):
-                current_active_user = dashboard_details.modifiedBy
-            if current_active_user:
-                try:
-                    owner_ref = self.metadata.get_reference_by_email(current_active_user.lower())
-                    if owner_ref and owner_ref.root[0] not in owner_ref_list:
-                        owner_ref_list.append(owner_ref.root[0])
-                except Exception as err:
-                    logger.debug(f"Could not fetch current active user due to {err}")
-            if len(owner_ref_list) > 0:
-                logger.debug(f"Successfully fetched owners data for {dashboard_details.id}")
-                return EntityReferenceList(root=owner_ref_list)
-            return None  # noqa: TRY300
+            if self.service_connection.useAdminApis:
+                return self._get_owner_ref_admin(dashboard_details)
+            return self._get_owner_ref_non_admin(dashboard_details)
         except Exception as err:
             logger.debug(traceback.format_exc())
             logger.warning(f"Could not fetch owner data due to {err}")
+        return None
+
+    def _get_owner_ref_admin(  # pylint: disable=unused-argument, useless-return  # noqa: C901
+        self, dashboard_details: Any
+    ) -> Optional[EntityReferenceList]:  # noqa: UP045
+        """
+        Admin-mode owner resolution: reads the per-entity `users` array that the
+        admin workspace scan embeds inline (`getArtifactUsers`). Non-admin GET
+        endpoints never populate that array - see `_get_owner_ref_non_admin`.
+        """
+        owner_ref_list = []  # to assign multiple owners to entity if they exist
+        for owner in dashboard_details.users or []:
+            owner_ref = None
+            # put filtering conditions
+            access_right: Optional[str] = None  # noqa: UP045
+            if isinstance(dashboard_details, Dataset):
+                access_right = owner.datasetUserAccessRight
+            elif isinstance(dashboard_details, Dataflow):
+                access_right = owner.dataflowUserAccessRight
+            elif isinstance(dashboard_details, Datamart):
+                access_right = owner.datamartUserAccessRight
+            elif isinstance(dashboard_details, PowerBIReport):
+                access_right = owner.reportUserAccessRight
+            elif isinstance(dashboard_details, PowerBIDashboard):
+                access_right = owner.dashboardUserAccessRight
+
+            if owner.userType != "Member":
+                logger.debug(f"User is not a member of {dashboard_details.id}: ({owner.displayName}, {owner.email})")
+                continue
+            if access_right and any(keyword in access_right.lower() for keyword in OWNER_ACCESS_RIGHTS_KEYWORDS):
+                if owner.email:
+                    try:
+                        owner_email = EmailStr._validate(owner.email)  # pyright: ignore[reportAttributeAccessIssue]
+                    except PydanticCustomError:
+                        logger.debug(f"Invalid email for owner: {owner.email}")
+                        owner_email = None
+                    if owner_email:
+                        try:
+                            owner_ref = self.metadata.get_reference_by_email(owner_email.lower())
+                        except Exception as err:
+                            logger.debug(
+                                f"Could not process owner data with email"
+                                f" {owner.email} in {dashboard_details.id}: {err}"
+                            )
+                elif owner.displayName:
+                    try:
+                        owner_ref = self.metadata.get_reference_by_name(name=owner.displayName)
+                    except Exception as err:
+                        logger.debug(
+                            f"Could not process owner data with name"
+                            f" {owner.displayName} in {dashboard_details.id}: {err}"
+                        )
+                if owner_ref:
+                    owner_ref_list.append(owner_ref.root[0])
+            else:
+                logger.debug(
+                    f"User does not have owner, admin or write access to"
+                    f" {dashboard_details.id}: ({owner.displayName}, {owner.email})"
+                )
+        # check for last modified, configuredBy user
+        current_active_user = None
+        if isinstance(dashboard_details, Dataset):
+            current_active_user = dashboard_details.configuredBy
+        elif isinstance(dashboard_details, (Dataflow, PowerBIReport, Datamart)):
+            current_active_user = dashboard_details.modifiedBy
+        if current_active_user:
+            try:
+                owner_ref = self.metadata.get_reference_by_email(current_active_user.lower())
+                if owner_ref and owner_ref.root[0] not in owner_ref_list:
+                    owner_ref_list.append(owner_ref.root[0])
+            except Exception as err:
+                logger.debug(f"Could not fetch current active user due to {err}")
+        if len(owner_ref_list) > 0:
+            logger.debug(f"Successfully fetched owners data for {dashboard_details.id}")
+            return EntityReferenceList(root=owner_ref_list)
+        return None
+
+    def resolve_owner_principal(self, principal: PowerBIPrincipal) -> Optional[EntityReference]:  # noqa: UP045
+        """Resolve one Power BI principal to an OpenMetadata owner reference.
+
+        Looks the principal up in OpenMetadata and returns None when it does
+        not exist. Subclasses may override to provision missing principals -
+        this default implementation never creates a user or team, so generic
+        ingestion never writes one as a side effect of owner resolution.
+        """
+        if principal.principal_type == POWERBI_APP_PRINCIPAL_TYPE:
+            return None
+        try:
+            if principal.email:
+                owner_ref_list = self.metadata.get_reference_by_email(principal.email.lower())
+            elif principal.display_name:
+                # `is_owner=True` rejects a Team match whose type isn't Group -
+                # `get_reference_by_name` can otherwise return the wrong kind
+                # of Team for a Power BI security group.
+                owner_ref_list = self.metadata.get_reference_by_name(
+                    name=principal.display_name,
+                    is_owner=(principal.principal_type == POWERBI_GROUP_PRINCIPAL_TYPE),
+                )
+            else:
+                return None
+        except Exception as err:
+            logger.debug(f"Could not resolve owner principal {principal.identifier}: {err}")
+            return None
+        if owner_ref_list and owner_ref_list.root:
+            return owner_ref_list.root[0]
+        return None
+
+    def _resolve_write_principals(
+        self,
+        principals: Iterable[PowerBIPrincipal],
+        write_rights: frozenset,
+    ) -> List[EntityReference]:  # noqa: UP006
+        """Resolve every distinct write-capable principal in `principals` to an
+        owner reference via `resolve_owner_principal` (the seam subclasses use
+        to provision missing users/teams). Viewer-level and unresolved
+        principals are counted, never treated as owners; `App` principals are
+        never resolved at all - a Power BI app is not a person or a team.
+        De-duplicates by (principal_type, identifier) so a principal reached
+        from two sources (e.g. a workspace member who is also on a dataset's
+        ACL) is only resolved once.
+        """
+        owner_refs: List[EntityReference] = []  # noqa: UP006
+        seen: set = set()
+        for principal in principals:
+            key = (principal.principal_type, principal.identifier)
+            if key in seen:
+                continue
+            seen.add(key)
+            if principal.principal_type == POWERBI_APP_PRINCIPAL_TYPE:
+                self._metrics[self.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] += 1
+                continue
+            if not principal.access_right or principal.access_right not in write_rights:
+                self._metrics[self.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] += 1
+                continue
+            try:
+                owner_ref = self.resolve_owner_principal(principal)
+            except Exception as err:
+                logger.debug(f"Could not resolve owner principal {principal.identifier}: {err}")
+                owner_ref = None
+            if owner_ref is None:
+                self._metrics[self.METRIC_OWNER_PRINCIPALS_UNRESOLVED] += 1
+                continue
+            owner_refs.append(owner_ref)
+        return owner_refs
+
+    def _collect_non_admin_owners(
+        self,
+        configured_by: Optional[str],  # noqa: UP045
+        principals: List[PowerBIPrincipal],  # noqa: UP006
+        write_rights: frozenset,
+    ) -> List[EntityReference]:  # noqa: UP006
+        """`configured_by` (the non-admin equivalent of admin mode's
+        `modifiedBy`) plus every write-capable principal, resolved to distinct
+        owner references. Both paths go through `resolve_owner_principal` so a
+        subclass override (e.g. provisioning missing users) applies uniformly.
+        """
+        owner_refs: List[EntityReference] = []  # noqa: UP006
+        seen_ids: set = set()
+
+        def _add(ref: Optional[EntityReference]) -> None:  # noqa: UP045
+            if ref is None:
+                return
+            # `ref.id` is a `Uuid` RootModel, not hashable on its own - key on
+            # its string form instead (see `model_str()`'s docstring).
+            ref_id = model_str(ref.id)
+            if ref_id not in seen_ids:
+                seen_ids.add(ref_id)
+                owner_refs.append(ref)
+
+        if configured_by:
+            try:
+                _add(
+                    self.resolve_owner_principal(
+                        PowerBIPrincipal(
+                            principal_type=POWERBI_USER_PRINCIPAL_TYPE,
+                            identifier=configured_by,
+                            email=configured_by,
+                        )
+                    )
+                )
+            except Exception as err:
+                logger.debug(f"Could not resolve configuredBy owner {configured_by}: {err}")
+
+        for owner_ref in self._resolve_write_principals(principals, write_rights):
+            _add(owner_ref)
+        return owner_refs
+
+    def _compute_dataflow_owner_refs(self, dataflow: Dataflow) -> List[EntityReference]:  # noqa: UP006
+        """Dataflow owners = `configuredBy` + workspace members with a write-capable role."""
+        return self._collect_non_admin_owners(
+            configured_by=dataflow.configuredBy,
+            principals=self.state.workspace_principals,
+            write_rights=POWERBI_WRITE_WORKSPACE_ROLES,
+        )
+
+    def _compute_datamodel_owner_refs(self, dataset: Dataset) -> List[EntityReference]:  # noqa: UP006
+        """Semantic model (dataset) owners = `configuredBy` + workspace members with
+        a write-capable role + dataset-ACL principals with a write-level right.
+        """
+        principals = list(self.state.workspace_principals) + list(dataset.dataset_principals or [])
+        return self._collect_non_admin_owners(
+            configured_by=dataset.configuredBy,
+            principals=principals,
+            write_rights=POWERBI_WRITE_WORKSPACE_ROLES | POWERBI_WRITE_DATASET_RIGHTS,
+        )
+
+    def _compute_report_owner_refs(self, report: PowerBIReport) -> List[EntityReference]:  # noqa: UP006
+        """Reports have no owner endpoint in non-admin mode (404) - they inherit
+        their semantic model's owners via `datasetId`.
+        """
+        if not report.datasetId:
+            return []
+        dataset = self.state.find_dataset(report.datasetId)
+        if dataset is None:
+            return []
+        return self._compute_datamodel_owner_refs(dataset)
+
+    def _compute_dashboard_owner_refs(self, dashboard: PowerBIDashboard) -> List[EntityReference]:  # noqa: UP006
+        """Dashboards have no owner endpoint in non-admin mode either - they union
+        the owners of every report behind their tiles.
+        """
+        owner_refs: List[EntityReference] = []  # noqa: UP006
+        seen_ids: set = set()
+        for tile in dashboard.tiles or []:
+            if not tile.reportId:
+                continue
+            report = self.state.find_report(tile.reportId)
+            if report is None:
+                continue
+            for ref in self._compute_report_owner_refs(report):
+                ref_id = model_str(ref.id)
+                if ref_id not in seen_ids:
+                    seen_ids.add(ref_id)
+                    owner_refs.append(ref)
+        return owner_refs
+
+    def _get_owner_ref_non_admin(self, dashboard_details: Any) -> Optional[EntityReferenceList]:  # noqa: UP045
+        """
+        Non-admin owner resolution.
+
+        Non-admin GET endpoints never populate `users` on individual dashboard
+        entities - that array is filled by the admin scan's `getArtifactUsers`
+        (see `_get_owner_ref_admin`). Instead, ownership is derived from
+        `configuredBy` plus workspace membership and dataset ACLs fetched
+        separately (`fetch_group_users` / `fetch_dataset_users`, wired in
+        `get_org_workspace_data`); reports and dashboards have no owner
+        endpoint of their own in non-admin mode and inherit owners from their
+        semantic model / reports respectively. See the `_compute_*_owner_refs`
+        methods for the per-entity-type rules.
+        """
+        if isinstance(dashboard_details, PowerBIDashboard):
+            owner_refs = self._compute_dashboard_owner_refs(dashboard_details)
+            metric = self.METRIC_OWNERS_ASSIGNED_DASHBOARDS
+        elif isinstance(dashboard_details, PowerBIReport):
+            owner_refs = self._compute_report_owner_refs(dashboard_details)
+            metric = self.METRIC_OWNERS_ASSIGNED_REPORTS
+        elif isinstance(dashboard_details, Dataset):
+            owner_refs = self._compute_datamodel_owner_refs(dashboard_details)
+            metric = self.METRIC_OWNERS_ASSIGNED_DATAMODELS
+        elif isinstance(dashboard_details, Dataflow):
+            owner_refs = self._compute_dataflow_owner_refs(dashboard_details)
+            metric = self.METRIC_OWNERS_ASSIGNED_DATAFLOWS
+        else:
+            # Datamart is admin-scan-only (see its docstring in models.py) -
+            # never reached when useAdminApis is False.
+            return None
+        if owner_refs:
+            self._metrics[metric] += 1
+            logger.debug(f"Successfully resolved non-admin owners for {dashboard_details.id}")
+            return EntityReferenceList(root=owner_refs)
+        self._metrics[self.METRIC_ASSETS_WITHOUT_OWNER] += 1
         return None

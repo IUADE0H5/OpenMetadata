@@ -23,6 +23,7 @@ from metadata.ingestion.source.dashboard.powerbi.models import (
     Dataset,
     Group,
     PowerBIDashboard,
+    PowerBIPrincipal,
     PowerBIReport,
 )
 
@@ -46,11 +47,13 @@ class WorkspaceState:
     def __init__(self) -> None:
         self._current: Group | None = None
         self._datasets_by_id: dict[str, Dataset] = {}
+        self._reports_by_id: dict[str, PowerBIReport] = {}
         self._dataflow_exports: dict[str, DataflowExportResponse] = {}
         self._known_report_ids: set[str] = set()
         self._filtered_dashboards: list[DashboardLike] = []
         self._filtered_datamodels: list[DataModelLike] | None = None
         self._dashboard_charts: dict[str, list[str]] = {}
+        self._workspace_principals: list[PowerBIPrincipal] = []
 
     def enter(self, workspace: Group) -> None:
         """Activate `workspace` and build its per-workspace caches.
@@ -65,9 +68,13 @@ class WorkspaceState:
             )
         self._current = workspace
         self._datasets_by_id = {d.id: d for d in workspace.datasets or []}
+        self._reports_by_id = {r.id: r for r in workspace.reports or []}
         self._filtered_dashboards = []
         self._filtered_datamodels = None
         self._dashboard_charts = {}
+        # Non-admin only; empty for a workspace built from the admin scan
+        # (owner resolution there reads each entity's own `users` instead).
+        self._workspace_principals = workspace.workspace_principals or []
         for report in workspace.reports or []:
             self._known_report_ids.add(report.id)
 
@@ -77,10 +84,12 @@ class WorkspaceState:
             return
         self._current = None
         self._datasets_by_id = {}
+        self._reports_by_id = {}
         self._dataflow_exports = {}
         self._filtered_dashboards = []
         self._filtered_datamodels = None
         self._dashboard_charts = {}
+        self._workspace_principals = []
 
     @property
     def current(self) -> Group:
@@ -96,6 +105,20 @@ class WorkspaceState:
     def is_known_report(self, report_id: str | None) -> bool:
         """Return True if `report_id` was seen in any workspace entered so far."""
         return report_id is not None and report_id in self._known_report_ids
+
+    def find_report(self, report_id: str) -> PowerBIReport | None:
+        """Look up a report by id in the current workspace.
+
+        Used for non-admin dashboard owner resolution, which has no owner
+        endpoint of its own and instead unions the owners of the reports
+        behind the dashboard's tiles.
+        """
+        return self._reports_by_id.get(report_id)
+
+    @property
+    def workspace_principals(self) -> list[PowerBIPrincipal]:
+        """This workspace's membership (non-admin only; empty under the admin scan)."""
+        return self._workspace_principals
 
     def cache_dataflow_export(self, key: str, export: DataflowExportResponse) -> None:
         """Memoise a dataflow export for the current workspace's lineage stage."""

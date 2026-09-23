@@ -15,6 +15,25 @@ Constants used by PowerBI metadata ingestion
 
 OWNER_ACCESS_RIGHTS_KEYWORDS = ["owner", "write", "admin"]
 
+# Power BI principal type strings, as returned verbatim by the non-admin
+# workspace-users and dataset-users endpoints (`principalType`).
+POWERBI_USER_PRINCIPAL_TYPE = "User"
+POWERBI_GROUP_PRINCIPAL_TYPE = "Group"
+POWERBI_APP_PRINCIPAL_TYPE = "App"
+
+# Workspace roles that can publish or modify workspace content. Viewer is the
+# only Power BI workspace role that cannot; Contributor is the lowest role
+# that can - that is a property of the Power BI permission model itself, not
+# of one deployment's policy, so this mapping is generic rather than a
+# per-tenant choice.
+# https://learn.microsoft.com/en-us/power-bi/collaborate-share/service-roles-new-workspaces
+POWERBI_WRITE_WORKSPACE_ROLES = frozenset({"Admin", "Member", "Contributor"})
+
+# Dataset-level access rights (from the non-admin dataset-users endpoint)
+# that grant write access to the dataset, as opposed to the read-only
+# `Read` right. Same generic reasoning as POWERBI_WRITE_WORKSPACE_ROLES.
+POWERBI_WRITE_DATASET_RIGHTS = frozenset({"ReadWrite", "ReadWriteReshare", "Owner"})
+
 SNOWFLAKE_QUERY_EXPRESSION_KW = "Value.NativeQuery(Snowflake.Databases("
 DATABRICKS_QUERY_EXPRESSION_KW = "Value.NativeQuery(Databricks.Catalogs("
 BIGQUERY_QUERY_EXPRESSION_KW = "Value.NativeQuery(GoogleBigQuery.Database("
