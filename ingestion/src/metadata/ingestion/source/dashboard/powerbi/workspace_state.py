@@ -79,6 +79,17 @@ class WorkspaceState:
         # second, columnless pass over an edge already written with columns would
         # silently wipe them. Bounded per CLAUDE.md's cache rule.
         self._emitted_column_lineage_edges: set[tuple[str, str]] = set()
+        # Report ids whose visual charts, and dataset ids whose TMDL tables, have
+        # already been processed this workspace, this run. `yield_dashboard_chart`
+        # and `yield_datamodel` are topology `NodeStage`s on the "dashboard" node -
+        # its producer yields once per report, and each stage's own body then loops
+        # every report/dataset in the workspace again, so without this a report's
+        # charts (and the METRIC_VISUALS_*/METRIC_REPORT_VISUAL_CHARTS_CREATED
+        # counters, and duplicate FQNs in `state._dashboard_charts`) and a dataset's
+        # TMDL ingestion (METRIC_MODEL_COLUMNS_INGESTED/METRIC_AUTO_DATE_TABLES_SKIPPED)
+        # get redone and recounted once per *other* report in the workspace too.
+        self._processed_report_chart_ids: set[str] = set()
+        self._processed_tmdl_dataset_ids: set[str] = set()
 
     def enter(self, workspace: Group) -> None:
         """Activate `workspace` and build its per-workspace caches.
@@ -109,6 +120,8 @@ class WorkspaceState:
         self._report_last_updated = None
         self._semantic_model_last_updated = None
         self._emitted_column_lineage_edges = set()
+        self._processed_report_chart_ids = set()
+        self._processed_tmdl_dataset_ids = set()
         for report in workspace.reports or []:
             self._known_report_ids.add(report.id)
 
@@ -133,6 +146,8 @@ class WorkspaceState:
         self._report_last_updated = None
         self._semantic_model_last_updated = None
         self._emitted_column_lineage_edges = set()
+        self._processed_report_chart_ids = set()
+        self._processed_tmdl_dataset_ids = set()
 
     @property
     def current(self) -> Group:
@@ -310,3 +325,21 @@ class WorkspaceState:
         """Record that `(from_id, to_id)` has now been written with its full
         `columnsLineage`, for the current workspace."""
         self._emitted_column_lineage_edges.add((from_id, to_id))
+
+    # --- Report-chart / TMDL-ingestion dedup: write-once per id, this workspace -----
+
+    def has_processed_report_charts(self, report_id: str) -> bool:
+        """True if `report_id`'s visual charts have already been yielded this workspace."""
+        return report_id in self._processed_report_chart_ids
+
+    def mark_report_charts_processed(self, report_id: str) -> None:
+        """Record that `report_id`'s visual charts have been yielded, for the current workspace."""
+        self._processed_report_chart_ids.add(report_id)
+
+    def has_processed_dataset_tmdl(self, dataset_id: str) -> bool:
+        """True if `dataset_id`'s TMDL tables have already been ingested this workspace."""
+        return dataset_id in self._processed_tmdl_dataset_ids
+
+    def mark_dataset_tmdl_processed(self, dataset_id: str) -> None:
+        """Record that `dataset_id`'s TMDL tables have been ingested, for the current workspace."""
+        self._processed_tmdl_dataset_ids.add(dataset_id)

@@ -219,6 +219,7 @@ class TestSwitchOff:
             PowerbiSource.METRIC_DATAFLOW_MODEL_COLUMNS_UNMAPPED,
             PowerbiSource.METRIC_MODEL_COLUMNS_USED,
             PowerbiSource.METRIC_MODEL_COLUMNS_UNUSED,
+            PowerbiSource.METRIC_COLUMN_LINEAGE_SOURCE_COLUMN_MISSING,
         ):
             assert values[key] == 0
 
@@ -266,6 +267,61 @@ class TestChartCreationPerVisual:
         assert enabled_source.metric_values()[PowerbiSource.METRIC_VISUALS_DATA] == 1
         assert enabled_source.metric_values()[PowerbiSource.METRIC_VISUALS_NON_DATA] == 1
         assert enabled_source.metric_values()[PowerbiSource.METRIC_REPORT_VISUAL_CHARTS_CREATED] == 1
+
+    def test_duplicate_visual_id_yields_one_chart_and_logs_once(self, enabled_source, caplog):
+        """A visual id can repeat within one report (small-multiples containers) -
+        `{report_id}_{visual_id}` would then collide. Keep the first, log a
+        DEBUG once per id when a later duplicate actually differs, never per
+        occurrence."""
+        report = PowerBIReport(id="rep-1", name="Report One")
+        enabled_source.state.add_filtered_dashboard(report)
+        report_definition = ReportDefinition(
+            format="legacy",
+            visuals=[
+                VisualDefinition(
+                    visual_id="v1",
+                    page_id="page1",
+                    page_display_name="Page One",
+                    visual_type="barChart",
+                    title="Container A",
+                    refs=[FieldRef("column", "Sales", "Amount")],
+                    is_data_visual=True,
+                ),
+                # Same visual_id, different title/type - a second small-multiples
+                # container sharing the id.
+                VisualDefinition(
+                    visual_id="v1",
+                    page_id="page1",
+                    page_display_name="Page One",
+                    visual_type="columnChart",
+                    title="Container B",
+                    refs=[FieldRef("column", "Sales", "Amount")],
+                    is_data_visual=True,
+                ),
+                # A third occurrence, still differing - "once" means once per id.
+                VisualDefinition(
+                    visual_id="v1",
+                    page_id="page1",
+                    page_display_name="Page One",
+                    visual_type="pieChart",
+                    title="Container C",
+                    refs=[FieldRef("column", "Sales", "Amount")],
+                    is_data_visual=True,
+                ),
+            ],
+        )
+        enabled_source._get_report_definition = MagicMock(return_value=report_definition)
+
+        with caplog.at_level("DEBUG"):
+            charts = [e.right for e in enabled_source.yield_dashboard_chart(Group(id="ws-1", name="x")) if e.right]
+
+        assert len(charts) == 1
+        assert charts[0].name.root == "rep-1_v1"
+        assert charts[0].displayName == "Container A"
+        assert enabled_source.state.pop_dashboard_chart_ids("rep-1") == ["rep-1_v1"]
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_VISUALS_DATA] == 1
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_REPORT_VISUAL_CHARTS_CREATED] == 1
+        assert sum("Duplicate visual id" in m for m in caplog.messages) == 1
 
     def test_display_name_falls_back_to_page_and_visual_type(self, enabled_source):
         report = PowerBIReport(id="rep-2", name="Report Two")
@@ -593,6 +649,74 @@ class TestModelColumnUsageComputation:
         dangling_log_lines = [m for m in caplog.messages if "NoSuchColumn" in m or "NoSuchMeasure" in m]
         assert len(dangling_log_lines) == 2
 
+    def test_resolved_refs_counted_distinct_per_report_from_report_parse(self, enabled_source):
+        dataset, report = self._dataset_and_report(enabled_source)
+        enabled_source.state.cache_semantic_model_definition(dataset.id, SemanticModelDefinition())
+        report_definition = ReportDefinition(
+            format="legacy",
+            visuals=[
+                VisualDefinition(
+                    visual_id="v1",
+                    page_id="p1",
+                    page_display_name="P",
+                    visual_type="table",
+                    title="T",
+                    refs=[
+                        FieldRef("column", "Sales", "Amount"),
+                        # Same (kind, table, name) again - e.g. filter + projection.
+                        FieldRef("column", "Sales", "Amount", context="filter@visual"),
+                    ],
+                    is_data_visual=True,
+                ),
+                VisualDefinition(
+                    visual_id="v2",
+                    page_id="p1",
+                    page_display_name="P",
+                    visual_type="table",
+                    title="T2",
+                    refs=[FieldRef("measure", "Sales", "Total")],
+                    is_data_visual=True,
+                ),
+            ],
+            report_refs=[FieldRef("column", "Sales", "Region")],
+        )
+        enabled_source.state.cache_report_definition(report.id, report_definition)
+        usage = ModelColumnUsage(
+            business_columns=frozenset(),
+            used=frozenset(),
+            unused=frozenset(),
+            wholly_unused_tables=frozenset(),
+            # This ref IS in the report's own refs but classified dangling - must
+            # not be counted as resolved.
+            dangling={"rep-1": [FieldRef("column", "Sales", "Region")]},
+        )
+        enabled_source._compute_column_usage = MagicMock(return_value=usage)
+        enabled_source.metadata.get_by_name = MagicMock(return_value=None)
+
+        enabled_source._ensure_column_usage_computed()
+
+        # Distinct (kind, table, name) across the report: (column,Sales,Amount),
+        # (measure,Sales,Total), (column,Sales,Region) = 3, minus the 1 dangling = 2.
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_REFS_RESOLVED] == 2
+
+    def test_measures_transitive_taken_from_usage_counters_not_lineage_loop(self, enabled_source):
+        dataset, report = self._dataset_and_report(enabled_source)
+        enabled_source.state.cache_semantic_model_definition(dataset.id, SemanticModelDefinition())
+        enabled_source.state.cache_report_definition(report.id, ReportDefinition(format="legacy"))
+        usage = ModelColumnUsage(
+            business_columns=frozenset(),
+            used=frozenset(),
+            unused=frozenset(),
+            wholly_unused_tables=frozenset(),
+            counters={"measures_transitive": 7},
+        )
+        enabled_source._compute_column_usage = MagicMock(return_value=usage)
+        enabled_source.metadata.get_by_name = MagicMock(return_value=None)
+
+        enabled_source._ensure_column_usage_computed()
+
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_MEASURES_RESOLVED_TRANSITIVELY] == 7
+
 
 class TestDatamodelReportColumnLineage:
     def test_direct_and_measure_refs_both_emitted_never_merged(self, enabled_source):
@@ -687,7 +811,10 @@ class TestDatamodelReportColumnLineage:
             )
 
         assert len(column_lineage) == 1
-        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_REFS_RESOLVED] == 1
+        # METRIC_COLUMN_REFS_RESOLVED is a distinct-per-report count derived from
+        # usage/report parse data in `_ensure_column_usage_computed`, not a tally of
+        # lineage entries here - see that method's docstring.
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_LINEAGE_EMITTED] == 1
 
     def test_visual_from_other_report_excluded(self, enabled_source):
         datamodel_entity = _dm("11111111-1111-1111-1111-111111111111", "ds-1", "svc.ds-1")
@@ -705,7 +832,11 @@ class TestDatamodelReportColumnLineage:
 
         assert column_lineage == []
 
-    def test_unresolved_column_counted_dangling_not_emitted(self, enabled_source):
+    def test_unresolved_column_counted_source_column_missing_not_emitted(self, enabled_source):
+        """The parser resolved this ref to a real column (it's in `per_visual`, not
+        `usage.dangling`), but the ingested `DashboardDataModel` entity has no
+        matching column - METRIC_COLUMN_LINEAGE_SOURCE_COLUMN_MISSING, not
+        METRIC_COLUMN_REFS_DANGLING, which means the parser's own dangling refs."""
         datamodel_entity = _dm("11111111-1111-1111-1111-111111111111", "ds-1", "svc.ds-1")
         usage = ModelColumnUsage(
             business_columns=frozenset(),
@@ -727,7 +858,40 @@ class TestDatamodelReportColumnLineage:
             )
 
         assert column_lineage == []
-        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_REFS_DANGLING] == 1
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_LINEAGE_SOURCE_COLUMN_MISSING] == 1
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_REFS_DANGLING] == 0
+
+    def test_repeated_missing_source_column_logged_once(self, enabled_source, caplog):
+        """The same missing (table, column) can be referenced by more than one
+        visual in a report - count and log it once per report, not once per visual."""
+        datamodel_entity = _dm("11111111-1111-1111-1111-111111111111", "ds-1", "svc.ds-1")
+        usage = ModelColumnUsage(
+            business_columns=frozenset(),
+            used=frozenset(),
+            unused=frozenset(),
+            wholly_unused_tables=frozenset(),
+            per_visual={
+                ("rep-1", "v1"): [ColumnUse(table="Sales", column="Missing")],
+                ("rep-1", "v2"): [ColumnUse(table="Sales", column="Missing")],
+            },
+        )
+        chart_entity = MagicMock()
+        chart_entity.fullyQualifiedName.root = "svc.rep-1_v"
+        enabled_source.metadata.get_by_name = MagicMock(return_value=chart_entity)
+
+        with (
+            patch(
+                "metadata.ingestion.source.dashboard.powerbi.metadata.fqn.build",
+                side_effect=lambda *a, **kw: kw.get("chart_name"),
+            ),
+            caplog.at_level("INFO"),
+        ):
+            enabled_source._create_datamodel_report_column_lineage(
+                datamodel_entity=datamodel_entity, report_id="rep-1", usage=usage
+            )
+
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_COLUMN_LINEAGE_SOURCE_COLUMN_MISSING] == 1
+        assert sum("Missing" in m for m in caplog.messages) == 1
 
 
 class TestDataflowModelColumnLineage:
@@ -814,6 +978,63 @@ class TestDataflowModelColumnLineage:
         )
 
         assert column_lineage == []
+
+
+class TestChartAndTmdlProcessingDedup:
+    """`yield_dashboard_chart` and `yield_datamodel` are topology `NodeStage`s on
+    the "dashboard" node - the producer yields once per report, and each stage's
+    body then loops every report/dataset in the workspace again on each of those
+    calls. Without a dedup guard, a report's chart creation (and a dataset's TMDL
+    ingestion) gets redone, and its metrics recounted, once per *other* report."""
+
+    def test_report_visual_charts_yielded_once_across_redundant_calls(self, enabled_source):
+        report = PowerBIReport(id="rep-1", name="R")
+        enabled_source.state.add_filtered_dashboard(report)
+        report_definition = ReportDefinition(
+            format="legacy",
+            visuals=[
+                VisualDefinition(
+                    visual_id="v1",
+                    page_id="p1",
+                    page_display_name="P",
+                    visual_type="barChart",
+                    title="T",
+                    refs=[FieldRef("column", "Sales", "Amount")],
+                    is_data_visual=True,
+                )
+            ],
+        )
+        enabled_source._get_report_definition = MagicMock(return_value=report_definition)
+
+        # Two calls, as the redundant per-report topology loop would produce.
+        first_pass = list(enabled_source.yield_dashboard_chart(Group(id="ws-1", name="x")))
+        second_pass = list(enabled_source.yield_dashboard_chart(Group(id="ws-1", name="x")))
+
+        first_charts = [e.right for e in first_pass if e.right is not None]
+        second_charts = [e.right for e in second_pass if e.right is not None]
+        assert len(first_charts) == 1
+        assert second_charts == []
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_REPORT_VISUAL_CHARTS_CREATED] == 1
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_VISUALS_DATA] == 1
+        # No duplicate chart id fed into the report's `charts=` FQN list either.
+        assert enabled_source.state.pop_dashboard_chart_ids("rep-1") == ["rep-1_v1"]
+
+    def test_tmdl_tables_ingested_once_across_redundant_calls(self, enabled_source):
+        dataset = Dataset(id="ds-1", name="Sales Model", tables=[])
+        model_definition = SemanticModelDefinition(
+            tables=[TmdlTable(name="Sales", columns=[TmdlColumn(name="Amount")])]
+        )
+        enabled_source._get_semantic_model_definition = MagicMock(return_value=model_definition)
+
+        enabled_source._replace_dataset_tables_with_tmdl(dataset)
+        enabled_source._replace_dataset_tables_with_tmdl(dataset)
+
+        # The second call is skipped entirely by the dedup guard, before it would
+        # even reach the (separately cached) definition fetch.
+        assert enabled_source._get_semantic_model_definition.call_count == 1
+        assert [t.name for t in dataset.tables or []] == ["Sales"]
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_MODEL_COLUMNS_INGESTED] == 1
+        assert enabled_source.metric_values()[PowerbiSource.METRIC_AUTO_DATE_TABLES_SKIPPED] == 0
 
 
 class TestColumnLineageEdgeDedup:

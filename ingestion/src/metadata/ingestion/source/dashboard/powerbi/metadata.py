@@ -322,6 +322,13 @@ class PowerbiSource(DashboardServiceSource):
     METRIC_COLUMN_LINEAGE_ENTRIES_EMITTED_DATAFLOW_DATASET = "column_lineage_entries_emitted_dataflow_dataset"
     METRIC_COLUMN_LINEAGE_ENTRIES_VERIFIED_DATAFLOW_DATASET = "column_lineage_entries_verified_dataflow_dataset"
     METRIC_COLUMN_LINEAGE_ENTRIES_DROPPED_DATAFLOW_DATASET = "column_lineage_entries_dropped_dataflow_dataset"
+    # A model->chart use whose (table, column) has no matching column on the
+    # `DashboardDataModel` entity itself - distinct from METRIC_COLUMN_REFS_DANGLING,
+    # which counts the parser's own dangling refs (a name that never resolved to any
+    # model column at all). This one means the parser resolved the ref to a real TMDL
+    # column, but that column didn't make it onto the ingested entity - expected 0
+    # once auto-date columns are filtered out of `per_visual` upstream.
+    METRIC_COLUMN_LINEAGE_SOURCE_COLUMN_MISSING = "column_lineage_source_column_missing"
 
     # Canonical `edge_kind` values `_track_column_lineage_edge`/`_verify_column_lineage_edges`
     # dispatch the per-kind metrics above on - distinct from `error_name` (which is
@@ -1101,16 +1108,55 @@ class PowerbiSource(DashboardServiceSource):
         return report_definition
 
     def _yield_report_visual_charts(self, dashboard_details: PowerBIReport) -> Iterable[Either[CreateChartRequest]]:
-        """One Chart per data visual in `dashboard_details`'s report definition.
+        """One Chart per *distinct* data visual in `dashboard_details`'s report
+        definition - a visual id can repeat within one report (small-multiples
+        containers), so this dedupes on `visual_id`, keeping the first occurrence.
 
         Non-data visuals (`is_data_visual=False`) get no Chart, only a metric.
+
+        `yield_dashboard_chart` is a topology `NodeStage` on the "dashboard" node,
+        whose producer yields once per report in the workspace - and its own body
+        then loops every report in the workspace again on each of those calls. Without
+        this guard a report's charts (and the visuals/charts-created metrics, and
+        `state._dashboard_charts`, which would gain duplicate chart ids feeding
+        duplicate FQNs into the report's `charts=` list) would be reprocessed and
+        recounted once per *other* report too.
         """
+        if self.state.has_processed_report_charts(dashboard_details.id):
+            return
         workspace_id = self.context.get().workspace.id  # pyright: ignore[reportAttributeAccessIssue]
         report_definition = self._get_report_definition(dashboard_details, workspace_id)
         if report_definition is None:
             return
+        self.state.mark_report_charts_processed(dashboard_details.id)
+        # A visual id can repeat within one report (small-multiples containers) -
+        # `{report_id}_{visual_id}` would then collide, so dedupe on visual_id,
+        # keep the first occurrence, and only log a later one when it actually
+        # differs (title or visual_type) from what was kept.
+        seen_visual_ids: dict = {}
+        logged_duplicate_visual_ids: set = set()
         for visual in report_definition.visuals or []:
             try:
+                visual_id = visual.visual_id
+                if visual_id in seen_visual_ids:
+                    kept_title, kept_type = seen_visual_ids[visual_id]
+                    if (visual.title, visual.visual_type) != (
+                        kept_title,
+                        kept_type,
+                    ) and visual_id not in logged_duplicate_visual_ids:
+                        logged_duplicate_visual_ids.add(visual_id)
+                        logger.debug(
+                            "Duplicate visual id [%s] in report [%s] differs from the kept one "
+                            "(kept title=%r type=%r, duplicate title=%r type=%r) - keeping the first",
+                            visual_id,
+                            dashboard_details.id,
+                            kept_title,
+                            kept_type,
+                            visual.title,
+                            visual.visual_type,
+                        )
+                    continue
+                seen_visual_ids[visual_id] = (visual.title, visual.visual_type)
                 if not visual.is_data_visual:
                     self._metrics[self.METRIC_VISUALS_NON_DATA] += 1
                     continue
@@ -1439,11 +1485,22 @@ class PowerbiSource(DashboardServiceSource):
         """Populate `dataset.tables` from the semantic model's TMDL definition,
         in place, skipping auto-date tables. A no-op (dataset keeps whatever
         `tables` it already had) if the definition can't be fetched or parsed.
+
+        `yield_datamodel` is a topology `NodeStage` on the "dashboard" node, called
+        once per report in the workspace, and its own body loops every dataset in
+        the workspace on each call - so without this guard a dataset's TMDL tables
+        would be rebuilt, and METRIC_MODEL_COLUMNS_INGESTED/METRIC_AUTO_DATE_TABLES_SKIPPED
+        recounted, once per *other* report too. Safe to skip entirely once done:
+        `dataset` is the same cached object every call (`_filtered_datamodels`'s
+        memo), so `dataset.tables` set here on the first pass is still there.
         """
+        if self.state.has_processed_dataset_tmdl(dataset.id):
+            return
         workspace_id = self.context.get().workspace.id  # pyright: ignore[reportAttributeAccessIssue]
         model_definition = self._get_semantic_model_definition(dataset, workspace_id)
         if model_definition is None:
             return
+        self.state.mark_dataset_tmdl_processed(dataset.id)
         tables: List[PowerBiTable] = []  # noqa: UP006
         for table in getattr(model_definition, "tables", None) or []:
             if getattr(table, "is_auto_date", False):
@@ -1751,9 +1808,18 @@ class PowerbiSource(DashboardServiceSource):
         `function` is `measure:<name>` for a column reached via a measure, unset for a
         direct column reference - `via_measure` on `ColumnUse` already carries exactly
         the name to use (the first, visual-facing measure on the path).
+
+        Does NOT increment METRIC_COLUMN_REFS_RESOLVED or
+        METRIC_MEASURES_RESOLVED_TRANSITIVELY - both must be distinct-per-report/
+        distinct-per-model counts, not per-lineage-entry ones, so `_ensure_column_usage_computed`
+        derives them straight from `usage` instead (see its docstring).
         """
         column_lineage: List[ColumnLineage] = []  # noqa: UP006
         service_name = self.context.get().dashboard_service  # pyright: ignore[reportAttributeAccessIssue]
+        # A (table, column) the parser resolved to a real TMDL column but that isn't
+        # on the ingested `datamodel_entity` - logged once per report, not once per
+        # visual it happens to appear in.
+        seen_missing_source_column: set = set()
         for (visual_report_id, visual_id), column_uses in (usage.per_visual or {}).items():
             if visual_report_id != report_id:
                 continue
@@ -1789,13 +1855,22 @@ class PowerbiSource(DashboardServiceSource):
                     column=use.column,
                 )
                 if not from_column_fqn:
-                    self._metrics[self.METRIC_COLUMN_REFS_DANGLING] += 1
+                    missing_key = (use.table, use.column)
+                    if missing_key not in seen_missing_source_column:
+                        seen_missing_source_column.add(missing_key)
+                        self._metrics[self.METRIC_COLUMN_LINEAGE_SOURCE_COLUMN_MISSING] += 1
+                        logger.info(
+                            "Model column referenced by report [%s] has no matching column on model [%s]: "
+                            "table=%s column=%s",
+                            report_id,
+                            datamodel_entity.name.root,
+                            use.table,
+                            use.column,
+                        )
                     continue
-                self._metrics[self.METRIC_COLUMN_REFS_RESOLVED] += 1
                 entry_kwargs: dict = {"fromColumns": [from_column_fqn], "toColumn": to_column}
                 if via_measure:
                     entry_kwargs["function"] = f"measure:{via_measure}"
-                    self._metrics[self.METRIC_MEASURES_RESOLVED_TRANSITIVELY] += 1
                 column_lineage.append(ColumnLineage(**entry_kwargs))
                 self._metrics[self.METRIC_COLUMN_LINEAGE_EMITTED] += 1
         return column_lineage
@@ -3336,6 +3411,24 @@ class PowerbiSource(DashboardServiceSource):
             logger.debug(traceback.format_exc())
             return None
 
+    @staticmethod
+    def _report_ref_keys(report_definition: Any) -> set:
+        """Every distinct (kind, table, name) triple `report_definition` (a
+        `ReportDefinitionLike`) references, across every visual, every page's own
+        filters, and the report-level filters - the same universe
+        `column_usage.resolve_column_usage` classifies as either resolved (surfacing
+        in `usage.per_visual`) or dangling (`usage.dangling`)."""
+        keys: set = set()
+        for visual in getattr(report_definition, "visuals", None) or []:
+            for ref in getattr(visual, "refs", None) or []:
+                keys.add((getattr(ref, "kind", None), getattr(ref, "table", None), getattr(ref, "name", None)))
+        for ref in getattr(report_definition, "report_refs", None) or []:
+            keys.add((getattr(ref, "kind", None), getattr(ref, "table", None), getattr(ref, "name", None)))
+        for page_refs in (getattr(report_definition, "page_refs", None) or {}).values():
+            for ref in page_refs or []:
+                keys.add((getattr(ref, "kind", None), getattr(ref, "table", None), getattr(ref, "name", None)))
+        return keys
+
     def _ensure_column_usage_computed(self) -> None:
         """Compute and cache `ModelColumnUsage` for every dataset in the current
         workspace that has a cached semantic model definition (i.e. TMDL fetch +
@@ -3344,6 +3437,13 @@ class PowerbiSource(DashboardServiceSource):
         `db_service_prefix`) are a no-op. Logs dangling refs at INFO and calls the
         `on_datamodel_column_usage` hook once per model, after the model entity
         exists in OM.
+
+        METRIC_COLUMN_REFS_RESOLVED and METRIC_MEASURES_RESOLVED_TRANSITIVELY are
+        computed here, not in `_create_datamodel_report_column_lineage` - both must
+        be distinct counts (distinct resolved (kind, table, name) refs per report;
+        distinct measures in the transitive closure of used measures, per model),
+        not a tally of lineage entries, which double-counts a column reached via
+        multiple measures or used in multiple visuals.
         """
         if self.state.column_usage_computed:
             return
@@ -3366,6 +3466,20 @@ class PowerbiSource(DashboardServiceSource):
             self._metrics[self.METRIC_MODEL_COLUMNS_USED] += len(usage.used or frozenset())
             self._metrics[self.METRIC_MODEL_COLUMNS_UNUSED] += len(usage.unused or frozenset())
             self._metrics[self.METRIC_DAX_UNRESOLVED] += len(usage.dax_unresolved or set())
+            # Distinct measures in the transitive closure of used measures, for this
+            # model - column_usage.py's own counter, already deduped; not a count of
+            # lineage entries (one measure can feed many (visual, column) uses).
+            self._metrics[self.METRIC_MEASURES_RESOLVED_TRANSITIVELY] += (usage.counters or {}).get(
+                "measures_transitive", 0
+            )
+            for report_id, report_definition in reports.items():
+                dangling_this_report = {
+                    (getattr(ref, "kind", None), getattr(ref, "table", None), getattr(ref, "name", None))
+                    for ref in (usage.dangling or {}).get(report_id, [])
+                }
+                self._metrics[self.METRIC_COLUMN_REFS_RESOLVED] += len(
+                    self._report_ref_keys(report_definition) - dangling_this_report
+                )
             for report_id, dangling_refs in (usage.dangling or {}).items():
                 # The same (kind, table, name) dangling ref can appear more than
                 # once per report (once per context it's referenced in - filter,
