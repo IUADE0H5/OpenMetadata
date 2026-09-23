@@ -29,6 +29,11 @@ table Sales
 \t\tdataType: dateTime
 \t\tsourceColumn: OrderDate
 
+\t\tvariation Variation
+\t\t\tisDefault
+\t\t\trelationship: 77777777-7777-7777-7777-777777777777
+\t\t\tdefaultHierarchy: LocalDateTable_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.'Date Hierarchy'
+
 \tcolumn Year = YEAR([OrderDate])
 \t\tdataType: int64
 \t\tsummarizeBy: none
@@ -159,6 +164,26 @@ class TestParseTmdl:
             ("Year", "Year"),
             ("Quarter", "Quarter"),
         ]
+
+    def test_parses_column_variation_block(self):
+        model = parse_tmdl(_parts())
+        table = model.table("Sales")
+        order_date = next(c for c in table.columns if c.name == "OrderDate")
+        assert len(order_date.variations) == 1
+        variation = order_date.variations[0]
+        assert variation.name == "Variation"
+        assert variation.is_default is True
+        assert variation.relationship == "77777777-7777-7777-7777-777777777777"
+        assert variation.default_hierarchy == (
+            "LocalDateTable_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "Date Hierarchy",
+        )
+
+    def test_column_without_variation_has_empty_list(self):
+        model = parse_tmdl(_parts())
+        table = model.table("Sales")
+        amount = next(c for c in table.columns if c.name == "Amount")
+        assert amount.variations == []
 
     def test_parses_unfenced_multiline_partition_source(self):
         model = parse_tmdl(_parts())

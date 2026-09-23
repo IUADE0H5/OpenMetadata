@@ -26,6 +26,7 @@ from metadata.ingestion.source.dashboard.powerbi.tmdl import (
     TmdlMeasure,
     TmdlRelationship,
     TmdlTable,
+    TmdlVariation,
 )
 
 
@@ -43,6 +44,9 @@ def _model() -> SemanticModelDefinition:
         measures=[
             TmdlMeasure(name="Total Sales", expression="SUM(Sales[Amount])"),
             TmdlMeasure(name="Sales Rank", expression="RANKX(ALL(Sales), [Total Sales])"),
+            TmdlMeasure(name="Shared", expression="SUM(Sales[Amount])"),
+            TmdlMeasure(name="A", expression="[Shared] + 1"),
+            TmdlMeasure(name="B", expression="[Shared] + 2"),
         ],
         hierarchies=[
             TmdlHierarchy(
@@ -52,6 +56,13 @@ def _model() -> SemanticModelDefinition:
         ],
     )
     sales.columns[3].sort_by_column = "RegionSort"  # Region -> RegionSort
+    sales.columns[2].variations = [
+        TmdlVariation(
+            name="Variation",
+            is_default=True,
+            default_hierarchy=("LocalDateTable_x", "Date Hierarchy"),
+        )
+    ]
     customer = TmdlTable(
         name="Customer",
         columns=[TmdlColumn(name="CustomerId"), TmdlColumn(name="Name"), TmdlColumn(name="Country")],
@@ -61,6 +72,12 @@ def _model() -> SemanticModelDefinition:
         name="LocalDateTable_x",
         is_auto_date=True,
         columns=[TmdlColumn(name="Date"), TmdlColumn(name="Year")],
+        hierarchies=[
+            TmdlHierarchy(
+                name="Date Hierarchy",
+                levels=[TmdlHierarchyLevel(name="Year", column="Year")],
+            )
+        ],
     )
     model = SemanticModelDefinition(tables=[sales, customer, unused_table, auto_date])
     model.relationships = [
@@ -70,8 +87,10 @@ def _model() -> SemanticModelDefinition:
     return model
 
 
-def _ref(table, name, kind="column", context="projection", hierarchy=None) -> FieldRef:
-    return FieldRef(kind=kind, table=table, name=name, hierarchy=hierarchy, context=context)
+def _ref(table, name, kind="column", context="projection", hierarchy=None, variation_level=None) -> FieldRef:
+    return FieldRef(
+        kind=kind, table=table, name=name, hierarchy=hierarchy, context=context, variation_level=variation_level
+    )
 
 
 def _report(visuals=None, report_refs=None, page_refs=None, fmt="pbir") -> ReportDefinition:
@@ -307,3 +326,67 @@ class TestDaxUnresolvedPropagation:
         report = _report(visuals=[_visual("v1", [_ref("Sales", "Broken", kind="measure")])])
         usage = resolve_column_usage(model, {"r1": report})
         assert "[GhostMeasure]" in usage.dax_unresolved
+
+
+class TestVariationHierarchyLevel:
+    def test_resolves_to_business_column_for_used_5(self):
+        ref = _ref("Sales", "OrderDate", kind="hierarchy_level", variation_level="Year")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(_model(), {"r1": report})
+        assert ("Sales", "OrderDate") in usage.used
+        # The auto-date table itself is never a business column, used_5 or not.
+        assert ("LocalDateTable_x", "Year") not in usage.used
+
+    def test_also_touches_the_auto_date_table_column_for_chart_lineage(self):
+        ref = _ref("Sales", "OrderDate", kind="hierarchy_level", variation_level="Year")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(_model(), {"r1": report})
+        uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
+        assert ("Sales", "OrderDate") in uses
+        assert ("LocalDateTable_x", "Year") in uses
+
+    def test_unresolvable_variation_level_produces_no_auto_date_touch(self):
+        # The column has no variation targeting a "Month" level in this fixture.
+        ref = _ref("Sales", "OrderDate", kind="hierarchy_level", variation_level="Month")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(_model(), {"r1": report})
+        uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
+        assert uses == {("Sales", "OrderDate")}
+
+    def test_column_without_a_variation_at_all_is_unaffected(self):
+        ref = _ref("Sales", "Amount", kind="hierarchy_level", variation_level="Year")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(_model(), {"r1": report})
+        uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
+        assert uses == {("Sales", "Amount")}
+
+
+class TestPerVisualMeasureClosureIsolation:
+    def test_two_visuals_reaching_a_shared_submeasure_each_get_the_full_closure(self):
+        # Regression: the measure-closure cycle guard used to be a single set shared
+        # across every ref in the report, so whichever visual explored the shared
+        # "Shared" submeasure first silently starved every later visual's own
+        # per-visual attribution of the columns reached through it -- even though the
+        # report-wide used_5 total stayed correct (a union either way).
+        report = _report(
+            visuals=[
+                _visual("v1", [_ref("Sales", "A", kind="measure")]),
+                _visual("v2", [_ref("Sales", "B", kind="measure")]),
+            ]
+        )
+        usage = resolve_column_usage(_model(), {"r1": report})
+        v1_cols = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
+        v2_cols = {(u.table, u.column) for u in usage.per_visual[("r1", "v2")]}
+        assert ("Sales", "Amount") in v1_cols
+        assert ("Sales", "Amount") in v2_cols
+
+    def test_measures_transitive_counter_still_deduplicates_across_visuals(self):
+        report = _report(
+            visuals=[
+                _visual("v1", [_ref("Sales", "A", kind="measure")]),
+                _visual("v2", [_ref("Sales", "B", kind="measure")]),
+            ]
+        )
+        usage = resolve_column_usage(_model(), {"r1": report})
+        # A, B and Shared are each counted once even though Shared is reached twice.
+        assert usage.counters["measures_transitive"] == 3

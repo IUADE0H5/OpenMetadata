@@ -535,6 +535,98 @@ class TestParsePbirReportDefinition:
         assert ref.hierarchy == "Date Hierarchy"
         assert ref.name == "Year"
 
+    def test_variation_hierarchy_level_resolves_to_business_column(self):
+        # A drilled auto-date hierarchy (Year/Quarter/.../Day on a date column) is
+        # wrapped in PropertyVariationSource, not a plain SourceRef -- the "Hierarchy"
+        # name here belongs to the internal auto-date table, not the business one.
+        query_state = {
+            "Values": {
+                "projections": [
+                    {
+                        "field": {
+                            "HierarchyLevel": {
+                                "Expression": {
+                                    "Hierarchy": {
+                                        "Expression": {
+                                            "PropertyVariationSource": {
+                                                "Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                "Name": "Variation",
+                                                "Property": "OrderDate",
+                                            }
+                                        },
+                                        "Hierarchy": "Date Hierarchy",
+                                    }
+                                },
+                                "Level": "Year",
+                            }
+                        },
+                        "queryRef": "Sales.OrderDate.Variation.Date Hierarchy.Year",
+                    }
+                ]
+            }
+        }
+        visual = _pbir_visual(query_state=query_state)
+        parts = _pbir_parts({"Page1": {"page": {"name": "Page1"}, "visuals": {"v1": visual}}})
+        rd = parse_report_definition(parts)
+        ref = rd.visuals[0].refs[0]
+        assert ref.kind == "hierarchy_level"
+        assert ref.table == "Sales"
+        assert ref.name == "OrderDate"
+        # None (never a real hierarchy name) is the variation marker column_usage.py
+        # keys off; the drilled level is kept separately for the auto-date lookup.
+        assert ref.hierarchy is None
+        assert ref.variation_level == "Year"
+
+    def test_nested_from_inside_objects_resolves_aliases_locally(self):
+        # A conditional-formatting/filter-chip binding under `objects` can carry its
+        # own nested {"From": [...], "Where": [...]} sub-query with its own alias scope,
+        # unrelated to the visual's own outer aliases.
+        objects = {
+            "general": [
+                {
+                    "properties": {
+                        "filter": {
+                            "filter": {
+                                "Version": 2,
+                                "From": [{"Name": "l", "Entity": "Date", "Type": 0}],
+                                "Where": [
+                                    {
+                                        "Condition": {
+                                            "In": {
+                                                "Expressions": [
+                                                    {
+                                                        "Column": {
+                                                            "Expression": {"SourceRef": {"Source": "l"}},
+                                                            "Property": "Year",
+                                                        }
+                                                    }
+                                                ],
+                                                "Values": [[{"Literal": {"Value": "2026L"}}]],
+                                            }
+                                        }
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                }
+            ]
+        }
+        visual = _pbir_visual(
+            query_state={
+                "Y": {
+                    "projections": [
+                        {"field": {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"}}}
+                    ]
+                }
+            },
+            objects=objects,
+        )
+        parts = _pbir_parts({"Page1": {"page": {"name": "Page1"}, "visuals": {"v1": visual}}})
+        rd = parse_report_definition(parts)
+        object_refs = {(r.table, r.name) for r in rd.visuals[0].refs if r.context == "objects"}
+        assert ("Date", "Year") in object_refs
+
     def test_visual_page_and_report_level_filters(self):
         visual_filter = [
             {

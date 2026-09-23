@@ -99,6 +99,11 @@ class _ModelIndex:
     sort_by: dict[ColumnKey, str]
     measure_deps: dict[ColumnKey, DaxReferences]
     calc_column_deps: dict[ColumnKey, DaxReferences]
+    # (business_table, business_column) -> {level_name: auto_date_table_column_key}.
+    # Built from each column's TMDL `variation` block; used only to additionally
+    # resolve chart lineage for the internal auto-date table a variation drills into
+    # (report_definition.py has no model access to look that table up itself).
+    variation_levels: dict[ColumnKey, dict[str, ColumnKey]]
 
 
 def _build_index(model: SemanticModelDefinition) -> _ModelIndex:
@@ -132,7 +137,33 @@ def _build_index(model: SemanticModelDefinition) -> _ModelIndex:
             for column in table.columns
             if column.expression
         },
+        variation_levels=_build_variation_levels(model),
     )
+
+
+def _build_variation_levels(model: SemanticModelDefinition) -> dict[ColumnKey, dict[str, ColumnKey]]:
+    tables_by_name = {table.name: table for table in model.tables}
+    result: dict[ColumnKey, dict[str, ColumnKey]] = {}
+    for table in model.tables:
+        for column in table.columns:
+            for variation in column.variations:
+                if variation.default_hierarchy is None:
+                    continue
+                auto_date_table_name, hierarchy_name = variation.default_hierarchy
+                auto_date_table = tables_by_name.get(auto_date_table_name)
+                if auto_date_table is None:
+                    continue
+                hierarchy = next((h for h in auto_date_table.hierarchies if h.name == hierarchy_name), None)
+                if hierarchy is None:
+                    continue
+                levels = {
+                    level.name: (auto_date_table_name, level.column)
+                    for level in hierarchy.levels
+                    if level.column is not None
+                }
+                if levels:
+                    result[(table.name, column.name)] = levels
+    return result
 
 
 def _resolve_ref(ref: FieldRef, index: _ModelIndex) -> tuple[str, ColumnKey] | None:
@@ -141,7 +172,13 @@ def _resolve_ref(ref: FieldRef, index: _ModelIndex) -> tuple[str, ColumnKey] | N
     implementation: a ref tagged Column that is actually a measure (or vice versa)
     still resolves, since the JSON's own tag can lag the model."""
     if ref.kind == "hierarchy_level":
-        column = index.hierarchies.get(ref.table, {}).get(ref.hierarchy or "", {}).get(ref.name)
+        if ref.hierarchy is None:
+            # A variation-based ref: report_definition.py already resolved it straight
+            # to the physical (table, column) the auto-date hierarchy was built on --
+            # just check that column genuinely exists.
+            key = (ref.table, ref.name)
+            return ("column", key) if key in index.all_columns else None
+        column = index.hierarchies.get(ref.table, {}).get(ref.hierarchy, {}).get(ref.name)
         return ("column", (ref.table, column)) if column is not None else None
     key = (ref.table, ref.name)
     if key in index.measure_index:
@@ -161,15 +198,27 @@ class _DirectUsageResult:
 
 
 def _measure_closure(
-    start: ColumnKey, measure_deps: dict[ColumnKey, DaxReferences], seen: set[ColumnKey], dax_unresolved: set[str]
+    start: ColumnKey,
+    measure_deps: dict[ColumnKey, DaxReferences],
+    all_measures_seen: set[ColumnKey],
+    dax_unresolved: set[str],
 ) -> set[ColumnKey]:
+    """Returns the full transitive column closure reached from `start`. Cycle-guarded
+    with a *local* seen set, deliberately not `all_measures_seen`: that set is shared
+    across every ref in a report purely to count distinct measures reached overall
+    (`measures_transitive`), and gating traversal on it here would make a call's
+    returned columns depend on which other ref happened to explore the same measure
+    subgraph first -- correct for the report-wide `used` set (a union anyway) but
+    silently incomplete for any one visual's own per-visual attribution."""
     columns: set[ColumnKey] = set()
+    local_seen: set[ColumnKey] = set()
     stack = [start]
     while stack:
         key = stack.pop()
-        if key in seen:
+        if key in local_seen:
             continue
-        seen.add(key)
+        local_seen.add(key)
+        all_measures_seen.add(key)
         deps = measure_deps.get(key)
         if deps is None:
             continue
@@ -197,6 +246,16 @@ def _collect_direct_usage(
             result.used.add(key)
             if visual_key is not None:
                 result.per_visual.setdefault(visual_key, []).append(ColumnUse(key[0], key[1]))
+            if ref.kind == "hierarchy_level" and ref.hierarchy is None and ref.variation_level is not None:
+                # A variation ref resolves to its business column above (needed for
+                # used_5); the internal auto-date table's own same-named column is a
+                # second, separate physical touch for chart lineage only -- it's never
+                # a business column, so it can't affect used_5/unused_5 either way.
+                auto_date_key = index.variation_levels.get(key, {}).get(ref.variation_level)
+                if auto_date_key is not None:
+                    result.used.add(auto_date_key)
+                    if visual_key is not None:
+                        result.per_visual[visual_key].append(ColumnUse(auto_date_key[0], auto_date_key[1]))
         else:
             counters["direct_measure_refs"] += 1
             reached = _measure_closure(key, index.measure_deps, result.measures_seen, result.dax_unresolved)

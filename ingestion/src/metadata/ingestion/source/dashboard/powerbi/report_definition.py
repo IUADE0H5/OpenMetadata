@@ -61,8 +61,17 @@ class FieldRef:
     """A single reference to a model column, measure or hierarchy level.
 
     `name` is the column or measure name depending on `kind`; `hierarchy` is only set
-    when `kind == "hierarchy_level"`. `context` records where the reference came from:
-    one of projection|sort|objects|filter@report|filter@page|filter@visual|tooltip.
+    when `kind == "hierarchy_level"` for a *real* named model hierarchy. `context`
+    records where the reference came from: one of
+    projection|sort|objects|filter@report|filter@page|filter@visual|tooltip.
+
+    A `kind == "hierarchy_level"` ref with `hierarchy` left as None (never true for a
+    real hierarchy) instead came from a column's auto-date *variation* (drilling
+    Year/Quarter/.../Day on a date column): `table`/`name` are already the resolved
+    physical business column, and `variation_level` carries the specific level drilled
+    (e.g. "Year") -- needed only to additionally resolve the internal auto-date table's
+    own same-named column for chart lineage, since report_definition.py has no model
+    access to look that table up itself.
     """
 
     kind: FieldKind
@@ -70,6 +79,7 @@ class FieldRef:
     name: str
     hierarchy: str | None = None
     context: str = "projection"
+    variation_level: str | None = None
 
 
 @dataclass
@@ -133,20 +143,32 @@ def _walk_expression(node: Any, aliases: dict[str, str], context: str, out: list
     """Recursively collects FieldRefs from a query-expression JSON tree. Continues
     recursing into every value regardless of whether it matched a known kind -- an
     Aggregation, for instance, is never special-cased; recursion reaches the Column it
-    wraps naturally, exactly as the reference prototype behaves."""
+    wraps naturally, exactly as the reference prototype behaves.
+
+    A nested sub-query (its own `{"From": [...], ...}`, the same shape a TopN filter or
+    a top-level prototypeQuery has) can appear anywhere -- notably inside `objects`
+    conditional-formatting/filter-chip bindings, which carry their own local `From` a
+    slicer's outer aliases know nothing about. Any dict introducing a `From` list opens
+    a fresh alias scope, layered onto (never replacing) whatever was already resolvable,
+    for everything nested under it.
+    """
     if isinstance(node, dict):
+        local_aliases = aliases
+        nested_from = node.get("From")
+        if isinstance(nested_from, list) and nested_from:
+            local_aliases = {**aliases, **_aliases_of(node)}
         for key, value in node.items():
             if key in ("Column", "PropertyVariationSource") and isinstance(value, dict) and "Property" in value:
-                table = _alias_entity(value.get("Expression"), aliases)
+                table = _alias_entity(value.get("Expression"), local_aliases)
                 if table is not None:
                     out.append(FieldRef("column", table, value["Property"], context=context))
             elif key == "Measure" and isinstance(value, dict) and "Property" in value:
-                table = _alias_entity(value.get("Expression"), aliases)
+                table = _alias_entity(value.get("Expression"), local_aliases)
                 if table is not None:
                     out.append(FieldRef("measure", table, value["Property"], context=context))
             elif key == "HierarchyLevel" and isinstance(value, dict):
-                _handle_hierarchy_level(value, aliases, context, out)
-            _walk_expression(value, aliases, context, out)
+                _handle_hierarchy_level(value, local_aliases, context, out)
+            _walk_expression(value, local_aliases, context, out)
     elif isinstance(node, list):
         for item in node:
             _walk_expression(item, aliases, context, out)
@@ -154,9 +176,24 @@ def _walk_expression(node: Any, aliases: dict[str, str], context: str, out: list
 
 def _handle_hierarchy_level(node: dict[str, Any], aliases: dict[str, str], context: str, out: list[FieldRef]) -> None:
     hierarchy = (node.get("Expression") or {}).get("Hierarchy") or {}
-    # A hierarchy defined via an auto-date variation resolves differently (the
-    # "Hierarchy" name is synthetic); skip rather than guess at a wrong table/level.
-    if "PropertyVariationSource" in (hierarchy.get("Expression") or {}):
+    variation = (hierarchy.get("Expression") or {}).get("PropertyVariationSource")
+    if variation is not None:
+        # A hierarchy reached through a column's auto-date variation (drilling
+        # Year/Quarter/.../Day on a date column) isn't really "table.hierarchy.level" --
+        # the "Hierarchy" name here is the synthetic auto-date table's own hierarchy.
+        # What the report actually used is the business date column the variation is
+        # defined on; every level drilled from it traces back to that one column, so
+        # `hierarchy=None` is left unset here (never true for a real named hierarchy) to
+        # signal a variation ref -- column_usage.py resolves it directly, not through
+        # the model's hierarchy/level lookup. The drilled level itself (Year/Month/...)
+        # is kept in `variation_level` so column_usage.py can additionally resolve the
+        # internal auto-date table's own same-named column for chart lineage -- that
+        # table's name isn't discoverable here, only from the model's TMDL variation.
+        table = _alias_entity(variation.get("Expression"), aliases)
+        column = variation.get("Property")
+        level = node.get("Level")
+        if table is not None and column is not None:
+            out.append(FieldRef("hierarchy_level", table, column, context=context, variation_level=level))
         return
     table = _alias_entity(hierarchy.get("Expression"), aliases)
     hierarchy_name = hierarchy.get("Hierarchy")

@@ -32,6 +32,19 @@ _MEMBER_HEADER_RE = re.compile(
 )
 _LEVEL_HEADER_RE = re.compile(r"^\t\tlevel\s+((?:'(?:[^']|'')*')|[^\s=]+)\s*$")
 _RELATIONSHIP_HEADER_RE = re.compile(r"^relationship\s+")
+_VARIATION_HEADER_RE = re.compile(r"^\t\tvariation\s+((?:'(?:[^']|'')*')|[^\s=]+)\s*$")
+
+
+@dataclass
+class TmdlVariation:
+    """A column's auto-date variation: the link between a business date column and the
+    internal auto-date table Power BI generates a default drill-down hierarchy from."""
+
+    name: str
+    is_default: bool = False
+    relationship: str | None = None
+    # (auto_date_table, hierarchy_name), parsed from `defaultHierarchy: T.'Hierarchy'`.
+    default_hierarchy: tuple[str, str] | None = None
 
 
 @dataclass
@@ -43,6 +56,7 @@ class TmdlColumn:
     expression: str | None = None
     sort_by_column: str | None = None
     is_hidden: bool = False
+    variations: list[TmdlVariation] = field(default_factory=list)
 
 
 @dataclass
@@ -221,6 +235,11 @@ def _read_column_properties(lines: list[str], i: int, column: TmdlColumn) -> int
         if lines[i].strip() == "":
             i += 1
             continue
+        variation_header = _VARIATION_HEADER_RE.match(lines[i])
+        if variation_header:
+            variation, i = _read_variation(lines, i, variation_header)
+            column.variations.append(variation)
+            continue
         stripped = lines[i].strip()
         if stripped == "isHidden":
             column.is_hidden = True
@@ -234,6 +253,27 @@ def _read_column_properties(lines: list[str], i: int, column: TmdlColumn) -> int
             break
         i += 1
     return i
+
+
+def _read_variation(lines: list[str], i: int, header: re.Match[str]) -> tuple[TmdlVariation, int]:
+    variation = TmdlVariation(name=_unquote(header.group(1)))
+    i += 1
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() == "":
+            i += 1
+            continue
+        if _indent(line) < 3:
+            break
+        stripped = line.strip()
+        if stripped == "isDefault":
+            variation.is_default = True
+        elif stripped.startswith("relationship:"):
+            variation.relationship = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("defaultHierarchy:"):
+            variation.default_hierarchy = _split_qualified_ref(stripped.split(":", 1)[1].strip())
+        i += 1
+    return variation, i
 
 
 def _read_hierarchy_levels(lines: list[str], i: int, hierarchy: TmdlHierarchy) -> int:
