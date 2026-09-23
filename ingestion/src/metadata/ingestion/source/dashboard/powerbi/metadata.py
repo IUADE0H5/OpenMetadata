@@ -206,12 +206,36 @@ class PowerbiSource(DashboardServiceSource):
         self.pagination_entity_per_page = min(100, self.service_connection.pagination_entity_per_page)
         self.datamodel_file_mappings = []
         self.state = WorkspaceState()
-        self._metrics = Counter()
+        # Every declared METRIC_* key starts at 0, not merely absent. A bare
+        # Counter() only emits a key once it's first incremented, so a metric
+        # that is legitimately always 0 for a run (e.g. no unresolved owners)
+        # is indistinguishable on the far side of a Prometheus scrape from
+        # "this code path never ran" - exactly the failure mode that hid a
+        # real bug for a full run. Seeding every key here, from the class's
+        # own METRIC_* attributes rather than a hand-maintained list, makes
+        # that impossible to forget when a metric is added.
+        self._metrics = Counter(dict.fromkeys(self._all_metric_keys(), 0))
         self._counted_source_references: set = set()
         self._unresolved_logged_count = 0
 
+    @classmethod
+    def _all_metric_keys(cls) -> List[str]:  # noqa: UP006
+        """Every ``METRIC_*`` class attribute's value, walking the full MRO so a
+        subclass's own metrics are included too - the single source of truth
+        for ``metric_values()``'s full key set.
+        """
+        return [
+            name
+            for name in (getattr(cls, attr) for attr in dir(cls) if attr.startswith("METRIC_"))
+            if isinstance(name, str)
+        ]
+
     def metric_values(self) -> dict[str, int]:
         """Cheap, side-effect free snapshot of dataflow/M-parsing volume counters.
+
+        Always returns the full, stable set of ``METRIC_*`` keys (each starts
+        at 0 in ``__init__``) - never a partial dict missing a key that just
+        happened not to be incremented this run.
 
         A subclass's metrics reporter picks this up automatically after
         ingestion; see the ``METRIC_*`` class attributes for the keys.

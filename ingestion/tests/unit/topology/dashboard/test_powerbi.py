@@ -3865,3 +3865,43 @@ class PowerBIUnitTest(TestCase):
         assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
         assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 1
         assert metrics[PowerbiSource.METRIC_ASSETS_WITHOUT_OWNER] == 1
+
+    @pytest.mark.order(94)
+    def test_metric_values_always_has_every_declared_key_at_zero(self):
+        """A freshly constructed source's `metric_values()` must contain every
+        declared `METRIC_*` key at 0, not merely the keys that happened to be
+        incremented. A bare `Counter()` only emits a key once it's first
+        incremented, making "this metric is legitimately 0" indistinguishable
+        from "this code path never ran" on the far side of a Prometheus
+        scrape - the failure mode that hid a real owners bug for a full run.
+        """
+        metrics = self.powerbi.metric_values()
+        expected_keys = self.powerbi._all_metric_keys()
+        # Guard against the guard: if this list is empty, the assertion below
+        # would pass vacuously.
+        assert len(expected_keys) > 10
+        for key in expected_keys:
+            assert key in metrics, f"metric_values() is missing declared key {key!r}"
+            assert metrics[key] == 0
+
+    @pytest.mark.order(95)
+    def test_metric_values_incrementing_one_key_leaves_others_at_zero(self):
+        """Incrementing one counter must not cause the others to vanish from
+        `metric_values()` - they stay present at 0, not absent.
+        """
+        self.powerbi._metrics.clear()
+        # clear() on a Counter drops every key back to unset; reseed exactly
+        # as __init__ does, so this test doesn't depend on __init__'s
+        # internals beyond the documented `_all_metric_keys()` seam.
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+
+        self.powerbi._metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_DATAFLOWS] += 1
+
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_DATAFLOWS] == 1
+        untouched_keys = [
+            k for k in self.powerbi._all_metric_keys() if k != PowerbiSource.METRIC_OWNERS_ASSIGNED_DATAFLOWS
+        ]
+        assert len(untouched_keys) > 5
+        for key in untouched_keys:
+            assert metrics[key] == 0
