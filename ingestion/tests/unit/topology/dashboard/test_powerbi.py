@@ -19,6 +19,7 @@ from metadata.generated.schema.type.filterPattern import FilterPattern
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.models.barrier import Barrier
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
+from metadata.ingestion.source.dashboard.powerbi.constants import is_write_dataset_right
 from metadata.ingestion.source.dashboard.powerbi.metadata import PowerbiSource
 from metadata.ingestion.source.dashboard.powerbi.models import (
     Dataflow,
@@ -3683,3 +3684,184 @@ class PowerBIUnitTest(TestCase):
         assert result is not None
         assert len(result.root) == 2
         mock_non_admin.assert_not_called()
+
+    @pytest.mark.order(89)
+    def test_is_write_dataset_right_is_a_prefix_predicate_not_an_exact_set(self):
+        """Microsoft's documented dataset-right enum (Read, ReadWrite,
+        ReadReshare, ReadWriteReshare, Owner) is incomplete - a live probe of
+        a production workspace's dataset ACLs returned `Explore`-suffixed
+        variants beyond it. `is_write_dataset_right` must classify those by
+        capability (does it start with `ReadWrite`, or equal `Owner`?), not
+        by exact membership in the documented set.
+        """
+        # Observed live, 231/291 ACL rows in the probed workspace: write-level.
+        assert is_write_dataset_right("ReadWriteReshareExplore") is True
+        # Documented values.
+        assert is_write_dataset_right("ReadWrite") is True
+        assert is_write_dataset_right("ReadWriteReshare") is True
+        assert is_write_dataset_right("Owner") is True
+        # Read-only, including the observed `Explore` suffix on a read right
+        # (1/291 rows) - must NOT be treated as write just because it isn't
+        # in a fixed "read" list.
+        assert is_write_dataset_right("Read") is False
+        assert is_write_dataset_right("ReadExplore") is False
+        assert is_write_dataset_right("ReadReshare") is False
+        # Absent/unknown right: never a false positive.
+        assert is_write_dataset_right(None) is False
+        assert is_write_dataset_right("") is False
+        assert is_write_dataset_right("SomethingUnexpected") is False
+
+    @pytest.mark.order(90)
+    def test_non_admin_datamodel_owner_from_live_observed_explore_suffix_right(self):
+        """End-to-end (not just the predicate unit test above): a dataset-ACL
+        principal with the live-observed `ReadWriteReshareExplore` right - not
+        in Microsoft's documented enum - must still become an owner; a
+        principal with the also-observed `ReadExplore` (read-only) must not.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="ada@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadWriteReshareExplore",
+                    )
+                ),
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="reader@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadExplore",
+                    )
+                ),
+            ],
+        )
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(dataset)
+
+        assert result is not None
+        assert len(result.root) == 1
+        mock_get_ref.assert_called_once_with("ada@example.com")
+
+    @pytest.mark.order(91)
+    def test_non_admin_dataset_acl_group_with_no_usable_name_is_unresolved_not_crashed(self):
+        """A `Group` principal normalized from the dataset-ACL endpoint (which
+        carries no email or display name at all, only `identifier` and the
+        right - see `PowerBIPrincipal.from_dataset_user`) must resolve to
+        `None` and be counted unresolved, never crash and never be guessed at
+        from its opaque `identifier` object id.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        dataset_acl_group = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="group-object-id",
+                principalType="Group",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+        assert dataset_acl_group.email is None
+        assert dataset_acl_group.display_name is None
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[dataset_acl_group],
+        )
+
+        with (
+            patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref_email,
+            patch.object(self.powerbi.metadata, "get_reference_by_name") as mock_get_ref_name,
+        ):
+            result = self.powerbi.get_owner_ref(dataset)
+
+        assert result is None
+        mock_get_ref_email.assert_not_called()
+        mock_get_ref_name.assert_not_called()
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_UNRESOLVED] == 1
+        assert metrics[PowerbiSource.METRIC_ASSETS_WITHOUT_OWNER] == 1
+
+    @pytest.mark.order(92)
+    def test_non_admin_workspace_role_write_check_is_exact_match(self):
+        """Unlike the dataset right, the workspace-role write check is a plain
+        exact-match set (`POWERBI_WRITE_WORKSPACE_ROLES`) - verified live: a
+        production workspace's `GET .../users` rows returned only `Admin`,
+        `Member` and `Viewer`, all handled correctly by exact match.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[
+                PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_CONTRIBUTOR),  # Contributor
+                PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_VIEWER),  # Viewer
+            ],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is not None
+        assert len(result.root) == 1
+
+    @pytest.mark.order(93)
+    def test_non_admin_dataset_acl_app_excluded_by_app_rule_not_by_right(self):
+        """An `App` principal on a dataset's ACL holding a write-level right
+        (live-observed: `App|ReadWriteReshareExplore`, 21 rows in the probed
+        workspace) must still never become an owner - excluded by the `App`
+        principal-type rule specifically, not because its right happens to
+        fail the write-capability check. Paired with a `Group` holding the
+        observed read-only `ReadExplore` right, also excluded (by right).
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="app-object-id",
+                        principalType="App",
+                        datasetUserAccessRight="ReadWriteReshareExplore",
+                    )
+                ),
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="group-object-id",
+                        principalType="Group",
+                        datasetUserAccessRight="ReadExplore",
+                    )
+                ),
+            ],
+        )
+
+        with (
+            patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref_email,
+            patch.object(self.powerbi.metadata, "get_reference_by_name") as mock_get_ref_name,
+        ):
+            result = self.powerbi.get_owner_ref(dataset)
+
+        assert result is None
+        mock_get_ref_email.assert_not_called()
+        mock_get_ref_name.assert_not_called()
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 1
+        assert metrics[PowerbiSource.METRIC_ASSETS_WITHOUT_OWNER] == 1

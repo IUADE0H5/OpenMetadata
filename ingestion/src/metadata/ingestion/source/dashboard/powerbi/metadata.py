@@ -81,13 +81,13 @@ from metadata.ingestion.source.dashboard.powerbi.constants import (
     POWERBI_APP_PRINCIPAL_TYPE,
     POWERBI_GROUP_PRINCIPAL_TYPE,
     POWERBI_USER_PRINCIPAL_TYPE,
-    POWERBI_WRITE_DATASET_RIGHTS,
     POWERBI_WRITE_WORKSPACE_ROLES,
     RDL_REPORT_FORMAT,
     RDL_REPORTS_PREFIX,
     SNOWFLAKE_QUERY_EXPRESSION_KW,
     SQL_DATABASE_EXPRESSION_KW,
     SQL_LINE_COMMENT_PATTERN,
+    is_write_dataset_right,
 )
 from metadata.ingestion.source.dashboard.powerbi.databricks_parser import (
     parse_databricks_native_query_source,
@@ -2699,6 +2699,10 @@ class PowerbiSource(DashboardServiceSource):
                     is_owner=(principal.principal_type == POWERBI_GROUP_PRINCIPAL_TYPE),
                 )
             else:
+                # A Group normalized from the dataset-ACL endpoint has neither
+                # (that endpoint carries no email or display name at all - see
+                # `PowerBIPrincipal.from_dataset_user`) - counted unresolved,
+                # never guessed at from `identifier` (an opaque object id).
                 return None
         except Exception as err:
             logger.debug(f"Could not resolve owner principal {principal.identifier}: {err}")
@@ -2710,7 +2714,7 @@ class PowerbiSource(DashboardServiceSource):
     def _resolve_write_principals(
         self,
         principals: Iterable[PowerBIPrincipal],
-        write_rights: frozenset,
+        is_write_right: Callable[[Optional[str]], bool],  # noqa: UP045
     ) -> List[EntityReference]:  # noqa: UP006
         """Resolve every distinct write-capable principal in `principals` to an
         owner reference via `resolve_owner_principal` (the seam subclasses use
@@ -2720,6 +2724,11 @@ class PowerbiSource(DashboardServiceSource):
         De-duplicates by (principal_type, identifier) so a principal reached
         from two sources (e.g. a workspace member who is also on a dataset's
         ACL) is only resolved once.
+
+        `is_write_right` decides write-capability from `principal.access_right`
+        (a workspace role or a dataset right, depending on where the principal
+        came from) - a predicate, not a fixed set, because a dataset right is
+        not exact-matched (see `is_write_dataset_right`'s docstring).
         """
         owner_refs: List[EntityReference] = []  # noqa: UP006
         seen: set = set()
@@ -2731,7 +2740,7 @@ class PowerbiSource(DashboardServiceSource):
             if principal.principal_type == POWERBI_APP_PRINCIPAL_TYPE:
                 self._metrics[self.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] += 1
                 continue
-            if not principal.access_right or principal.access_right not in write_rights:
+            if not is_write_right(principal.access_right):
                 self._metrics[self.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] += 1
                 continue
             try:
@@ -2749,7 +2758,7 @@ class PowerbiSource(DashboardServiceSource):
         self,
         configured_by: Optional[str],  # noqa: UP045
         principals: List[PowerBIPrincipal],  # noqa: UP006
-        write_rights: frozenset,
+        is_write_right: Callable[[Optional[str]], bool],  # noqa: UP045
     ) -> List[EntityReference]:  # noqa: UP006
         """`configured_by` (the non-admin equivalent of admin mode's
         `modifiedBy`) plus every write-capable principal, resolved to distinct
@@ -2783,7 +2792,7 @@ class PowerbiSource(DashboardServiceSource):
             except Exception as err:
                 logger.debug(f"Could not resolve configuredBy owner {configured_by}: {err}")
 
-        for owner_ref in self._resolve_write_principals(principals, write_rights):
+        for owner_ref in self._resolve_write_principals(principals, is_write_right):
             _add(owner_ref)
         return owner_refs
 
@@ -2792,18 +2801,24 @@ class PowerbiSource(DashboardServiceSource):
         return self._collect_non_admin_owners(
             configured_by=dataflow.configuredBy,
             principals=self.state.workspace_principals,
-            write_rights=POWERBI_WRITE_WORKSPACE_ROLES,
+            is_write_right=lambda right: right in POWERBI_WRITE_WORKSPACE_ROLES,
         )
 
     def _compute_datamodel_owner_refs(self, dataset: Dataset) -> List[EntityReference]:  # noqa: UP006
         """Semantic model (dataset) owners = `configuredBy` + workspace members with
         a write-capable role + dataset-ACL principals with a write-level right.
+
+        A principal's `access_right` is checked against whichever domain it
+        actually came from (workspace role vs dataset right) via a single
+        combined predicate - the two domains' values never overlap, so this
+        stays correct for a merged principals list without needing to track
+        each principal's source separately.
         """
         principals = list(self.state.workspace_principals) + list(dataset.dataset_principals or [])
         return self._collect_non_admin_owners(
             configured_by=dataset.configuredBy,
             principals=principals,
-            write_rights=POWERBI_WRITE_WORKSPACE_ROLES | POWERBI_WRITE_DATASET_RIGHTS,
+            is_write_right=lambda right: right in POWERBI_WRITE_WORKSPACE_ROLES or is_write_dataset_right(right),
         )
 
     def _compute_report_owner_refs(self, report: PowerBIReport) -> List[EntityReference]:  # noqa: UP006

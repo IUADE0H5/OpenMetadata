@@ -13,6 +13,8 @@
 Constants used by PowerBI metadata ingestion
 """
 
+from typing import Optional
+
 OWNER_ACCESS_RIGHTS_KEYWORDS = ["owner", "write", "admin"]
 
 # Power BI principal type strings, as returned verbatim by the non-admin
@@ -25,14 +27,39 @@ POWERBI_APP_PRINCIPAL_TYPE = "App"
 # only Power BI workspace role that cannot; Contributor is the lowest role
 # that can - that is a property of the Power BI permission model itself, not
 # of one deployment's policy, so this mapping is generic rather than a
-# per-tenant choice.
+# per-tenant choice. Exact-match set is safe here: verified live against a
+# production workspace's `GET .../users` rows (Admin, Member, Viewer seen;
+# Contributor per Microsoft's docs, not observed but same permission tier).
 # https://learn.microsoft.com/en-us/power-bi/collaborate-share/service-roles-new-workspaces
 POWERBI_WRITE_WORKSPACE_ROLES = frozenset({"Admin", "Member", "Contributor"})
 
 # Dataset-level access rights (from the non-admin dataset-users endpoint)
-# that grant write access to the dataset, as opposed to the read-only
-# `Read` right. Same generic reasoning as POWERBI_WRITE_WORKSPACE_ROLES.
-POWERBI_WRITE_DATASET_RIGHTS = frozenset({"ReadWrite", "ReadWriteReshare", "Owner"})
+# that grant write access to the dataset, as opposed to a read-only right.
+# NOT an exact-match set, deliberately: Microsoft's documented enum (Read,
+# ReadWrite, ReadReshare, ReadWriteReshare, Owner) is incomplete. A live
+# probe of a production workspace's dataset ACLs (21 datasets, 291 ACL rows)
+# returned suffixed variants beyond it - ReadWriteReshareExplore (231 rows),
+# ReadExplore (1 row) - alongside plain Read (59 rows); an exact-match set
+# against the documented enum silently drops every one of the 231 write
+# principals with the Explore suffix. Written as a capability predicate
+# instead: write-level iff the right starts with "ReadWrite" or equals
+# "Owner" exactly; anything else that starts with "Read" (Read, ReadExplore,
+# ReadReshare, ...) is read-only. Do NOT "tidy" this back into an exact set -
+# it will re-break the moment Microsoft adds another suffix.
+POWERBI_WRITE_DATASET_RIGHT_PREFIX = "ReadWrite"
+POWERBI_OWNER_DATASET_RIGHT = "Owner"
+
+
+def is_write_dataset_right(access_right: Optional[str]) -> bool:  # noqa: UP045
+    """True iff a non-admin dataset-ACL `datasetUserAccessRight` grants write access.
+
+    See the comment above `POWERBI_WRITE_DATASET_RIGHT_PREFIX` for why this is
+    a prefix predicate and not an exact-match set.
+    """
+    if not access_right:
+        return False
+    return access_right.startswith(POWERBI_WRITE_DATASET_RIGHT_PREFIX) or access_right == POWERBI_OWNER_DATASET_RIGHT
+
 
 SNOWFLAKE_QUERY_EXPRESSION_KW = "Value.NativeQuery(Snowflake.Databases("
 DATABRICKS_QUERY_EXPRESSION_KW = "Value.NativeQuery(Databricks.Catalogs("
