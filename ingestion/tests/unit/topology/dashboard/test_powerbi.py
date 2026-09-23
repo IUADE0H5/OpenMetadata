@@ -3905,3 +3905,167 @@ class PowerBIUnitTest(TestCase):
         assert len(untouched_keys) > 5
         for key in untouched_keys:
             assert metrics[key] == 0
+
+    # -- Owner-computation memoisation ------------------------------------
+
+    @pytest.mark.order(96)
+    def test_non_admin_dataset_owner_principals_counted_once_across_dependents(self):
+        """A dataset reached directly, plus via three dependent reports, must
+        only run principal resolution once - `owner_principals_skipped_viewer`
+        counts the dataset's Viewer principal once, not four times, and
+        `owners_assigned_datamodels`/`owners_assigned_reports` still count
+        each top-level asset exactly once (memoisation must not suppress
+        those).
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="ada@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadWrite",
+                    )
+                ),
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="reader@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="Read",
+                    )
+                ),
+            ],
+        )
+        report_a = PowerBIReport(id="report-a", name="Report A", datasetId="dataset-1")
+        report_b = PowerBIReport(id="report-b", name="Report B", datasetId="dataset-1")
+        report_c = PowerBIReport(id="report-c", name="Report C", datasetId="dataset-1")
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            datasets=[dataset],
+            reports=[report_a, report_b, report_c],
+        )
+        self.powerbi.state.enter(workspace)
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            dataset_result = self.powerbi.get_owner_ref(dataset)
+            report_a_result = self.powerbi.get_owner_ref(report_a)
+            report_b_result = self.powerbi.get_owner_ref(report_b)
+            report_c_result = self.powerbi.get_owner_ref(report_c)
+
+        for result in (dataset_result, report_a_result, report_b_result, report_c_result):
+            assert result is not None
+            assert len(result.root) == 1
+            assert result.root[0].name == "Ada"
+
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 1
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_DATAMODELS] == 1
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_REPORTS] == 3
+        # get_reference_by_email is the observable stand-in for an OMD lookup:
+        # one call for the dataset's own resolution, never re-run for the
+        # three dependents.
+        assert mock_get_ref.call_count == 1
+
+    @pytest.mark.order(97)
+    def test_resolve_owner_principal_invoked_once_per_asset_not_per_dependent(self):
+        """`resolve_owner_principal` is the seam every OMD lookup goes
+        through - patch it directly (rather than `get_reference_by_email`) to
+        prove the memoisation boundary is at the right layer: one call for
+        the dataset's write-capable principal, reused by three reports and a
+        dashboard behind them, not four or five.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="ada@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadWrite",
+                    )
+                )
+            ],
+        )
+        report_a = PowerBIReport(id="report-a", name="Report A", datasetId="dataset-1")
+        report_b = PowerBIReport(id="report-b", name="Report B", datasetId="dataset-1")
+        dashboard = PowerBIDashboard(
+            id="dashboard-1",
+            displayName="Exec Dashboard",
+            tiles=[Tile(id="tile-1", reportId="report-a")],
+        )
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            datasets=[dataset],
+            reports=[report_a, report_b],
+        )
+        self.powerbi.state.enter(workspace)
+        provisioned_ref = EntityReference(id=uuid.uuid4(), name="Ada", type="user")
+
+        with patch.object(self.powerbi, "resolve_owner_principal", return_value=provisioned_ref) as mock_resolve:
+            self.powerbi.get_owner_ref(dataset)
+            self.powerbi.get_owner_ref(report_a)
+            self.powerbi.get_owner_ref(report_b)
+            self.powerbi.get_owner_ref(dashboard)
+
+        assert mock_resolve.call_count == 1
+
+    @pytest.mark.order(98)
+    def test_owner_refs_cache_cleared_between_workspaces(self):
+        """A dataset id reused across workspaces (unusual, but not impossible
+        for a stubbed/misbehaving tenant) must not let workspace B inherit
+        workspace A's cached owners - `WorkspaceState.exit()` must drop the
+        owner-refs cache alongside every other per-workspace cache.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+
+        dataset_a = Dataset(
+            id="dataset-1",
+            name="Workspace A Dataset",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="ada@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadWrite",
+                    )
+                )
+            ],
+        )
+        workspace_a = Group(id="ws-a", name="Workspace A", datasets=[dataset_a])
+        self.powerbi.state.enter(workspace_a)
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result_a = self.powerbi.get_owner_ref(dataset_a)
+        assert result_a is not None
+        assert result_a.root[0].name == "Ada"
+
+        self.powerbi.state.exit()
+
+        # Same dataset id, different (and this time ownerless) workspace.
+        dataset_b = Dataset(id="dataset-1", name="Workspace B Dataset", dataset_principals=[])
+        workspace_b = Group(id="ws-b", name="Workspace B", datasets=[dataset_b])
+        self.powerbi.state.enter(workspace_b)
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            result_b = self.powerbi.get_owner_ref(dataset_b)
+
+        assert result_b is None
+        mock_get_ref.assert_not_called()

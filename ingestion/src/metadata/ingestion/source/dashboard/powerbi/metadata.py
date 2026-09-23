@@ -174,15 +174,24 @@ class PowerbiSource(DashboardServiceSource):
     # Non-admin owner resolution (`_get_owner_ref_non_admin`) only - the admin
     # scan's owner path (`_get_owner_ref_admin`) isn't metered, it always had
     # the entity's `users` inline.
+    # `owners_assigned_*` is always per asset: a report that inherits its
+    # owners from a cached dataset computation still gets its own increment
+    # here (`_get_owner_ref_non_admin` bumps it once per top-level
+    # `get_owner_ref` call, independent of whether the underlying
+    # `_compute_*_owner_refs` call was a cache hit).
     METRIC_OWNERS_ASSIGNED_DATAMODELS = "owners_assigned_datamodels"
     METRIC_OWNERS_ASSIGNED_DATAFLOWS = "owners_assigned_dataflows"
     METRIC_OWNERS_ASSIGNED_REPORTS = "owners_assigned_reports"
     METRIC_OWNERS_ASSIGNED_DASHBOARDS = "owners_assigned_dashboards"
-    # Per-principal-evaluation counters: how many times a principal was seen
-    # while resolving one asset's owners, not how many distinct principals
-    # exist - the same tenant-wide Viewer is counted once per asset it is
-    # evaluated against (a dataset and its dataflow in the same workspace
-    # each count it separately).
+    # Per-(owning asset, principal) counters, not per dependent that reaches
+    # that asset: `_compute_datamodel_owner_refs`/`_compute_dataflow_owner_refs`
+    # memoise the owner set per dataset/dataflow id in `WorkspaceState`
+    # (cleared per workspace), so a dataset with three dependent reports
+    # counts its principals once here, not three times - a report/dashboard
+    # inheriting a cached owner set never re-enters principal resolution.
+    # A future counter that is instead meant to count once per dependent
+    # traversal (rather than once per owning asset) should carry an
+    # `_occurrences` suffix to say so, not this shape.
     METRIC_OWNER_PRINCIPALS_SKIPPED_APP = "owner_principals_skipped_app"
     METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER = "owner_principals_skipped_viewer"
     METRIC_OWNER_PRINCIPALS_UNRESOLVED = "owner_principals_unresolved"
@@ -2821,12 +2830,25 @@ class PowerbiSource(DashboardServiceSource):
         return owner_refs
 
     def _compute_dataflow_owner_refs(self, dataflow: Dataflow) -> List[EntityReference]:  # noqa: UP006
-        """Dataflow owners = `configuredBy` + workspace members with a write-capable role."""
-        return self._collect_non_admin_owners(
+        """Dataflow owners = `configuredBy` + workspace members with a write-capable role.
+
+        Memoised per dataflow id for the current workspace (`WorkspaceState`):
+        a dataflow's owner set is looked up here at most once per run, however
+        many times it is reached, since nothing currently re-derives a
+        dataflow's owners from a dependent asset the way a dataset's are.
+        Kept memoised anyway for the same reason as the dataset path below -
+        cheap, and future-proof against a dependent being added later.
+        """
+        cached = self.state.get_dataflow_owner_refs(dataflow.id)
+        if cached is not None:
+            return list(cached)
+        owner_refs = self._collect_non_admin_owners(
             configured_by=dataflow.configuredBy,
             principals=self.state.workspace_principals,
             is_write_right=lambda right: right in POWERBI_WRITE_WORKSPACE_ROLES,
         )
+        self.state.cache_dataflow_owner_refs(dataflow.id, owner_refs)
+        return owner_refs
 
     def _compute_datamodel_owner_refs(self, dataset: Dataset) -> List[EntityReference]:  # noqa: UP006
         """Semantic model (dataset) owners = `configuredBy` + workspace members with
@@ -2837,13 +2859,26 @@ class PowerbiSource(DashboardServiceSource):
         combined predicate - the two domains' values never overlap, so this
         stays correct for a merged principals list without needing to track
         each principal's source separately.
+
+        Memoised per dataset id for the current workspace: every report that
+        points at this dataset (`_compute_report_owner_refs`), and every
+        dashboard tile behind one of those reports
+        (`_compute_dashboard_owner_refs`), reaches this same dataset - without
+        memoisation each of those recomputes the full principal resolution,
+        including the `resolve_owner_principal` OpenMetadata lookups, once per
+        dependent instead of once per dataset.
         """
+        cached = self.state.get_dataset_owner_refs(dataset.id)
+        if cached is not None:
+            return list(cached)
         principals = list(self.state.workspace_principals) + list(dataset.dataset_principals or [])
-        return self._collect_non_admin_owners(
+        owner_refs = self._collect_non_admin_owners(
             configured_by=dataset.configuredBy,
             principals=principals,
             is_write_right=lambda right: right in POWERBI_WRITE_WORKSPACE_ROLES or is_write_dataset_right(right),
         )
+        self.state.cache_dataset_owner_refs(dataset.id, owner_refs)
+        return owner_refs
 
     def _compute_report_owner_refs(self, report: PowerBIReport) -> List[EntityReference]:  # noqa: UP006
         """Reports have no owner endpoint in non-admin mode (404) - they inherit

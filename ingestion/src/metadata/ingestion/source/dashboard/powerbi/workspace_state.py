@@ -17,6 +17,7 @@ Lifecycle contract:
     around the workspace iteration).
 """
 
+from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.ingestion.source.dashboard.powerbi.models import (
     Dataflow,
     DataflowExportResponse,
@@ -44,6 +45,11 @@ class WorkspaceState:
     tenant; only the id is required, not the report payload).
     """
 
+    # Bounded per CLAUDE.md's cache rule, even though these are released on
+    # every `exit()` - a pathological single workspace should still degrade
+    # to recomputing rather than grow unbounded within one `enter()` scope.
+    _MAX_CACHED_OWNER_REFS = 5_000
+
     def __init__(self) -> None:
         self._current: Group | None = None
         self._datasets_by_id: dict[str, Dataset] = {}
@@ -54,6 +60,8 @@ class WorkspaceState:
         self._filtered_datamodels: list[DataModelLike] | None = None
         self._dashboard_charts: dict[str, list[str]] = {}
         self._workspace_principals: list[PowerBIPrincipal] = []
+        self._dataset_owner_refs: dict[str, list[EntityReference]] = {}
+        self._dataflow_owner_refs: dict[str, list[EntityReference]] = {}
 
     def enter(self, workspace: Group) -> None:
         """Activate `workspace` and build its per-workspace caches.
@@ -75,6 +83,8 @@ class WorkspaceState:
         # Non-admin only; empty for a workspace built from the admin scan
         # (owner resolution there reads each entity's own `users` instead).
         self._workspace_principals = workspace.workspace_principals or []
+        self._dataset_owner_refs = {}
+        self._dataflow_owner_refs = {}
         for report in workspace.reports or []:
             self._known_report_ids.add(report.id)
 
@@ -90,6 +100,8 @@ class WorkspaceState:
         self._filtered_datamodels = None
         self._dashboard_charts = {}
         self._workspace_principals = []
+        self._dataset_owner_refs = {}
+        self._dataflow_owner_refs = {}
 
     @property
     def current(self) -> Group:
@@ -127,6 +139,35 @@ class WorkspaceState:
     def get_dataflow_export(self, key: str) -> DataflowExportResponse | None:
         """Fetch a previously cached dataflow export for the current workspace."""
         return self._dataflow_exports.get(key)
+
+    # --- Non-admin owner refs: memoised per dataset/dataflow id -------------
+    #
+    # A dataset's (or dataflow's) owner set is recomputed by every dependent
+    # asset that inherits it - a report via its `datasetId`, a dashboard via
+    # every tile's report - so without this cache the same OpenMetadata
+    # lookups (`resolve_owner_principal`) run once per dependent, and the
+    # owner_principals_* counters count each principal once per dependent
+    # instead of once per owning asset. Caching here (not in the source
+    # itself) keeps the memoisation workspace-scoped, matching every other
+    # per-workspace cache on this class.
+
+    def cache_dataset_owner_refs(self, dataset_id: str, owner_refs: list[EntityReference]) -> None:
+        """Memoise a dataset's computed owner refs for the current workspace."""
+        if len(self._dataset_owner_refs) < self._MAX_CACHED_OWNER_REFS:
+            self._dataset_owner_refs[dataset_id] = owner_refs
+
+    def get_dataset_owner_refs(self, dataset_id: str) -> list[EntityReference] | None:
+        """Fetch a previously cached dataset owner-refs list; `None` on a cache miss."""
+        return self._dataset_owner_refs.get(dataset_id)
+
+    def cache_dataflow_owner_refs(self, dataflow_id: str, owner_refs: list[EntityReference]) -> None:
+        """Memoise a dataflow's computed owner refs for the current workspace."""
+        if len(self._dataflow_owner_refs) < self._MAX_CACHED_OWNER_REFS:
+            self._dataflow_owner_refs[dataflow_id] = owner_refs
+
+    def get_dataflow_owner_refs(self, dataflow_id: str) -> list[EntityReference] | None:
+        """Fetch a previously cached dataflow owner-refs list; `None` on a cache miss."""
+        return self._dataflow_owner_refs.get(dataflow_id)
 
     # --- Filtered dashboards: write per-item, read by iteration -------------
 
