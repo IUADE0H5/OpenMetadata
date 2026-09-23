@@ -157,16 +157,21 @@ def _read_expression(lines: list[str], header_index: int, inline_rest: str | Non
         return "\n".join(buf).strip("\n"), j + 1
     if rest != "":
         return rest, header_index + 1
-    # No inline text after '=': an unfenced block, indented deeper than the header line,
-    # possibly with blank separator lines inside it.
+    # No inline text after '=': an unfenced block. Its body sits two indents deeper
+    # than the header (e.g. a measure header at 1 tab has its DAX body at 3 tabs) --
+    # exactly one deeper (base_indent + 1) is a *sibling* property of the header
+    # itself (formatString, lineageTag, ...), never part of the expression, and must
+    # end the block. Getting this wrong silently glued trailing property lines onto
+    # the DAX text; harmless for regex-based ref extraction on its own, but it must
+    # not be mistaken for a general "any deeper indent continues the block" rule.
     buf = []
     j = header_index + 1
     while j < len(lines):
         if lines[j].strip() == "":
-            if buf and (j + 1 >= len(lines) or _indent(lines[j + 1]) <= base_indent):
+            if buf and (j + 1 >= len(lines) or _indent(lines[j + 1]) <= base_indent + 1):
                 break
             buf.append(lines[j])
-        elif _indent(lines[j]) > base_indent:
+        elif _indent(lines[j]) > base_indent + 1:
             buf.append(lines[j])
         else:
             break

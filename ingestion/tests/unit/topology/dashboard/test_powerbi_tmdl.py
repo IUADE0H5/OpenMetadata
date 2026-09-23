@@ -51,6 +51,16 @@ table Sales
 \t\t\t```
 \t\tformatString: 0
 
+\tmeasure 'Unfenced Multi Line Measure' =
+\t\t\tVAR MaxDate = MAX(Sales[OrderDate])
+\t\t\tRETURN
+\t\t\tCALCULATE(
+\t\t\t    SUM(Sales[Amount]),
+\t\t\t    Sales[OrderDate] = MaxDate
+\t\t\t)
+\t\tformatString: 0
+\t\tlineageTag: 55555555-5555-5555-5555-555555555555
+
 \thierarchy 'Order Hierarchy'
 \t\tlineageTag: 22222222-2222-2222-2222-222222222222
 
@@ -154,6 +164,20 @@ class TestParseTmdl:
         assert "VAR x = 1" in measure.expression
         assert "RETURN x" in measure.expression
         assert "```" not in measure.expression
+
+    def test_unfenced_multiline_measure_excludes_trailing_sibling_properties(self):
+        # Regression: an unfenced block's own body sits two indents deeper than its
+        # header (e.g. 3 tabs under a 1-tab `measure` header); the header's sibling
+        # properties (formatString, lineageTag, ...) sit only one indent deeper (2
+        # tabs) immediately after, with no blank-line separator, and must not be
+        # swallowed into the expression text.
+        model = parse_tmdl(_parts())
+        table = model.table("Sales")
+        measure = next(m for m in table.measures if m.name == "Unfenced Multi Line Measure")
+        assert "CALCULATE(" in measure.expression
+        assert "Sales[OrderDate] = MaxDate" in measure.expression
+        assert "formatString" not in measure.expression
+        assert "lineageTag" not in measure.expression
 
     def test_parses_hierarchy_with_levels(self):
         model = parse_tmdl(_parts())

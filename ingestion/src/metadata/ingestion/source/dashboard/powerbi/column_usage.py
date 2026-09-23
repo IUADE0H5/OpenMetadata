@@ -81,8 +81,12 @@ class ModelColumnUsage:
     used: frozenset[ColumnKey]
     unused: frozenset[ColumnKey]
     wholly_unused_tables: frozenset[str]
-    # Business columns only -- an auto-date table is never ingested into OpenMetadata,
-    # so a lineage entry pointing at one would be silently dropped by the server.
+    # Never an auto-date table -- it's never ingested into OpenMetadata, so a lineage
+    # entry pointing at one would be silently dropped by the server. A column reached
+    # through a measure's DAX need not be a *declared* one on its (real) table: dax.py
+    # trusts a DAX column reference as typed and never verifies it actually exists, so
+    # a stale or case-mismatched column name on a genuine business table still ends up
+    # in lineage under its literal DAX spelling -- only the table matters here.
     per_visual: dict[VisualKey, list[ColumnUse]] = field(default_factory=dict)
     dangling: dict[str, list[FieldRef]] = field(default_factory=dict)
     dax_unresolved: set[str] = field(default_factory=set)
@@ -96,6 +100,7 @@ class _ModelIndex:
 
     all_columns: set[ColumnKey]
     business_columns: frozenset[ColumnKey]
+    auto_date_tables: frozenset[str]
     measure_index: set[ColumnKey]
     hierarchies: dict[str, dict[str, dict[str, str]]]
     sort_by: dict[ColumnKey, str]
@@ -109,6 +114,7 @@ def _build_index(model: SemanticModelDefinition) -> _ModelIndex:
         business_columns=frozenset(
             (table.name, column.name) for table in model.tables if not table.is_auto_date for column in table.columns
         ),
+        auto_date_tables=frozenset(table.name for table in model.tables if table.is_auto_date),
         measure_index={(table.name, measure.name) for table in model.tables for measure in table.measures},
         hierarchies={
             table.name: {
@@ -215,12 +221,18 @@ def _collect_direct_usage(
             metric = "hierarchy_level_refs" if ref.kind == "hierarchy_level" else "direct_column_refs"
             counters[metric] += 1
             result.used.add(key)
-            # Chart lineage is business columns only: auto-date tables are never
-            # ingested into OpenMetadata, so a lineage entry pointing at one would be
-            # silently dropped by the server. A variation ref already resolved to its
-            # business column above (key), which is all chart lineage gets from it --
-            # `ref.variation_level` is kept on the FieldRef for logging only.
-            if visual_key is not None and key in index.business_columns:
+            # Chart lineage excludes auto-date tables: they're never ingested into
+            # OpenMetadata, so a lineage entry pointing at one would be silently
+            # dropped by the server. This is a *table*-level check, not "must be a
+            # declared business column": a DAX column reference is trusted as-is (see
+            # dax.py -- it never verifies the column actually exists), so a
+            # case-mismatched or stale column name on a real business table still
+            # belongs in lineage under its literal DAX spelling, same as the
+            # reference truth does; only the physical table it's never ingested at
+            # all knocks a ref out. A variation ref already resolved to its business
+            # column above (key) -- `ref.variation_level` is kept on the FieldRef for
+            # logging only.
+            if visual_key is not None and key[0] not in index.auto_date_tables:
                 result.per_visual.setdefault(visual_key, []).append(ColumnUse(key[0], key[1]))
         else:
             counters["direct_measure_refs"] += 1
@@ -229,7 +241,9 @@ def _collect_direct_usage(
             if visual_key is not None:
                 entries = result.per_visual.setdefault(visual_key, [])
                 entries.extend(
-                    ColumnUse(col[0], col[1], via_measure=key[1]) for col in reached if col in index.business_columns
+                    ColumnUse(col[0], col[1], via_measure=key[1])
+                    for col in reached
+                    if col[0] not in index.auto_date_tables
                 )
 
     for report_id, report in reports.items():

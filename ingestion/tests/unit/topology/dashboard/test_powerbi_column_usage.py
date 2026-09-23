@@ -365,10 +365,15 @@ class TestVariationHierarchyLevel:
         assert uses == {("Sales", "Amount")}
 
 
-class TestPerVisualIsBusinessColumnsOnly:
-    """Section-5 `used` can (and does) contain non-business info transiently on its way
-    to being filtered; per_visual chart lineage must never leak an auto-date table
-    column into it, however the ref got there."""
+class TestPerVisualExcludesAutoDateTables:
+    """Chart lineage never points at an auto-date table (never ingested into
+    OpenMetadata) -- but the filter is table-level, not "must be a declared business
+    column". dax.py never verifies a DAX column reference actually exists on its
+    table, and a stale or case-mismatched name on a genuine business table still
+    belongs in lineage under its literal DAX spelling -- confirmed against real
+    captured DAX (`'T'[is_IT]` referencing an actual, differently-cased `is_it`
+    column, and `T[pull_author]` referencing a column that doesn't exist under any
+    case) where the reference truth expects exactly that literal text in lineage."""
 
     def test_direct_column_ref_to_an_auto_date_table_produces_no_lineage_entry(self):
         ref = _ref("LocalDateTable_x", "Year")
@@ -398,6 +403,33 @@ class TestPerVisualIsBusinessColumnsOnly:
         uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
         assert uses == {("Sales", "Amount")}
         assert ("LocalDateTable_x", "Year") not in uses
+
+    def test_case_mismatched_dax_column_ref_on_a_real_table_still_reaches_lineage(self):
+        # The model declares "CustomerId"; the DAX (as real captured measures do)
+        # refers to it with different casing. dax.py resolves this as a column of a
+        # real table without checking exact casing -- lineage must not silently drop
+        # it just because a stricter (table, column) membership check would fail.
+        model = _model()
+        model.tables[0].measures.append(
+            TmdlMeasure(name="Distinct Customers", expression="DISTINCTCOUNT(Sales[customerid])")
+        )
+        ref = _ref("Sales", "Distinct Customers", kind="measure")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(model, {"r1": report})
+        uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
+        assert ("Sales", "customerid") in uses
+
+    def test_dax_reference_to_a_nonexistent_column_on_a_real_table_still_reaches_lineage(self):
+        # A stale/typo'd column name in DAX, on a table that genuinely exists and
+        # isn't auto-date -- dax.py never verifies the column itself exists, and
+        # neither does the lineage filter; only the table matters.
+        model = _model()
+        model.tables[0].measures.append(TmdlMeasure(name="Broken Ref", expression="SUM(Sales[no_such_column])"))
+        ref = _ref("Sales", "Broken Ref", kind="measure")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(model, {"r1": report})
+        uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
+        assert ("Sales", "no_such_column") in uses
 
 
 class TestPerVisualMeasureClosureIsolation:
