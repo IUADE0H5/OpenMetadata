@@ -19,6 +19,14 @@ SNOWFLAKE_QUERY_EXPRESSION_KW = "Value.NativeQuery(Snowflake.Databases("
 DATABRICKS_QUERY_EXPRESSION_KW = "Value.NativeQuery(Databricks.Catalogs("
 BIGQUERY_QUERY_EXPRESSION_KW = "Value.NativeQuery(GoogleBigQuery.Database("
 SQL_DATABASE_EXPRESSION_KW = "Sql.Database("
+ATHENA_DATABASES_EXPRESSION_KW = "AmazonAthena.Databases("
+ODBC_QUERY_EXPRESSION_KW = "Odbc.Query("
+ODBC_DATASOURCE_EXPRESSION_KW = "Odbc.DataSource("
+
+# Athena's default-catalog placeholder: the M navigation's `Kind="Database"`
+# level is always this literal unless a real federated catalog is configured,
+# so it is never an OM database on its own.
+ATHENA_DEFAULT_CATALOG = "AwsDataCatalog"
 
 DEFAULT_REPORTS_PREFIX = "reports"
 RDL_REPORT_FORMAT = "RDL"

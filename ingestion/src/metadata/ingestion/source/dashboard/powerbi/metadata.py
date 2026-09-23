@@ -68,10 +68,14 @@ from metadata.ingestion.ometa.utils import model_str
 from metadata.ingestion.progress.modes import ProgressMode
 from metadata.ingestion.source.dashboard.dashboard_service import DashboardServiceSource
 from metadata.ingestion.source.dashboard.powerbi.constants import (
+    ATHENA_DATABASES_EXPRESSION_KW,
+    ATHENA_DEFAULT_CATALOG,
     BIGQUERY_QUERY_EXPRESSION_KW,
     DATABRICKS_QUERY_EXPRESSION_KW,
     DEFAULT_REPORTS_PREFIX,
     MAX_PROJECT_FILTER_SIZE,
+    ODBC_DATASOURCE_EXPRESSION_KW,
+    ODBC_QUERY_EXPRESSION_KW,
     OWNER_ACCESS_RIGHTS_KEYWORDS,
     RDL_REPORT_FORMAT,
     RDL_REPORTS_PREFIX,
@@ -93,6 +97,7 @@ from metadata.ingestion.source.dashboard.powerbi.models import (
     PowerBIReport,
     PowerBiTable,
     ReportPage,
+    UpstreaDataflow,
 )
 from metadata.ingestion.source.dashboard.powerbi.workspace_state import WorkspaceState
 from metadata.ingestion.source.database.column_helpers import truncate_column_name
@@ -139,6 +144,35 @@ class PowerbiSource(DashboardServiceSource):
     config: WorkflowSource
     metadata_config: OpenMetadataConnection
 
+    # `metric_values()` keys - plain counters an external metrics reporter
+    # can read after ingestion without re-deriving them from logs.
+    METRIC_DATAFLOWS_FETCHED = "dataflows_fetched"
+    # Recognized Athena/ODBC M query blocks, counted once per block regardless
+    # of loadEnabled - "seen" means detected, not "successfully dispatched".
+    METRIC_ATHENA_ODBC_QUERIES_SEEN = "athena_odbc_queries_seen"
+    # Distinct (data model, table reference) pairs per run; resolved + unresolved
+    # == parsed by construction (see `_record_source_reference`).
+    METRIC_SOURCE_REFERENCES_PARSED = "source_references_parsed"
+    METRIC_SOURCE_REFERENCES_RESOLVED = "source_references_resolved"
+    METRIC_SOURCE_REFERENCES_UNRESOLVED = "source_references_unresolved"
+    # Only queries recognized as Athena/ODBC/Sql.Database sourced (i.e. that
+    # would otherwise have reached the lineage parser) and skipped because
+    # loadEnabled is not true - not every disabled query in the document.
+    METRIC_QUERIES_SKIPPED_LOAD_DISABLED = "queries_skipped_load_disabled"
+    # Dataset->dataflow links whose workspaceObjectId is not one of the
+    # workspaces this run processed (outside projectFilterPattern, or not
+    # visible to the caller); never resolved, logged once per foreign workspace.
+    METRIC_UPSTREAM_LINKS_OUTSIDE_SCOPE = "upstream_links_outside_scope"
+
+    # Bounded per CLAUDE.md's cache rule: this de-dupes (data model, table
+    # reference) pairs for one connector run. A tenant's total distinct
+    # references realistically stays far under this; beyond it we degrade to
+    # per-occurrence counting (resolved/unresolved still stay consistent with
+    # parsed) rather than grow unbounded.
+    _MAX_TRACKED_SOURCE_REFERENCES = 50_000
+    # Caps the volume of "unresolved reference" INFO log lines per run.
+    _MAX_UNRESOLVED_LOGGED = 50
+
     def __init__(
         self,
         config: WorkflowSource,
@@ -148,6 +182,48 @@ class PowerbiSource(DashboardServiceSource):
         self.pagination_entity_per_page = min(100, self.service_connection.pagination_entity_per_page)
         self.datamodel_file_mappings = []
         self.state = WorkspaceState()
+        self._metrics = Counter()
+        self._counted_source_references: set = set()
+        self._unresolved_logged_count = 0
+
+    def metric_values(self) -> dict[str, int]:
+        """Cheap, side-effect free snapshot of dataflow/M-parsing volume counters.
+
+        A subclass's metrics reporter picks this up automatically after
+        ingestion; see the ``METRIC_*`` class attributes for the keys.
+        """
+        return dict(self._metrics)
+
+    def _record_source_reference(
+        self,
+        datamodel_entity: DashboardDataModel,
+        fqn_search_string: str,
+        resolved: bool,
+    ) -> None:
+        """Count one distinct (data model, table reference) pair, once per run.
+
+        Keeps ``source_references_parsed == resolved + unresolved`` true by
+        construction: both counters are updated together for the same key,
+        and a key already seen (e.g. the same table reached via two different
+        M queries in one dataflow) is not counted again. Unresolved references
+        are logged at INFO, once per pair, up to ``_MAX_UNRESOLVED_LOGGED``.
+        """
+        key = (model_str(datamodel_entity.name), fqn_search_string)
+        if key in self._counted_source_references:
+            return
+        if len(self._counted_source_references) < self._MAX_TRACKED_SOURCE_REFERENCES:
+            self._counted_source_references.add(key)
+        self._metrics[self.METRIC_SOURCE_REFERENCES_PARSED] += 1
+        self._metrics[
+            self.METRIC_SOURCE_REFERENCES_RESOLVED if resolved else self.METRIC_SOURCE_REFERENCES_UNRESOLVED
+        ] += 1
+        if not resolved and self._unresolved_logged_count < self._MAX_UNRESOLVED_LOGGED:
+            self._unresolved_logged_count += 1
+            logger.info(
+                "Unresolved PowerBI source reference: data model=[%s] fqn_search_string=[%s]",
+                datamodel_entity.displayName or model_str(datamodel_entity.name),
+                fqn_search_string,
+            )
 
     def get_org_workspace_data(self) -> Iterable[Optional[Group]]:  # noqa: UP045
         """
@@ -160,9 +236,20 @@ class PowerbiSource(DashboardServiceSource):
                 f"Paginating workspace fetch with {len(paginated_filter_patterns)}"
                 f" batches to accommodate OData filter node limit"
             )
+
+        # Fetch every batch's workspace list up front (`fetch_all_workspaces`
+        # already returns a materialized list per batch) so a dataset->dataflow
+        # link's `workspaceObjectId` can be judged against the complete set of
+        # workspaces this run will process, not just the ones seen so far in
+        # this generator's stream.
+        workspace_batches = [
+            self.client.api_client.fetch_all_workspaces(pattern) or [] for pattern in paginated_filter_patterns
+        ]
+        known_workspace_ids = {workspace.id for batch in workspace_batches for workspace in batch}
+        outside_scope_link_counts: Counter = Counter()
+
         workspace_total = 0
-        for filter_pattern in paginated_filter_patterns:
-            workspaces = self.client.api_client.fetch_all_workspaces(filter_pattern)
+        for workspaces in workspace_batches:
             if workspaces:
                 workspace_total += len(workspaces)
                 self.progress_tracking.manual.set_total("Workspaces", workspace_total)
@@ -191,9 +278,47 @@ class PowerbiSource(DashboardServiceSource):
                             self.client.api_client.fetch_dataset_tables(group_id=workspace.id, dataset_id=dataset.id)
                             or []
                         )
+
+                    # add the dataflows to the workspace, and each dataflow's own
+                    # upstream dataflows (non-admin has no bulk equivalent of the
+                    # admin scan's inline upstreamDataflows, so this is per-dataflow)
+                    workspace.dataflows.extend(
+                        self.client.api_client.fetch_all_org_dataflows(group_id=workspace.id) or []
+                    )
+                    for dataflow in workspace.dataflows:
+                        dataflow.upstreamDataflows.extend(
+                            self.client.api_client.fetch_dataflow_upstream(
+                                group_id=workspace.id, dataflow_id=dataflow.id
+                            )
+                            or []
+                        )
+
+                    # non-admin datasets never carry upstreamDataflows inline (unlike
+                    # the admin scan); the link only exists via this workspace-wide call
+                    dataset_by_id = {dataset.id: dataset for dataset in workspace.datasets}
+                    for link in self.client.api_client.fetch_dataset_to_dataflow_links(group_id=workspace.id) or []:
+                        dataset = dataset_by_id.get(link.datasetObjectId)
+                        if dataset is None or not link.dataflowObjectId:
+                            continue
+                        if link.workspaceObjectId and link.workspaceObjectId not in known_workspace_ids:
+                            # The target dataflow's workspace isn't ingested this
+                            # run, so it can never resolve - don't even try.
+                            outside_scope_link_counts[link.workspaceObjectId] += 1
+                            continue
+                        dataset.upstreamDataflows.append(UpstreaDataflow(targetDataflowId=link.dataflowObjectId))
+
                     yield workspace
             else:
                 logger.error("Unable to fetch any PowerBI workspaces")
+
+        for foreign_workspace_id, count in outside_scope_link_counts.items():
+            self._metrics[self.METRIC_UPSTREAM_LINKS_OUTSIDE_SCOPE] += count
+            logger.info(
+                "PowerBI dataset-to-dataflow links reference workspace [%s], which is outside "
+                "this run's scope (%d link(s)); not resolved.",
+                foreign_workspace_id,
+                count,
+            )
 
     def _paginate_project_filter_pattern(self, filter_pattern):
         """
@@ -802,10 +927,14 @@ class PowerbiSource(DashboardServiceSource):
                         dataflow_id=dataset.id,
                     )
                     # dataflow export api for detailed metadata
-                    # api: https://api.powerbi.com/v1.0/myorg/admin/dataflows/DATAFLOW_ID/export
-                    # doc: https://learn.microsoft.com/en-us/rest/api/power-bi/admin/dataflows-export-dataflow-as-admin
-                    dataflow_export = self.client.api_client.fetch_dataflow_export(dataflow_id=dataset.id)
+                    # admin api: https://api.powerbi.com/v1.0/myorg/admin/dataflows/DATAFLOW_ID/export
+                    # non-admin api: https://api.powerbi.com/v1.0/myorg/groups/GROUP_ID/dataflows/DATAFLOW_ID
+                    dataflow_export = self.client.api_client.fetch_dataflow_export(
+                        dataflow_id=dataset.id,
+                        group_id=self.context.get().workspace.id,  # pyright: ignore[reportAttributeAccessIssue]
+                    )
                     if dataflow_export:
+                        self._metrics[self.METRIC_DATAFLOWS_FETCHED] += 1
                         self.state.cache_dataflow_export(dataset.id, dataflow_export)
                         datamodel_columns = self._get_dataflow_column_info(dataflow_export)
                 elif isinstance(dataset, Datamart):
@@ -1466,6 +1595,85 @@ class PowerbiSource(DashboardServiceSource):
             logger.debug(traceback.format_exc())
         return None
 
+    def resolve_source_database(self, table_info: dict) -> Optional[str]:  # noqa: UP045
+        """Database to resolve a parsed M source against.
+
+        Defaults to whatever the M parser found (``None`` for an Athena source
+        whose catalog level is the ``AwsDataCatalog`` placeholder). A subclass
+        may override this to map a data-source name (``table_info["dsn"]``,
+        set by ``_parse_athena_source``/``_extract_tables_from_sql``) onto a
+        database/catalog when the expression itself doesn't name one - e.g. to
+        tell apart two AWS accounts that are ingested as two OM databases
+        under one PowerBI service but only differ by DSN.
+        """
+        return table_info.get("database")
+
+    def _parse_athena_source(self, source_expression: str) -> Optional[List[dict]]:  # noqa: UP006, UP045
+        """
+        Parse Power Query M expressions sourced from the Athena PowerBI
+        connector (``AmazonAthena.Databases``) or a generic ODBC DSN pointed
+        at Athena (``Odbc.Query`` / ``Odbc.DataSource``).
+
+        The Athena connector's catalog navigation always has exactly three
+        levels - Database, Schema, Table (or View) - reached through
+        ``Source{[Name = "...", Kind = "..."]}[Data]`` records; step names
+        vary (``Navigation`` vs ``#"Navigation 3"``) so matching is done on
+        the record itself, never on step names. The ``Kind="Database"`` level
+        is Athena's default-catalog placeholder (``AwsDataCatalog``) unless a
+        real federated catalog is configured, so a placeholder value is
+        dropped rather than returned as an OM database - see
+        ``resolve_source_database`` for how a subclass can still use it (via
+        the returned ``dsn``) to pick an OM database.
+        """
+        try:
+            is_athena = ATHENA_DATABASES_EXPRESSION_KW in source_expression
+            is_odbc = (
+                ODBC_QUERY_EXPRESSION_KW in source_expression or ODBC_DATASOURCE_EXPRESSION_KW in source_expression
+            )
+            if not is_athena and not is_odbc:
+                return None
+            self._metrics[self.METRIC_ATHENA_ODBC_QUERIES_SEEN] += 1
+
+            if is_athena:
+                dsn_match = re.search(r'AmazonAthena\.Databases\(\s*"([^"]+)"', source_expression)
+            else:
+                dsn_match = re.search(r'Odbc\.(?:Query|DataSource)\(\s*"dsn=([^"]+?)"', source_expression)
+            dsn = dsn_match.group(1) if dsn_match else None
+
+            query_match = re.search(
+                r'Odbc\.Query\(\s*"dsn=[^"]+"\s*,\s*"((?:[^"]|"")*)"',
+                source_expression,
+                re.DOTALL,
+            )
+            if query_match:
+                sql_query = query_match.group(1)
+                return self._extract_tables_from_sql(sql_query, database=None, server=dsn, dialect=Dialect.ATHENA)
+
+            nav_matches = re.findall(
+                r'\{\[\s*Name\s*=\s*"([^"]+)"\s*,\s*Kind\s*=\s*"([^"]+)"\s*\]\}',
+                source_expression,
+            )
+            if not nav_matches:
+                return None
+            kind_to_name = {kind: name for name, kind in nav_matches}
+            table = kind_to_name.get("Table") or kind_to_name.get("View")
+            if not table:
+                return None
+            catalog = kind_to_name.get("Database")
+            database = None if catalog == ATHENA_DEFAULT_CATALOG else catalog
+            return [
+                {
+                    "database": database,
+                    "schema": kind_to_name.get("Schema"),
+                    "table": table,
+                    "dsn": dsn,
+                }
+            ]
+        except Exception as exc:
+            logger.debug(f"Error to parse Athena/ODBC table source: {exc}")
+            logger.debug(traceback.format_exc())
+        return None
+
     def _parse_table_info_from_source_exp(
         self, table: PowerBiTable, datamodel_entity: DashboardDataModel
     ) -> Optional[List[dict]]:  # noqa: UP006, UP045
@@ -1496,6 +1704,18 @@ class PowerbiSource(DashboardServiceSource):
             table_info_list = self._parse_databricks_source(source_expression, datamodel_entity)
             if isinstance(table_info_list, List):  # noqa: UP006
                 return table_info_list
+
+            # parse Athena / ODBC-to-Athena source
+            # `PowerBITableSource.expression`'s "before" validator already joins a
+            # list of M lines into one string before storage, but its declared type
+            # stays `str | List[str]`; normalize again so this narrows to `str`.
+            athena_source_expression = (
+                "\n".join(source_expression) if isinstance(source_expression, list) else source_expression
+            )
+            if isinstance(athena_source_expression, str):
+                table_info_list = self._parse_athena_source(athena_source_expression)
+                if isinstance(table_info_list, List):  # noqa: UP006
+                    return table_info_list
 
             # parse generic Sql.Database source
             # (inline query, native query, catalog access)
@@ -1545,7 +1765,7 @@ class PowerbiSource(DashboardServiceSource):
                 for table_info in table_info_list:
                     table_name = table_info.get("table") or table.name
                     schema_name = table_info.get("schema")
-                    database_name = table_info.get("database")
+                    database_name = self.resolve_source_database(table_info)
                     if prefix_table_name and table_name and prefix_table_name.lower() != table_name.lower():
                         logger.debug(f"Table {table_name} does not match prefix {prefix_table_name}")
                         return
@@ -1574,6 +1794,7 @@ class PowerbiSource(DashboardServiceSource):
                         entity_type=Table,
                         fqn_search_string=fqn_search_string,
                     )
+                    self._record_source_reference(datamodel_entity, fqn_search_string, resolved=bool(table_entity))
                     if table_entity and datamodel_entity:
                         logger.debug(
                             "Creating lineage between db table=%s and datamodel=%s",
@@ -1831,12 +2052,30 @@ class PowerbiSource(DashboardServiceSource):
                 continue
             entity_name = name_match.group(1) or name_match.group(2)
 
+            # Detected independently of loadEnabled: "seen" means the block is
+            # Athena/ODBC-shaped, whether or not it ends up dispatched below.
+            is_athena_or_odbc_block = any(
+                kw in block
+                for kw in (ATHENA_DATABASES_EXPRESSION_KW, ODBC_QUERY_EXPRESSION_KW, ODBC_DATASOURCE_EXPRESSION_KW)
+            )
+            is_recognized_source_block = is_athena_or_odbc_block or SQL_DATABASE_EXPRESSION_KW in block
+
             # Only process entities that have loadEnabled=true in queriesMetadata
             query_meta = queries_metadata.get(entity_name, {})
             if isinstance(query_meta, dict) and not query_meta.get("loadEnabled", False):
+                if is_athena_or_odbc_block:
+                    self._metrics[self.METRIC_ATHENA_ODBC_QUERIES_SEEN] += 1
+                # Only queries recognized as Athena/ODBC/Sql.Database sourced
+                # would otherwise have reached the lineage parser below - a
+                # disabled SharePoint/Web helper query was never going to be
+                # parsed for lineage, so it doesn't belong in this counter.
+                if is_recognized_source_block:
+                    self._metrics[self.METRIC_QUERIES_SKIPPED_LOAD_DISABLED] += 1
                 continue
 
-            table_info_list = self._parse_sql_source(block)
+            table_info_list = self._parse_athena_source(block)
+            if not isinstance(table_info_list, List):  # noqa: UP006
+                table_info_list = self._parse_sql_source(block)
             if table_info_list:
                 sql_query = None
                 for table_info in table_info_list:
@@ -1930,12 +2169,16 @@ class PowerbiSource(DashboardServiceSource):
         sql_query: str,
         database: Optional[str],  # noqa: UP045
         server: Optional[str],  # noqa: UP045
+        dialect: Dialect = Dialect.TSQL,
     ) -> Optional[List[dict]]:  # noqa: UP006, UP045
         """
-        Extract table references from a T-SQL query found in a dataflow M expression
-        sourced from the Power Query Sql.Database / Value.NativeQuery connector
-        (SQL Server / Azure SQL). Uses LineageParser with the TSQL dialect so
-        bracket-quoted identifiers like [Column Name] parse correctly.
+        Extract table references from a SQL query found in a dataflow M expression.
+
+        Defaults to the TSQL dialect for the Power Query Sql.Database /
+        Value.NativeQuery connector (SQL Server / Azure SQL), whose queries use
+        bracket-quoted identifiers like [Column Name]. Callers sourcing Athena
+        SQL (``Odbc.Query`` DSNs) pass ``dialect=Dialect.ATHENA`` so
+        double-quoted identifiers like "schema"."table" parse correctly instead.
         """
         try:
             # Clean PowerBI special characters
@@ -1950,7 +2193,7 @@ class PowerbiSource(DashboardServiceSource):
             try:
                 parser = LineageParser(
                     cleaned_sql,
-                    dialect=Dialect.TSQL,
+                    dialect=dialect,
                     timeout_seconds=30,
                     parser_type=self.get_query_parser_type(),
                 )
@@ -1985,14 +2228,15 @@ class PowerbiSource(DashboardServiceSource):
                         schema_name = schema_str
 
                 if table_name:
-                    lineage_tables.append(
-                        {
-                            "database": database_name,
-                            "schema": schema_name,
-                            "table": table_name,
-                            "sql": cleaned_sql,
-                        }
-                    )
+                    table_info = {
+                        "database": database_name,
+                        "schema": schema_name,
+                        "table": table_name,
+                        "sql": cleaned_sql,
+                    }
+                    if dialect == Dialect.ATHENA:
+                        table_info["dsn"] = server
+                    lineage_tables.append(table_info)
             return lineage_tables if lineage_tables else None  # noqa: TRY300
         except Exception as exc:
             logger.debug(f"Error extracting tables from dataflow SQL: {exc}")
@@ -2046,7 +2290,7 @@ class PowerbiSource(DashboardServiceSource):
                 for table_info in parsed_entity.get("tables", []):
                     table_name = table_info.get("table")
                     schema_name = table_info.get("schema")
-                    database_name = table_info.get("database")
+                    database_name = self.resolve_source_database(table_info)
 
                     if not table_name:
                         continue
@@ -2064,7 +2308,11 @@ class PowerbiSource(DashboardServiceSource):
                             service_name=prefix_service_name or "*",
                             table_name=prefix_table_name or table_name,
                             schema_name=prefix_schema_name or schema_name,
-                            database_name=prefix_database_name or database_name,
+                            # `or "*"` mirrors build_es_fqn_search_string's own
+                            # internal `database_name or "*"` fallback, so this
+                            # narrows the static type to `str` with no behavior
+                            # change versus passing a possibly-`None` value through.
+                            database_name=(prefix_database_name or database_name) or "*",
                         )
                     except ValueError:
                         logger.debug(f"Skipping table '{table_name}' with invalid FQN characters")
@@ -2073,6 +2321,7 @@ class PowerbiSource(DashboardServiceSource):
                         entity_type=Table,
                         fqn_search_string=fqn_search_string,
                     )
+                    self._record_source_reference(datamodel_entity, fqn_search_string, resolved=bool(table_entity))
                     if table_entity and datamodel_entity:
                         column_lineage = self._get_dataflow_column_lineage(
                             table_entity=table_entity,
