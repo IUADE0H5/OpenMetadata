@@ -103,3 +103,38 @@ RDL_REPORTS_PREFIX = "rdlreports"
 MAX_PROJECT_FILTER_SIZE = 10
 
 SQL_LINE_COMMENT_PATTERN = r"//[^\n]*"
+
+# Power BI report-visual `visualType` strings (from the PBIR/legacy report definition,
+# see `report_definition.py`) mapped to the generic OpenMetadata `ChartType`. Unlisted
+# visual types (and visuals whose type is unrecognized) fall back to `ChartType.Other`
+# rather than being dropped - the visual still gets a Chart entity, just an
+# uncategorized one.
+POWERBI_VISUAL_TYPE_TO_CHART_TYPE = {
+    "barChart": "Bar",
+    "clusteredBarChart": "Bar",
+    "stackedBarChart": "Bar",
+    "hundredPercentStackedBarChart": "Bar",
+    "columnChart": "Bar",
+    "clusteredColumnChart": "Bar",
+    "stackedColumnChart": "Bar",
+    "hundredPercentStackedColumnChart": "Bar",
+    "lineChart": "Line",
+    "lineStackedColumnComboChart": "Line",
+    "lineClusteredColumnComboChart": "Line",
+    "areaChart": "Area",
+    "stackedAreaChart": "Area",
+    "pieChart": "Pie",
+    "donutChart": "Pie",
+    "scatterChart": "Scatter",
+    "table": "Table",
+    "tableEx": "Table",
+    "pivotTable": "Table",
+    "matrix": "Table",
+    "histogram": "Histogram",
+    "gauge": "Gauge",
+    "map": "Map",
+    "filledMap": "Map",
+    "shapeMap": "Map",
+    "heatMap": "Heatmap",
+    "treemap": "Graph",
+}

@@ -62,6 +62,13 @@ class WorkspaceState:
         self._workspace_principals: list[PowerBIPrincipal] = []
         self._dataset_owner_refs: dict[str, list[EntityReference]] = {}
         self._dataflow_owner_refs: dict[str, list[EntityReference]] = {}
+        # Report/model definitions fetched from Fabric and the column usage computed
+        # from them - only populated when `report_column_usage_enabled` is True.
+        # Same per-workspace, reset-on-exit lifecycle as `_dataflow_exports`.
+        self._report_definitions: dict[str, object] = {}
+        self._semantic_model_definitions: dict[str, object] = {}
+        self._column_usage: dict[str, object] = {}
+        self._column_usage_computed: bool = False
 
     def enter(self, workspace: Group) -> None:
         """Activate `workspace` and build its per-workspace caches.
@@ -85,6 +92,10 @@ class WorkspaceState:
         self._workspace_principals = workspace.workspace_principals or []
         self._dataset_owner_refs = {}
         self._dataflow_owner_refs = {}
+        self._report_definitions = {}
+        self._semantic_model_definitions = {}
+        self._column_usage = {}
+        self._column_usage_computed = False
         for report in workspace.reports or []:
             self._known_report_ids.add(report.id)
 
@@ -102,6 +113,10 @@ class WorkspaceState:
         self._workspace_principals = []
         self._dataset_owner_refs = {}
         self._dataflow_owner_refs = {}
+        self._report_definitions = {}
+        self._semantic_model_definitions = {}
+        self._column_usage = {}
+        self._column_usage_computed = False
 
     @property
     def current(self) -> Group:
@@ -200,3 +215,43 @@ class WorkspaceState:
     def pop_dashboard_chart_ids(self, dashboard_id: str) -> list[str]:
         """Consume the chart ids for a dashboard; empty list if absent or already consumed."""
         return self._dashboard_charts.pop(dashboard_id, [])
+
+    # --- Report/model definitions + column usage: report-column-usage feature only ---
+    #
+    # Populated only when `PowerbiSource.report_column_usage_enabled` is True. Report
+    # and model definitions are cached as they're fetched (chart/datamodel stages) so
+    # the later lineage stage, which runs in the same workspace scope, reuses them
+    # instead of re-fetching from Fabric.
+
+    def cache_report_definition(self, report_id: str, definition: object) -> None:
+        """Memoise a parsed report definition for the current workspace."""
+        self._report_definitions[report_id] = definition
+
+    def get_report_definition(self, report_id: str) -> object | None:
+        """Fetch a previously cached report definition; `None` on a cache miss."""
+        return self._report_definitions.get(report_id)
+
+    def cache_semantic_model_definition(self, dataset_id: str, definition: object) -> None:
+        """Memoise a parsed semantic model (TMDL) definition for the current workspace."""
+        self._semantic_model_definitions[dataset_id] = definition
+
+    def get_semantic_model_definition(self, dataset_id: str) -> object | None:
+        """Fetch a previously cached semantic model definition; `None` on a cache miss."""
+        return self._semantic_model_definitions.get(dataset_id)
+
+    def cache_column_usage(self, dataset_id: str, usage: object) -> None:
+        """Memoise a dataset's computed `ModelColumnUsage` for the current workspace."""
+        self._column_usage[dataset_id] = usage
+
+    def get_column_usage(self, dataset_id: str) -> object | None:
+        """Fetch a previously cached `ModelColumnUsage`; `None` on a cache miss."""
+        return self._column_usage.get(dataset_id)
+
+    @property
+    def column_usage_computed(self) -> bool:
+        """Whether `resolve_column_usage` has already run for every dataset in this workspace."""
+        return self._column_usage_computed
+
+    def mark_column_usage_computed(self) -> None:
+        """Record that column usage has been computed for every dataset in the current workspace."""
+        self._column_usage_computed = True
