@@ -77,7 +77,11 @@ class WorkspaceState:
         # (once per report x db-service-prefix), and `addLineage` replaces an
         # edge's whole `columnsLineage` on every call rather than merging - so a
         # second, columnless pass over an edge already written with columns would
-        # silently wipe them. Bounded per CLAUDE.md's cache rule.
+        # silently wipe them. Not size-capped like `_MAX_CACHED_OWNER_REFS` above:
+        # a cap would let entries evict and re-allow the very re-write this guards
+        # against. Its natural bound is one workspace's distinct column-carrying
+        # edges - it's cleared on every `enter()`/`exit()`, same as the other
+        # per-workspace state.
         self._emitted_column_lineage_edges: set[tuple[str, str]] = set()
         # Report ids whose visual charts, and dataset ids whose TMDL tables, have
         # already been processed this workspace, this run. `yield_dashboard_chart`
