@@ -30,6 +30,16 @@ per the adopted "used" rule (project docs, section 5):
   single-pass.)
 - Everything else among the business columns (i.e. not belonging to an auto-date table)
   is unused. A model can back several reports; usage is the union across all of them.
+
+Power BI/DAX identifiers (tables, columns, measures) are case-insensitive: a report
+field ref, a `sortByColumn`, a relationship endpoint, or a variation target can name a
+column under different casing than the model's own TMDL declaration and still name the
+same column. Every resolution in this module -- report refs via `_resolve_ref`,
+sortByColumn, hierarchy levels, and relationships -- is case-insensitive and always
+returns the model's canonical declared spelling. A name that matches no declared
+table/column/measure under any casing is unresolved: dangling for a report field ref
+(never added to `used`, never chart lineage), `dax_unresolved` for a DAX reference
+(handled in dax.py, which returns only already-canonicalized keys here).
 """
 
 from collections.abc import Mapping
@@ -81,12 +91,10 @@ class ModelColumnUsage:
     used: frozenset[ColumnKey]
     unused: frozenset[ColumnKey]
     wholly_unused_tables: frozenset[str]
-    # Never an auto-date table -- it's never ingested into OpenMetadata, so a lineage
-    # entry pointing at one would be silently dropped by the server. A column reached
-    # through a measure's DAX need not be a *declared* one on its (real) table: dax.py
-    # trusts a DAX column reference as typed and never verifies it actually exists, so
-    # a stale or case-mismatched column name on a genuine business table still ends up
-    # in lineage under its literal DAX spelling -- only the table matters here.
+    # Always a genuine, declared business column (exact membership in
+    # business_columns) -- every key reaching here is already canonicalized, so this
+    # is equivalent to "not an auto-date table" but stated as the stricter check since
+    # that's what it actually is once casing is no longer a variable.
     per_visual: dict[VisualKey, list[ColumnUse]] = field(default_factory=dict)
     dangling: dict[str, list[FieldRef]] = field(default_factory=dict)
     dax_unresolved: set[str] = field(default_factory=set)
@@ -96,39 +104,62 @@ class ModelColumnUsage:
 @dataclass
 class _ModelIndex:
     """Precomputed, read-only lookups derived once from the model, shared by every
-    step of resolution."""
+    step of resolution. The `*_by_lower` maps are a per-model casefold index -- built
+    once here, bounded by the model's own table/column/measure counts, not an
+    accumulating cache -- used to resolve any name case-insensitively while always
+    returning the model's canonical declared spelling."""
 
     all_columns: set[ColumnKey]
     business_columns: frozenset[ColumnKey]
     auto_date_tables: frozenset[str]
     measure_index: set[ColumnKey]
-    hierarchies: dict[str, dict[str, dict[str, str]]]
-    sort_by: dict[ColumnKey, str]
+    sort_by: dict[ColumnKey, ColumnKey]
     measure_deps: dict[ColumnKey, DaxReferences]
     calc_column_deps: dict[ColumnKey, DaxReferences]
+    table_by_lower: dict[str, str]
+    column_by_lower: dict[tuple[str, str], ColumnKey]
+    measure_by_lower: dict[tuple[str, str], ColumnKey]
+    # (table.lower(), hierarchy.lower(), level.lower()) -> canonical column name.
+    hierarchy_level_by_lower: dict[tuple[str, str, str], str]
 
 
 def _build_index(model: SemanticModelDefinition) -> _ModelIndex:
+    table_by_lower = {table.name.lower(): table.name for table in model.tables}
+    column_by_lower = {
+        (table.name.lower(), column.name.lower()): (table.name, column.name)
+        for table in model.tables
+        for column in table.columns
+    }
+    measure_by_lower = {
+        (table.name.lower(), measure.name.lower()): (table.name, measure.name)
+        for table in model.tables
+        for measure in table.measures
+    }
+    hierarchy_level_by_lower = {
+        (table.name.lower(), hierarchy.name.lower(), level.name.lower()): level.column
+        for table in model.tables
+        for hierarchy in table.hierarchies
+        for level in hierarchy.levels
+        if level.column is not None
+    }
+
+    sort_by: dict[ColumnKey, ColumnKey] = {}
+    for table in model.tables:
+        for column in table.columns:
+            if not column.sort_by_column:
+                continue
+            target = column_by_lower.get((table.name.lower(), column.sort_by_column.lower()))
+            if target is not None:
+                sort_by[(table.name, column.name)] = target
+
     return _ModelIndex(
-        all_columns={(table.name, column.name) for table in model.tables for column in table.columns},
+        all_columns=set(column_by_lower.values()),
         business_columns=frozenset(
             (table.name, column.name) for table in model.tables if not table.is_auto_date for column in table.columns
         ),
         auto_date_tables=frozenset(table.name for table in model.tables if table.is_auto_date),
-        measure_index={(table.name, measure.name) for table in model.tables for measure in table.measures},
-        hierarchies={
-            table.name: {
-                hierarchy.name: {level.name: level.column for level in hierarchy.levels if level.column is not None}
-                for hierarchy in table.hierarchies
-            }
-            for table in model.tables
-        },
-        sort_by={
-            (table.name, column.name): column.sort_by_column
-            for table in model.tables
-            for column in table.columns
-            if column.sort_by_column
-        },
+        measure_index=set(measure_by_lower.values()),
+        sort_by=sort_by,
         measure_deps={
             (table.name, measure.name): extract_dax_references(measure.expression, model, table.name)
             for table in model.tables
@@ -140,28 +171,39 @@ def _build_index(model: SemanticModelDefinition) -> _ModelIndex:
             for column in table.columns
             if column.expression
         },
+        table_by_lower=table_by_lower,
+        column_by_lower=column_by_lower,
+        measure_by_lower=measure_by_lower,
+        hierarchy_level_by_lower=hierarchy_level_by_lower,
     )
 
 
 def _resolve_ref(ref: FieldRef, index: _ModelIndex) -> tuple[str, ColumnKey] | None:
     """Resolves a FieldRef to ("column", key) or ("measure", key) against the model,
-    applying the same kind/actual-model cross-check fallback as the reference
-    implementation: a ref tagged Column that is actually a measure (or vice versa)
-    still resolves, since the JSON's own tag can lag the model."""
+    case-insensitively, always returning the model's canonical spelling. Applies the
+    same kind/actual-model cross-check fallback as the reference implementation: a ref
+    tagged Column that is actually a measure (or vice versa) still resolves, since the
+    JSON's own tag can lag the model."""
+    table_lower = ref.table.lower()
     if ref.kind == "hierarchy_level":
         if ref.hierarchy is None:
             # A variation-based ref: report_definition.py already resolved it straight
             # to the physical (table, column) the auto-date hierarchy was built on --
-            # just check that column genuinely exists.
-            key = (ref.table, ref.name)
-            return ("column", key) if key in index.all_columns else None
-        column = index.hierarchies.get(ref.table, {}).get(ref.hierarchy, {}).get(ref.name)
-        return ("column", (ref.table, column)) if column is not None else None
-    key = (ref.table, ref.name)
-    if key in index.measure_index:
-        return ("measure", key)
-    if key in index.all_columns:
-        return ("column", key)
+            # just check that column genuinely exists (case-insensitively).
+            key = index.column_by_lower.get((table_lower, ref.name.lower()))
+            return ("column", key) if key is not None else None
+        column = index.hierarchy_level_by_lower.get((table_lower, ref.hierarchy.lower(), ref.name.lower()))
+        if column is None:
+            return None
+        canonical_table = index.table_by_lower.get(table_lower)
+        return ("column", (canonical_table, column)) if canonical_table is not None else None
+    name_lower = ref.name.lower()
+    measure_key = index.measure_by_lower.get((table_lower, name_lower))
+    if measure_key is not None:
+        return ("measure", measure_key)
+    column_key = index.column_by_lower.get((table_lower, name_lower))
+    if column_key is not None:
+        return ("column", column_key)
     return None
 
 
@@ -221,18 +263,14 @@ def _collect_direct_usage(
             metric = "hierarchy_level_refs" if ref.kind == "hierarchy_level" else "direct_column_refs"
             counters[metric] += 1
             result.used.add(key)
-            # Chart lineage excludes auto-date tables: they're never ingested into
+            # Chart lineage excludes auto-date tables (never ingested into
             # OpenMetadata, so a lineage entry pointing at one would be silently
-            # dropped by the server. This is a *table*-level check, not "must be a
-            # declared business column": a DAX column reference is trusted as-is (see
-            # dax.py -- it never verifies the column actually exists), so a
-            # case-mismatched or stale column name on a real business table still
-            # belongs in lineage under its literal DAX spelling, same as the
-            # reference truth does; only the physical table it's never ingested at
-            # all knocks a ref out. A variation ref already resolved to its business
-            # column above (key) -- `ref.variation_level` is kept on the FieldRef for
-            # logging only.
-            if visual_key is not None and key[0] not in index.auto_date_tables:
+            # dropped by the server). `key` is already canonicalized and verified to
+            # exist by `_resolve_ref`/dax.py, so exact business_columns membership is
+            # now the correct check -- it's equivalent to "not auto-date" once casing
+            # is no longer a variable. `ref.variation_level` is kept on the FieldRef
+            # for logging only.
+            if visual_key is not None and key in index.business_columns:
                 result.per_visual.setdefault(visual_key, []).append(ColumnUse(key[0], key[1]))
         else:
             counters["direct_measure_refs"] += 1
@@ -241,9 +279,7 @@ def _collect_direct_usage(
             if visual_key is not None:
                 entries = result.per_visual.setdefault(visual_key, [])
                 entries.extend(
-                    ColumnUse(col[0], col[1], via_measure=key[1])
-                    for col in reached
-                    if col[0] not in index.auto_date_tables
+                    ColumnUse(col[0], col[1], via_measure=key[1]) for col in reached if col in index.business_columns
                 )
 
     for report_id, report in reports.items():
@@ -267,15 +303,21 @@ def _traversed_relationships(
 ) -> tuple[set[ColumnKey], set[str]]:
     """A relationship is traversed only when both endpoint tables already have at
     least one used business column; an auto-date table has none, by construction, so
-    it can never satisfy this on its own side."""
+    it can never satisfy this on its own side. Endpoints are resolved
+    case-insensitively (relationships.tmdl is a separate parse pass from the tables
+    themselves, so casing drift, while unlikely, isn't ruled out); an endpoint that
+    doesn't resolve to a real column under any casing makes the relationship
+    unusable and it's skipped rather than guessed at."""
     added: set[ColumnKey] = set()
     traversed: set[str] = set()
     used_business_tables = {table for table, column in used if (table, column) in index.business_columns}
     for relationship in model.relationships:
-        if relationship.from_table not in used_business_tables or relationship.to_table not in used_business_tables:
+        from_key = index.column_by_lower.get((relationship.from_table.lower(), relationship.from_column.lower()))
+        to_key = index.column_by_lower.get((relationship.to_table.lower(), relationship.to_column.lower()))
+        if from_key is None or to_key is None:
             continue
-        from_key = (relationship.from_table, relationship.from_column)
-        to_key = (relationship.to_table, relationship.to_column)
+        if from_key[0] not in used_business_tables or to_key[0] not in used_business_tables:
+            continue
         added.update(key for key in (from_key, to_key) if key not in used)
         traversed.add(f"{from_key[0]}.{from_key[1]}->{to_key[0]}.{to_key[1]}")
     return added, traversed
@@ -283,10 +325,10 @@ def _traversed_relationships(
 
 def _sortby_additions(used: set[ColumnKey], index: _ModelIndex) -> set[ColumnKey]:
     added = set()
-    for table, column in used:
-        sort_target = index.sort_by.get((table, column))
-        if sort_target and (table, sort_target) not in used:
-            added.add((table, sort_target))
+    for key in used:
+        sort_target = index.sort_by.get(key)
+        if sort_target and sort_target not in used:
+            added.add(sort_target)
     return added
 
 

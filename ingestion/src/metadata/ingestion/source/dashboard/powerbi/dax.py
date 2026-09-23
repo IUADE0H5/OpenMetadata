@@ -14,6 +14,12 @@ makes, resolved against a parsed semantic model. This is a regex-based reader, n
 DAX parser -- it is deliberately one-hop (a measure's own references only); transitive
 closure across measure-to-measure and calculated-column chains lives in
 `column_usage.py`, which can cycle-guard across many expressions at once.
+
+Power BI/DAX identifiers (tables, columns, measures) are case-insensitive: `'T'[col]`
+and `'T'[COL]` name the same column if the model declares either casing. Every
+resolution here is done case-insensitively and always returns the model's own
+canonical (TMDL-declared) spelling, never the DAX text's casing, so a downstream
+consumer can always match on the exact string the model itself uses.
 """
 
 import re
@@ -52,58 +58,95 @@ def _strip_dax(expression: str) -> str:
     return _STRING_LITERAL_RE.sub('""', text)
 
 
+@dataclass
+class _CasefoldIndex:
+    """A per-model, case-insensitive lookup built fresh for each call -- bounded by
+    the model's own table/column/measure counts, not an accumulating cache."""
+
+    table_by_lower: dict[str, str]
+    column_by_lower: dict[tuple[str, str], tuple[str, str]]
+    # lower(measure name) -> every (canonical_table, canonical_measure) declaring it,
+    # in table-declaration order, for the bare-[X]-prefers-host-table tie-break.
+    measures_by_name_lower: dict[str, list[tuple[str, str]]]
+    measure_by_lower: dict[tuple[str, str], tuple[str, str]]
+
+
+def _build_casefold_index(model: SemanticModelDefinition) -> _CasefoldIndex:
+    table_by_lower = {table.name.lower(): table.name for table in model.tables}
+    column_by_lower = {
+        (table.name.lower(), column.name.lower()): (table.name, column.name)
+        for table in model.tables
+        for column in table.columns
+    }
+    measures_by_name_lower: dict[str, list[tuple[str, str]]] = {}
+    measure_by_lower: dict[tuple[str, str], tuple[str, str]] = {}
+    for table in model.tables:
+        for measure in table.measures:
+            measures_by_name_lower.setdefault(measure.name.lower(), []).append((table.name, measure.name))
+            measure_by_lower[(table.name.lower(), measure.name.lower())] = (table.name, measure.name)
+    return _CasefoldIndex(table_by_lower, column_by_lower, measures_by_name_lower, measure_by_lower)
+
+
 def extract_dax_references(expression: str, model: SemanticModelDefinition, host_table: str) -> DaxReferences:
     result = DaxReferences()
     if not expression:
         return result
 
     text = _strip_dax(expression)
-    table_names = {table.name for table in model.tables}
-    column_names = {(table.name, column.name) for table in model.tables for column in table.columns}
-    measures_by_name: dict[str, list[str]] = {}
-    for table in model.tables:
-        for measure in table.measures:
-            measures_by_name.setdefault(measure.name, []).append(table.name)
-    measure_index = {(table.name, measure.name) for table in model.tables for measure in table.measures}
-    var_names = set(_VAR_NAME_RE.findall(text))
+    index = _build_casefold_index(model)
+    var_names_lower = {name.lower() for name in _VAR_NAME_RE.findall(text)}
+    host_table_lower = host_table.lower()
 
     consumed_spans: list[tuple[int, int]] = []
     for match in _QUALIFIED_REF_RE.finditer(text):
         quoted, quoted_col, bare, bare_col = match.groups()
-        table = quoted.replace("''", "'") if quoted is not None else bare
-        column = quoted_col if quoted is not None else bare_col
+        table_raw = quoted.replace("''", "'") if quoted is not None else bare
+        column_raw = quoted_col if quoted is not None else bare_col
         consumed_spans.append(match.span())
-        if table not in table_names:
-            result.unresolved.add(f"{table}[{column}]")
+
+        canonical_table = index.table_by_lower.get(table_raw.lower())
+        if canonical_table is None:
+            result.unresolved.add(f"{table_raw}[{column_raw}]")
             continue
-        if (table, column) in measure_index:
-            result.measures.add((table, column))
+        canonical_table_lower = canonical_table.lower()
+        measure_key = index.measure_by_lower.get((canonical_table_lower, column_raw.lower()))
+        if measure_key is not None:
+            result.measures.add(measure_key)
+            continue
+        column_key = index.column_by_lower.get((canonical_table_lower, column_raw.lower()))
+        if column_key is not None:
+            result.columns.add(column_key)
         else:
-            result.columns.add((table, column))
+            # The table is real but no column or measure by this name exists under any
+            # casing -- a stale/typo'd reference, not a resolvable one.
+            result.unresolved.add(f"{table_raw}[{column_raw}]")
 
     for match in _BARE_REF_RE.finditer(text):
         if _within(match.start(), consumed_spans):
             continue
         name = match.group(1)
-        if name in var_names:
+        if name.lower() in var_names_lower:
             continue
-        owners = measures_by_name.get(name)
-        if owners:
-            owner = host_table if host_table in owners else owners[0]
-            result.measures.add((owner, name))
-        elif (host_table, name) in column_names:
-            result.columns.add((host_table, name))
+        candidates = index.measures_by_name_lower.get(name.lower())
+        if candidates:
+            owner = next((c for c in candidates if c[0].lower() == host_table_lower), candidates[0])
+            result.measures.add(owner)
+            continue
+        column_key = index.column_by_lower.get((host_table_lower, name.lower()))
+        if column_key is not None:
+            result.columns.add(column_key)
         else:
             result.unresolved.add(f"[{name}]")
 
     for match in _BARE_TOKEN_RE.finditer(text):
         quoted, bare = match.groups()
-        name = quoted.replace("''", "'") if quoted is not None else bare
-        if name not in table_names:
+        name_raw = quoted.replace("''", "'") if quoted is not None else bare
+        canonical_table = index.table_by_lower.get(name_raw.lower())
+        if canonical_table is None:
             continue
         if _within(match.start(), consumed_spans) or text[match.end() : match.end() + 1] == "[":
             continue  # part of (or immediately followed by) a qualified ref, not table-valued
-        result.tables.add(name)
+        result.tables.add(canonical_table)
 
     return result
 

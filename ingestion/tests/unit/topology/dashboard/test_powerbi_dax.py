@@ -153,3 +153,36 @@ class TestExtractDaxReferences:
         # The measure's own direct 'Date'[Date] ref is still one hop; [Total Sales]'s
         # own SUM(Sales[Amount]) is not pulled in -- that's column_usage.py's job.
         assert refs.columns == {("Date", "Date")}
+
+
+class TestCaseInsensitiveResolution:
+    """Power BI/DAX identifiers are case-insensitive: 'T'[COL] and 'T'[col] name the
+    same column if the model declares either casing. Confirmed against real captured
+    DAX referencing a column under different casing than the model's own declaration."""
+
+    def test_qualified_ref_with_different_table_and_column_casing_resolves_to_canonical(self):
+        refs = extract_dax_references("SUM('SALES'[amount])", _model(), "Sales")
+        assert refs.columns == {("Sales", "Amount")}
+
+    def test_qualified_measure_ref_with_different_casing_resolves_to_canonical(self):
+        refs = extract_dax_references("sales[total sales]", _model(), "Sales")
+        assert refs.measures == {("Sales", "Total Sales")}
+
+    def test_bare_measure_ref_with_different_casing_resolves_to_canonical(self):
+        refs = extract_dax_references("[TOTAL SALES] * 2", _model(), "Customer")
+        assert refs.measures == {("Sales", "Total Sales")}
+
+    def test_bare_column_ref_with_different_casing_resolves_to_canonical(self):
+        refs = extract_dax_references("[amount] * 1.1", _model(), "Sales")
+        assert refs.columns == {("Sales", "Amount")}
+
+    def test_table_valued_argument_with_different_casing_resolves_to_canonical(self):
+        refs = extract_dax_references("COUNTROWS(customer)", _model(), "Sales")
+        assert refs.tables == {"Customer"}
+
+    def test_column_that_does_not_exist_under_any_casing_is_unresolved(self):
+        # The table is real; no column or measure by this name exists under any case.
+        refs = extract_dax_references("Sales[NotAColumnAtAll]", _model(), "Sales")
+        assert refs.unresolved == {"Sales[NotAColumnAtAll]"}
+        assert refs.columns == set()
+        assert refs.measures == set()

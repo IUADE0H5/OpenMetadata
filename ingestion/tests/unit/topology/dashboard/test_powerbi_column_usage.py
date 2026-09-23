@@ -367,13 +367,9 @@ class TestVariationHierarchyLevel:
 
 class TestPerVisualExcludesAutoDateTables:
     """Chart lineage never points at an auto-date table (never ingested into
-    OpenMetadata) -- but the filter is table-level, not "must be a declared business
-    column". dax.py never verifies a DAX column reference actually exists on its
-    table, and a stale or case-mismatched name on a genuine business table still
-    belongs in lineage under its literal DAX spelling -- confirmed against real
-    captured DAX (`'T'[is_IT]` referencing an actual, differently-cased `is_it`
-    column, and `T[pull_author]` referencing a column that doesn't exist under any
-    case) where the reference truth expects exactly that literal text in lineage."""
+    OpenMetadata); business_columns membership is the exact check, since case is no
+    longer a variable by the time a key reaches here (see TestCaseInsensitiveDax /
+    TestCaseInsensitiveReportRefs)."""
 
     def test_direct_column_ref_to_an_auto_date_table_produces_no_lineage_entry(self):
         ref = _ref("LocalDateTable_x", "Year")
@@ -404,11 +400,15 @@ class TestPerVisualExcludesAutoDateTables:
         assert uses == {("Sales", "Amount")}
         assert ("LocalDateTable_x", "Year") not in uses
 
-    def test_case_mismatched_dax_column_ref_on_a_real_table_still_reaches_lineage(self):
-        # The model declares "CustomerId"; the DAX (as real captured measures do)
-        # refers to it with different casing. dax.py resolves this as a column of a
-        # real table without checking exact casing -- lineage must not silently drop
-        # it just because a stricter (table, column) membership check would fail.
+
+class TestCaseInsensitiveDax:
+    """Power BI/DAX identifiers are case-insensitive: `'T'[COL]` and `'T'[col]` name
+    the same column if the model declares either casing. Confirmed against a real
+    captured measure referencing a differently-cased column than the model's own TMDL
+    declaration -- the reference truth treats that as a genuine use of the declared
+    column, not a miss, and expects the canonical (declared) spelling in lineage."""
+
+    def test_case_mismatched_dax_column_ref_resolves_to_canonical_spelling(self):
         model = _model()
         model.tables[0].measures.append(
             TmdlMeasure(name="Distinct Customers", expression="DISTINCTCOUNT(Sales[customerid])")
@@ -416,20 +416,80 @@ class TestPerVisualExcludesAutoDateTables:
         ref = _ref("Sales", "Distinct Customers", kind="measure")
         report = _report(visuals=[_visual("v1", [ref])])
         usage = resolve_column_usage(model, {"r1": report})
+        assert ("Sales", "CustomerId") in usage.used
         uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
-        assert ("Sales", "customerid") in uses
+        assert ("Sales", "CustomerId") in uses
+        assert ("Sales", "customerid") not in uses
 
-    def test_dax_reference_to_a_nonexistent_column_on_a_real_table_still_reaches_lineage(self):
-        # A stale/typo'd column name in DAX, on a table that genuinely exists and
-        # isn't auto-date -- dax.py never verifies the column itself exists, and
-        # neither does the lineage filter; only the table matters.
+    def test_dax_reference_to_a_nonexistent_column_is_unresolved_not_used(self):
+        # A genuinely stale/typo'd column name -- no declared column by this name
+        # under any casing -- must not silently become a phantom "used" column or a
+        # lineage entry; it's unresolved DAX.
         model = _model()
         model.tables[0].measures.append(TmdlMeasure(name="Broken Ref", expression="SUM(Sales[no_such_column])"))
         ref = _ref("Sales", "Broken Ref", kind="measure")
         report = _report(visuals=[_visual("v1", [ref])])
         usage = resolve_column_usage(model, {"r1": report})
+        assert not any(table == "Sales" and column == "no_such_column" for table, column in usage.used)
+        assert usage.per_visual.get(("r1", "v1"), []) == []
+        assert "Sales[no_such_column]" in usage.dax_unresolved
+
+    def test_case_mismatched_sortby_column_resolves(self):
+        model = _model()
+        # RegionSort is declared correctly-cased in the model; point the sortByColumn
+        # text at a different casing, as TMDL text drift could plausibly produce.
+        model.tables[0].columns[3].sort_by_column = "regionsort"
+        report = _report(visuals=[_visual("v1", [_ref("Sales", "Region")])])
+        usage = resolve_column_usage(model, {"r1": report})
+        assert ("Sales", "RegionSort") in usage.used
+
+    def test_case_mismatched_relationship_endpoints_resolve_and_traverse(self):
+        model = _model()
+        model.relationships = [
+            TmdlRelationship("sales", "customerid", "CUSTOMER", "CUSTOMERID"),
+            TmdlRelationship("Sales", "OrderDate", "LocalDateTable_x", "Date"),
+        ]
+        report = _report(visuals=[_visual("v1", [_ref("Sales", "Amount"), _ref("Customer", "Name")])])
+        usage = resolve_column_usage(model, {"r1": report})
+        assert ("Sales", "CustomerId") in usage.used
+        assert ("Customer", "CustomerId") in usage.used
+        assert usage.counters["relationships_traversed"] == 1
+
+    def test_relationship_endpoint_matching_no_column_under_any_case_is_skipped(self):
+        model = _model()
+        model.relationships = [TmdlRelationship("Sales", "NoSuchColumn", "Customer", "CustomerId")]
+        report = _report(visuals=[_visual("v1", [_ref("Sales", "Amount"), _ref("Customer", "Name")])])
+        usage = resolve_column_usage(model, {"r1": report})  # must not raise
+        assert usage.counters["relationships_traversed"] == 0
+
+
+class TestCaseInsensitiveReportRefs:
+    def test_report_field_ref_with_different_casing_resolves_to_canonical_column(self):
+        ref = _ref("sales", "amount")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(_model(), {"r1": report})
+        assert ("Sales", "Amount") in usage.used
         uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
-        assert ("Sales", "no_such_column") in uses
+        assert ("Sales", "Amount") in uses
+
+    def test_report_field_ref_with_different_casing_measure_resolves(self):
+        ref = _ref("SALES", "TOTAL SALES", kind="measure")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(_model(), {"r1": report})
+        assert ("Sales", "Amount") in usage.used
+
+    def test_hierarchy_level_ref_with_different_casing_resolves(self):
+        ref = _ref("sales", "region", kind="hierarchy_level", hierarchy="geo hierarchy")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(_model(), {"r1": report})
+        assert ("Sales", "Region") in usage.used
+
+    def test_report_field_ref_to_a_column_that_does_not_exist_under_any_case_is_dangling(self):
+        ref = _ref("Sales", "TotallyMadeUp")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(_model(), {"r1": report})
+        assert usage.dangling["r1"] == [ref]
+        assert not any(table == "Sales" and column == "TotallyMadeUp" for table, column in usage.used)
 
 
 class TestPerVisualMeasureClosureIsolation:
