@@ -81,6 +81,8 @@ class ModelColumnUsage:
     used: frozenset[ColumnKey]
     unused: frozenset[ColumnKey]
     wholly_unused_tables: frozenset[str]
+    # Business columns only -- an auto-date table is never ingested into OpenMetadata,
+    # so a lineage entry pointing at one would be silently dropped by the server.
     per_visual: dict[VisualKey, list[ColumnUse]] = field(default_factory=dict)
     dangling: dict[str, list[FieldRef]] = field(default_factory=dict)
     dax_unresolved: set[str] = field(default_factory=set)
@@ -99,11 +101,6 @@ class _ModelIndex:
     sort_by: dict[ColumnKey, str]
     measure_deps: dict[ColumnKey, DaxReferences]
     calc_column_deps: dict[ColumnKey, DaxReferences]
-    # (business_table, business_column) -> {level_name: auto_date_table_column_key}.
-    # Built from each column's TMDL `variation` block; used only to additionally
-    # resolve chart lineage for the internal auto-date table a variation drills into
-    # (report_definition.py has no model access to look that table up itself).
-    variation_levels: dict[ColumnKey, dict[str, ColumnKey]]
 
 
 def _build_index(model: SemanticModelDefinition) -> _ModelIndex:
@@ -137,33 +134,7 @@ def _build_index(model: SemanticModelDefinition) -> _ModelIndex:
             for column in table.columns
             if column.expression
         },
-        variation_levels=_build_variation_levels(model),
     )
-
-
-def _build_variation_levels(model: SemanticModelDefinition) -> dict[ColumnKey, dict[str, ColumnKey]]:
-    tables_by_name = {table.name: table for table in model.tables}
-    result: dict[ColumnKey, dict[str, ColumnKey]] = {}
-    for table in model.tables:
-        for column in table.columns:
-            for variation in column.variations:
-                if variation.default_hierarchy is None:
-                    continue
-                auto_date_table_name, hierarchy_name = variation.default_hierarchy
-                auto_date_table = tables_by_name.get(auto_date_table_name)
-                if auto_date_table is None:
-                    continue
-                hierarchy = next((h for h in auto_date_table.hierarchies if h.name == hierarchy_name), None)
-                if hierarchy is None:
-                    continue
-                levels = {
-                    level.name: (auto_date_table_name, level.column)
-                    for level in hierarchy.levels
-                    if level.column is not None
-                }
-                if levels:
-                    result[(table.name, column.name)] = levels
-    return result
 
 
 def _resolve_ref(ref: FieldRef, index: _ModelIndex) -> tuple[str, ColumnKey] | None:
@@ -244,25 +215,22 @@ def _collect_direct_usage(
             metric = "hierarchy_level_refs" if ref.kind == "hierarchy_level" else "direct_column_refs"
             counters[metric] += 1
             result.used.add(key)
-            if visual_key is not None:
+            # Chart lineage is business columns only: auto-date tables are never
+            # ingested into OpenMetadata, so a lineage entry pointing at one would be
+            # silently dropped by the server. A variation ref already resolved to its
+            # business column above (key), which is all chart lineage gets from it --
+            # `ref.variation_level` is kept on the FieldRef for logging only.
+            if visual_key is not None and key in index.business_columns:
                 result.per_visual.setdefault(visual_key, []).append(ColumnUse(key[0], key[1]))
-            if ref.kind == "hierarchy_level" and ref.hierarchy is None and ref.variation_level is not None:
-                # A variation ref resolves to its business column above (needed for
-                # used_5); the internal auto-date table's own same-named column is a
-                # second, separate physical touch for chart lineage only -- it's never
-                # a business column, so it can't affect used_5/unused_5 either way.
-                auto_date_key = index.variation_levels.get(key, {}).get(ref.variation_level)
-                if auto_date_key is not None:
-                    result.used.add(auto_date_key)
-                    if visual_key is not None:
-                        result.per_visual[visual_key].append(ColumnUse(auto_date_key[0], auto_date_key[1]))
         else:
             counters["direct_measure_refs"] += 1
             reached = _measure_closure(key, index.measure_deps, result.measures_seen, result.dax_unresolved)
             result.used.update(reached)
             if visual_key is not None:
                 entries = result.per_visual.setdefault(visual_key, [])
-                entries.extend(ColumnUse(col[0], col[1], via_measure=key[1]) for col in reached)
+                entries.extend(
+                    ColumnUse(col[0], col[1], via_measure=key[1]) for col in reached if col in index.business_columns
+                )
 
     for report_id, report in reports.items():
         counters["reports"] += 1

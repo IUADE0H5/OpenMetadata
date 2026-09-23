@@ -337,16 +337,20 @@ class TestVariationHierarchyLevel:
         # The auto-date table itself is never a business column, used_5 or not.
         assert ("LocalDateTable_x", "Year") not in usage.used
 
-    def test_also_touches_the_auto_date_table_column_for_chart_lineage(self):
+    def test_chart_lineage_contains_only_the_business_column_never_the_auto_date_table(self):
+        # Auto-date tables are never ingested into OpenMetadata, so a lineage entry
+        # pointing at one would be silently dropped by the server -- chart lineage for
+        # a variation ref is the business column only, regardless of variation_level.
         ref = _ref("Sales", "OrderDate", kind="hierarchy_level", variation_level="Year")
         report = _report(visuals=[_visual("v1", [ref])])
         usage = resolve_column_usage(_model(), {"r1": report})
         uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
-        assert ("Sales", "OrderDate") in uses
-        assert ("LocalDateTable_x", "Year") in uses
+        assert uses == {("Sales", "OrderDate")}
+        assert not any(table == "LocalDateTable_x" for table, _ in uses)
 
-    def test_unresolvable_variation_level_produces_no_auto_date_touch(self):
-        # The column has no variation targeting a "Month" level in this fixture.
+    def test_variation_level_with_no_matching_model_variation_is_still_business_column_only(self):
+        # The column has no variation targeting a "Month" level in this fixture --
+        # doesn't matter, since chart lineage never looks at the auto-date side at all.
         ref = _ref("Sales", "OrderDate", kind="hierarchy_level", variation_level="Month")
         report = _report(visuals=[_visual("v1", [ref])])
         usage = resolve_column_usage(_model(), {"r1": report})
@@ -359,6 +363,41 @@ class TestVariationHierarchyLevel:
         usage = resolve_column_usage(_model(), {"r1": report})
         uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
         assert uses == {("Sales", "Amount")}
+
+
+class TestPerVisualIsBusinessColumnsOnly:
+    """Section-5 `used` can (and does) contain non-business info transiently on its way
+    to being filtered; per_visual chart lineage must never leak an auto-date table
+    column into it, however the ref got there."""
+
+    def test_direct_column_ref_to_an_auto_date_table_produces_no_lineage_entry(self):
+        ref = _ref("LocalDateTable_x", "Year")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(_model(), {"r1": report})
+        assert usage.per_visual.get(("r1", "v1"), []) == []
+        # Still resolved (not dangling) and still excluded from used_5, same as always.
+        assert "r1" not in usage.dangling
+
+    def test_regular_hierarchy_level_ref_directly_on_the_auto_date_table_is_excluded(self):
+        # A report can reference the auto-date table's own native hierarchy directly
+        # (not via a variation) -- e.g. a Year slicer built straight off the internal
+        # date table. Still never chart lineage.
+        ref = _ref("LocalDateTable_x", "Year", kind="hierarchy_level", hierarchy="Date Hierarchy")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(_model(), {"r1": report})
+        assert usage.per_visual.get(("r1", "v1"), []) == []
+
+    def test_measure_reaching_an_auto_date_column_excludes_it_from_lineage_but_not_used(self):
+        model = _model()
+        model.tables[0].measures.append(
+            TmdlMeasure(name="Touches Auto Date", expression="SUM(Sales[Amount]) + LocalDateTable_x[Year]")
+        )
+        ref = _ref("Sales", "Touches Auto Date", kind="measure")
+        report = _report(visuals=[_visual("v1", [ref])])
+        usage = resolve_column_usage(model, {"r1": report})
+        uses = {(u.table, u.column) for u in usage.per_visual[("r1", "v1")]}
+        assert uses == {("Sales", "Amount")}
+        assert ("LocalDateTable_x", "Year") not in uses
 
 
 class TestPerVisualMeasureClosureIsolation:
