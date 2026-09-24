@@ -17,12 +17,14 @@ Lifecycle contract:
     around the workspace iteration).
 """
 
+from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.ingestion.source.dashboard.powerbi.models import (
     Dataflow,
     DataflowExportResponse,
     Dataset,
     Group,
     PowerBIDashboard,
+    PowerBIPrincipal,
     PowerBIReport,
 )
 
@@ -43,14 +45,55 @@ class WorkspaceState:
     tenant; only the id is required, not the report payload).
     """
 
+    # Bounded per CLAUDE.md's cache rule, even though these are released on
+    # every `exit()` - a pathological single workspace should still degrade
+    # to recomputing rather than grow unbounded within one `enter()` scope.
+    _MAX_CACHED_OWNER_REFS = 5_000
+
     def __init__(self) -> None:
         self._current: Group | None = None
         self._datasets_by_id: dict[str, Dataset] = {}
+        self._reports_by_id: dict[str, PowerBIReport] = {}
         self._dataflow_exports: dict[str, DataflowExportResponse] = {}
         self._known_report_ids: set[str] = set()
         self._filtered_dashboards: list[DashboardLike] = []
         self._filtered_datamodels: list[DataModelLike] | None = None
         self._dashboard_charts: dict[str, list[str]] = {}
+        self._workspace_principals: list[PowerBIPrincipal] = []
+        self._dataset_owner_refs: dict[str, list[EntityReference]] = {}
+        self._dataflow_owner_refs: dict[str, list[EntityReference]] = {}
+        # Report/model definitions fetched from Fabric and the column usage computed
+        # from them - only populated when `report_column_usage_enabled` is True.
+        # Same per-workspace, reset-on-exit lifecycle as `_dataflow_exports`.
+        self._report_definitions: dict[str, object] = {}
+        self._semantic_model_definitions: dict[str, object] = {}
+        self._column_usage: dict[str, object] = {}
+        self._column_usage_computed: bool = False
+        self._report_last_updated: dict[str, str | None] | None = None
+        self._semantic_model_last_updated: dict[str, str | None] | None = None
+        # (from_id, to_id) pairs a column-carrying lineage edge has already been
+        # written for, this workspace, this run. `create_datamodel_report_lineage`
+        # and `_emit_om_target_lineage` re-process the same edges many times over
+        # (once per report x db-service-prefix), and `addLineage` replaces an
+        # edge's whole `columnsLineage` on every call rather than merging - so a
+        # second, columnless pass over an edge already written with columns would
+        # silently wipe them. Not size-capped like `_MAX_CACHED_OWNER_REFS` above:
+        # a cap would let entries evict and re-allow the very re-write this guards
+        # against. Its natural bound is one workspace's distinct column-carrying
+        # edges - it's cleared on every `enter()`/`exit()`, same as the other
+        # per-workspace state.
+        self._emitted_column_lineage_edges: set[tuple[str, str]] = set()
+        # Report ids whose visual charts, and dataset ids whose TMDL tables, have
+        # already been processed this workspace, this run. `yield_dashboard_chart`
+        # and `yield_datamodel` are topology `NodeStage`s on the "dashboard" node -
+        # its producer yields once per report, and each stage's own body then loops
+        # every report/dataset in the workspace again, so without this a report's
+        # charts (and the METRIC_VISUALS_*/METRIC_REPORT_VISUAL_CHARTS_CREATED
+        # counters, and duplicate FQNs in `state._dashboard_charts`) and a dataset's
+        # TMDL ingestion (METRIC_MODEL_COLUMNS_INGESTED/METRIC_AUTO_DATE_TABLES_SKIPPED)
+        # get redone and recounted once per *other* report in the workspace too.
+        self._processed_report_chart_ids: set[str] = set()
+        self._processed_tmdl_dataset_ids: set[str] = set()
 
     def enter(self, workspace: Group) -> None:
         """Activate `workspace` and build its per-workspace caches.
@@ -65,9 +108,24 @@ class WorkspaceState:
             )
         self._current = workspace
         self._datasets_by_id = {d.id: d for d in workspace.datasets or []}
+        self._reports_by_id = {r.id: r for r in workspace.reports or []}
         self._filtered_dashboards = []
         self._filtered_datamodels = None
         self._dashboard_charts = {}
+        # Non-admin only; empty for a workspace built from the admin scan
+        # (owner resolution there reads each entity's own `users` instead).
+        self._workspace_principals = workspace.workspace_principals or []
+        self._dataset_owner_refs = {}
+        self._dataflow_owner_refs = {}
+        self._report_definitions = {}
+        self._semantic_model_definitions = {}
+        self._column_usage = {}
+        self._column_usage_computed = False
+        self._report_last_updated = None
+        self._semantic_model_last_updated = None
+        self._emitted_column_lineage_edges = set()
+        self._processed_report_chart_ids = set()
+        self._processed_tmdl_dataset_ids = set()
         for report in workspace.reports or []:
             self._known_report_ids.add(report.id)
 
@@ -77,10 +135,23 @@ class WorkspaceState:
             return
         self._current = None
         self._datasets_by_id = {}
+        self._reports_by_id = {}
         self._dataflow_exports = {}
         self._filtered_dashboards = []
         self._filtered_datamodels = None
         self._dashboard_charts = {}
+        self._workspace_principals = []
+        self._dataset_owner_refs = {}
+        self._dataflow_owner_refs = {}
+        self._report_definitions = {}
+        self._semantic_model_definitions = {}
+        self._column_usage = {}
+        self._column_usage_computed = False
+        self._report_last_updated = None
+        self._semantic_model_last_updated = None
+        self._emitted_column_lineage_edges = set()
+        self._processed_report_chart_ids = set()
+        self._processed_tmdl_dataset_ids = set()
 
     @property
     def current(self) -> Group:
@@ -97,6 +168,20 @@ class WorkspaceState:
         """Return True if `report_id` was seen in any workspace entered so far."""
         return report_id is not None and report_id in self._known_report_ids
 
+    def find_report(self, report_id: str) -> PowerBIReport | None:
+        """Look up a report by id in the current workspace.
+
+        Used for non-admin dashboard owner resolution, which has no owner
+        endpoint of its own and instead unions the owners of the reports
+        behind the dashboard's tiles.
+        """
+        return self._reports_by_id.get(report_id)
+
+    @property
+    def workspace_principals(self) -> list[PowerBIPrincipal]:
+        """This workspace's membership (non-admin only; empty under the admin scan)."""
+        return self._workspace_principals
+
     def cache_dataflow_export(self, key: str, export: DataflowExportResponse) -> None:
         """Memoise a dataflow export for the current workspace's lineage stage."""
         self._dataflow_exports[key] = export
@@ -104,6 +189,35 @@ class WorkspaceState:
     def get_dataflow_export(self, key: str) -> DataflowExportResponse | None:
         """Fetch a previously cached dataflow export for the current workspace."""
         return self._dataflow_exports.get(key)
+
+    # --- Non-admin owner refs: memoised per dataset/dataflow id -------------
+    #
+    # A dataset's (or dataflow's) owner set is recomputed by every dependent
+    # asset that inherits it - a report via its `datasetId`, a dashboard via
+    # every tile's report - so without this cache the same OpenMetadata
+    # lookups (`resolve_owner_principal`) run once per dependent, and the
+    # owner_principals_* counters count each principal once per dependent
+    # instead of once per owning asset. Caching here (not in the source
+    # itself) keeps the memoisation workspace-scoped, matching every other
+    # per-workspace cache on this class.
+
+    def cache_dataset_owner_refs(self, dataset_id: str, owner_refs: list[EntityReference]) -> None:
+        """Memoise a dataset's computed owner refs for the current workspace."""
+        if len(self._dataset_owner_refs) < self._MAX_CACHED_OWNER_REFS:
+            self._dataset_owner_refs[dataset_id] = owner_refs
+
+    def get_dataset_owner_refs(self, dataset_id: str) -> list[EntityReference] | None:
+        """Fetch a previously cached dataset owner-refs list; `None` on a cache miss."""
+        return self._dataset_owner_refs.get(dataset_id)
+
+    def cache_dataflow_owner_refs(self, dataflow_id: str, owner_refs: list[EntityReference]) -> None:
+        """Memoise a dataflow's computed owner refs for the current workspace."""
+        if len(self._dataflow_owner_refs) < self._MAX_CACHED_OWNER_REFS:
+            self._dataflow_owner_refs[dataflow_id] = owner_refs
+
+    def get_dataflow_owner_refs(self, dataflow_id: str) -> list[EntityReference] | None:
+        """Fetch a previously cached dataflow owner-refs list; `None` on a cache miss."""
+        return self._dataflow_owner_refs.get(dataflow_id)
 
     # --- Filtered dashboards: write per-item, read by iteration -------------
 
@@ -136,3 +250,100 @@ class WorkspaceState:
     def pop_dashboard_chart_ids(self, dashboard_id: str) -> list[str]:
         """Consume the chart ids for a dashboard; empty list if absent or already consumed."""
         return self._dashboard_charts.pop(dashboard_id, [])
+
+    # --- Report/model definitions + column usage: report-column-usage feature only ---
+    #
+    # Populated only when `PowerbiSource.report_column_usage_enabled` is True. Report
+    # and model definitions are cached as they're fetched (chart/datamodel stages) so
+    # the later lineage stage, which runs in the same workspace scope, reuses them
+    # instead of re-fetching from Fabric.
+
+    def cache_report_definition(self, report_id: str, definition: object) -> None:
+        """Memoise a parsed report definition for the current workspace."""
+        self._report_definitions[report_id] = definition
+
+    def get_report_definition(self, report_id: str) -> object | None:
+        """Fetch a previously cached report definition; `None` on a cache miss."""
+        return self._report_definitions.get(report_id)
+
+    def cache_semantic_model_definition(self, dataset_id: str, definition: object) -> None:
+        """Memoise a parsed semantic model (TMDL) definition for the current workspace."""
+        self._semantic_model_definitions[dataset_id] = definition
+
+    def get_semantic_model_definition(self, dataset_id: str) -> object | None:
+        """Fetch a previously cached semantic model definition; `None` on a cache miss."""
+        return self._semantic_model_definitions.get(dataset_id)
+
+    def cache_column_usage(self, dataset_id: str, usage: object) -> None:
+        """Memoise a dataset's computed `ModelColumnUsage` for the current workspace."""
+        self._column_usage[dataset_id] = usage
+
+    def get_column_usage(self, dataset_id: str) -> object | None:
+        """Fetch a previously cached `ModelColumnUsage`; `None` on a cache miss."""
+        return self._column_usage.get(dataset_id)
+
+    @property
+    def column_usage_computed(self) -> bool:
+        """Whether `resolve_column_usage` has already run for every dataset in this workspace."""
+        return self._column_usage_computed
+
+    def mark_column_usage_computed(self) -> None:
+        """Record that column usage has been computed for every dataset in the current workspace."""
+        self._column_usage_computed = True
+
+    # --- Report/model lastUpdatedTimeUtc listings: write-once (lazy memo) -----------
+    #
+    # One `FabricApiClient.list_*_last_updated` call per workspace per run, not one per
+    # item - same lazy-memo shape as `filtered_datamodels`. `None` until populated;
+    # populated with `{}` (not left `None`) when the listing call itself failed, so a
+    # miss reads the same as "not in this workspace" rather than triggering a re-fetch
+    # per item for the rest of the run.
+
+    def set_report_last_updated(self, mapping: dict[str, str | None]) -> None:
+        """Populate the memoised report-id -> lastUpdatedTimeUtc map for the current workspace."""
+        self._report_last_updated = mapping
+
+    @property
+    def report_last_updated(self) -> dict[str, str | None] | None:
+        """Memoised report lastUpdatedTimeUtc map; `None` until populated via setter."""
+        return self._report_last_updated
+
+    def set_semantic_model_last_updated(self, mapping: dict[str, str | None]) -> None:
+        """Populate the memoised model-id -> lastUpdatedTimeUtc map for the current workspace."""
+        self._semantic_model_last_updated = mapping
+
+    @property
+    def semantic_model_last_updated(self) -> dict[str, str | None] | None:
+        """Memoised semantic-model lastUpdatedTimeUtc map; `None` until populated via setter."""
+        return self._semantic_model_last_updated
+
+    # --- Column-lineage edge dedup: write-once per (from_id, to_id), this workspace -
+
+    def has_emitted_column_lineage_edge(self, from_id: str, to_id: str) -> bool:
+        """True if a column-carrying lineage edge for `(from_id, to_id)` has already
+        been written in the current workspace this run - a later write must not be
+        attempted (see `_emitted_column_lineage_edges`'s field comment for why)."""
+        return (from_id, to_id) in self._emitted_column_lineage_edges
+
+    def mark_column_lineage_edge_emitted(self, from_id: str, to_id: str) -> None:
+        """Record that `(from_id, to_id)` has now been written with its full
+        `columnsLineage`, for the current workspace."""
+        self._emitted_column_lineage_edges.add((from_id, to_id))
+
+    # --- Report-chart / TMDL-ingestion dedup: write-once per id, this workspace -----
+
+    def has_processed_report_charts(self, report_id: str) -> bool:
+        """True if `report_id`'s visual charts have already been yielded this workspace."""
+        return report_id in self._processed_report_chart_ids
+
+    def mark_report_charts_processed(self, report_id: str) -> None:
+        """Record that `report_id`'s visual charts have been yielded, for the current workspace."""
+        self._processed_report_chart_ids.add(report_id)
+
+    def has_processed_dataset_tmdl(self, dataset_id: str) -> bool:
+        """True if `dataset_id`'s TMDL tables have already been ingested this workspace."""
+        return dataset_id in self._processed_tmdl_dataset_ids
+
+    def mark_dataset_tmdl_processed(self, dataset_id: str) -> None:
+        """Record that `dataset_id`'s TMDL tables have been ingested, for the current workspace."""
+        self._processed_tmdl_dataset_ids.add(dataset_id)

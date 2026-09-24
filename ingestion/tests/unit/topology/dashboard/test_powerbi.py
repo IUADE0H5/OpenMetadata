@@ -19,6 +19,10 @@ from metadata.generated.schema.type.filterPattern import FilterPattern
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.models.barrier import Barrier
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
+from metadata.ingestion.source.dashboard.powerbi.constants import (
+    POWERBI_WRITE_WORKSPACE_ROLES,
+    is_write_dataset_right,
+)
 from metadata.ingestion.source.dashboard.powerbi.metadata import PowerbiSource
 from metadata.ingestion.source.dashboard.powerbi.models import (
     Dataflow,
@@ -28,15 +32,20 @@ from metadata.ingestion.source.dashboard.powerbi.models import (
     DataflowMashup,
     Datamart,
     Dataset,
+    DatasetUpstreamDataflowLink,
+    DatasetUpstreamDataflowLinksResponse,
     Datasource,
     DatasourceConnectionDetails,
     Group,
     PowerBiColumns,
     PowerBIDashboard,
+    PowerBIDatasetUser,
+    PowerBIPrincipal,
     PowerBIReport,
     PowerBiTable,
     PowerBITableSource,
     PowerBIUser,
+    PowerBIWorkspaceUser,
     ReportPage,
     Tile,
     UpstreaDataflow,
@@ -703,6 +712,234 @@ MOCK_DATAMART = Datamart(
             targetDatamartId="datamart_b",
         ),
     ],
+)
+
+# --- Athena / ODBC-to-Athena PowerBI connector fixtures (neutral names) ---
+
+# Three-level AmazonAthena.Databases navigation: AwsDataCatalog placeholder ->
+# Glue database -> table. `#"Navigation N"` step names, as the real connector emits.
+MOCK_ATHENA_NAV_EXP = """let
+    Source = AmazonAthena.Databases("warehouse-dsn", null, []),
+    #"Navigation 1" = Source{[Name = "AwsDataCatalog", Kind = "Database"]}[Data],
+    #"Navigation 2" = #"Navigation 1"{[Name = "sales_db", Kind = "Schema"]}[Data],
+    #"Navigation 3" = #"Navigation 2"{[Name = "orders", Kind = "Table"]}[Data]
+in
+    #"Navigation 3"
+"""
+
+# Same shape, but the Database level is a real federated catalog, not the
+# AwsDataCatalog placeholder - it should be returned as the database.
+MOCK_ATHENA_NAV_FEDERATED_CATALOG_EXP = """let
+    Source = AmazonAthena.Databases("analytics-dsn", null, []),
+    Navigation1 = Source{[Name = "external_catalog", Kind = "Database"]}[Data],
+    Navigation2 = Navigation1{[Name = "sales_db", Kind = "Schema"]}[Data],
+    Navigation3 = Navigation2{[Name = "orders", Kind = "Table"]}[Data]
+in
+    Navigation3
+"""
+
+# Kind="View" instead of "Table", and unnumbered/unquoted step names.
+MOCK_ATHENA_NAV_VIEW_EXP = """let
+    Source = AmazonAthena.Databases("warehouse-dsn", null, []),
+    Navigation = Source{[Name = "AwsDataCatalog", Kind = "Database"]}[Data],
+    Navigation1 = Navigation{[Name = "sales_db", Kind = "Schema"]}[Data],
+    Navigation2 = Navigation1{[Name = "orders_view", Kind = "View"]}[Data]
+in
+    Navigation2
+"""
+
+# The only native-SQL shape observed in live capture: Odbc.Query with a DSN
+# and double-quoted schema/table identifiers.
+MOCK_ODBC_QUERY_EXP = (
+    "let\n"
+    '    Source = Odbc.Query("dsn=warehouse-dsn", "select * from ""sales_db"".""orders"" limit 10;")\n'
+    "in\n"
+    "    Source\n"
+)
+
+MOCK_DATAFLOW_ATHENA_BLOCK = (
+    "Orders = let\n"
+    '  Source = AmazonAthena.Databases("warehouse-dsn", null, []),\n'
+    '  #"Navigation 1" = Source{[Name = "AwsDataCatalog", Kind = "Database"]}[Data],\n'
+    '  #"Navigation 2" = #"Navigation 1"{[Name = "sales_db", Kind = "Schema"]}[Data],\n'
+    '  #"Navigation 3" = #"Navigation 2"{[Name = "orders", Kind = "Table"]}[Data]\n'
+    "in\n"
+    '  #"Navigation 3";\r\n'
+)
+
+MOCK_DATAFLOW_ATHENA_SECOND_DSN_BLOCK = (
+    "Customers = let\n"
+    '  Source = AmazonAthena.Databases("analytics-dsn", null, []),\n'
+    '  #"Navigation 1" = Source{[Name = "AwsDataCatalog", Kind = "Database"]}[Data],\n'
+    '  #"Navigation 2" = #"Navigation 1"{[Name = "crm_db", Kind = "Schema"]}[Data],\n'
+    '  #"Navigation 3" = #"Navigation 2"{[Name = "customers", Kind = "Table"]}[Data]\n'
+    "in\n"
+    '  #"Navigation 3";\r\n'
+)
+
+MOCK_DATAFLOW_ODBC_QUERY_BLOCK = (
+    "OrdersOdbc = let\n"
+    '  Source = Odbc.Query("dsn=warehouse-dsn", "select * from ""sales_db"".""orders"" limit 10;")\n'
+    "in\n"
+    "  Source;\r\n"
+)
+
+MOCK_DATAFLOW_ATHENA_QUERIES_METADATA = {
+    "Orders": {"queryId": "q1", "queryName": "Orders", "loadEnabled": True},
+    "Customers": {"queryId": "q2", "queryName": "Customers", "loadEnabled": True},
+    "OrdersOdbc": {"queryId": "q3", "queryName": "OrdersOdbc", "loadEnabled": True},
+}
+
+MOCK_DATAFLOW_ATHENA_DOCUMENT = (
+    "section Section1;\r\n"
+    "shared "
+    + MOCK_DATAFLOW_ATHENA_BLOCK
+    + "shared "
+    + MOCK_DATAFLOW_ATHENA_SECOND_DSN_BLOCK
+    + "shared "
+    + MOCK_DATAFLOW_ODBC_QUERY_BLOCK
+)
+
+MOCK_DATAFLOW_EXPORT_ATHENA = DataflowExportResponse(
+    name="AthenaDataflow",
+    description="Test Athena dataflow",
+    version="1.0",
+    entities=[
+        DataflowEntity(
+            name="Orders",
+            description="",
+            attributes=[
+                DataflowEntityAttribute(name="OrderId", dataType="int64"),
+                DataflowEntityAttribute(name="Amount", dataType="double"),
+            ],
+        ),
+    ],
+    **{
+        "pbi:mashup": DataflowMashup(
+            document=MOCK_DATAFLOW_ATHENA_DOCUMENT,
+            queriesMetadata=MOCK_DATAFLOW_ATHENA_QUERIES_METADATA,
+        )
+    },
+)
+
+# --- Counter-reconciliation fixtures (neutral names) ---
+
+# One disabled Athena query (would have been lineage-relevant) plus one
+# disabled non-SQL helper query (SharePoint - never lineage-relevant), to
+# prove the skip counter only counts the former.
+MOCK_DATAFLOW_LOAD_DISABLED_ATHENA_BLOCK = (
+    "DisabledOrders = let\n"
+    '  Source = AmazonAthena.Databases("warehouse-dsn", null, []),\n'
+    '  #"Navigation 1" = Source{[Name = "AwsDataCatalog", Kind = "Database"]}[Data],\n'
+    '  #"Navigation 2" = #"Navigation 1"{[Name = "sales_db", Kind = "Schema"]}[Data],\n'
+    '  #"Navigation 3" = #"Navigation 2"{[Name = "orders_disabled", Kind = "Table"]}[Data]\n'
+    "in\n"
+    '  #"Navigation 3";\r\n'
+)
+
+MOCK_DATAFLOW_LOAD_DISABLED_HELPER_BLOCK = (
+    "DisabledHelper = let\n"
+    '  Source = SharePoint.Files("https://example.sharepoint.com/sites/test", [ApiVersion = 15]),\n'
+    "  Filtered = Table.SelectRows(Source, each true)\n"
+    "in\n"
+    "  Filtered;\r\n"
+)
+
+MOCK_DATAFLOW_LOAD_DISABLED_DOCUMENT = (
+    "section Section1;\r\n"
+    "shared " + MOCK_DATAFLOW_LOAD_DISABLED_ATHENA_BLOCK + "shared " + MOCK_DATAFLOW_LOAD_DISABLED_HELPER_BLOCK
+)
+
+MOCK_DATAFLOW_LOAD_DISABLED_QUERIES_METADATA = {
+    "DisabledOrders": {"queryId": "q1", "queryName": "DisabledOrders", "loadEnabled": None},
+    "DisabledHelper": {"queryId": "q2", "queryName": "DisabledHelper"},
+}
+
+MOCK_DATAFLOW_EXPORT_LOAD_DISABLED = DataflowExportResponse(
+    name="DisabledQueriesDataflow",
+    entities=[],
+    **{
+        "pbi:mashup": DataflowMashup(
+            document=MOCK_DATAFLOW_LOAD_DISABLED_DOCUMENT,
+            queriesMetadata=MOCK_DATAFLOW_LOAD_DISABLED_QUERIES_METADATA,
+        )
+    },
+)
+
+# The same table (sales_db.user_activity) reached via two different M
+# queries in one dataflow: an Athena navigation and an Odbc.Query - the
+# "test query for api" pattern seen in the real capture.
+MOCK_DATAFLOW_DUPLICATE_REF_NAV_BLOCK = (
+    "ActivityNav = let\n"
+    '  Source = AmazonAthena.Databases("warehouse-dsn", null, []),\n'
+    '  #"Navigation 1" = Source{[Name = "AwsDataCatalog", Kind = "Database"]}[Data],\n'
+    '  #"Navigation 2" = #"Navigation 1"{[Name = "sales_db", Kind = "Schema"]}[Data],\n'
+    '  #"Navigation 3" = #"Navigation 2"{[Name = "user_activity", Kind = "Table"]}[Data]\n'
+    "in\n"
+    '  #"Navigation 3";\r\n'
+)
+
+MOCK_DATAFLOW_DUPLICATE_REF_ODBC_BLOCK = (
+    "ActivityOdbc = let\n"
+    '  Source = Odbc.Query("dsn=warehouse-dsn", "select * from ""sales_db"".""user_activity"" limit 10;")\n'
+    "in\n"
+    "  Source;\r\n"
+)
+
+MOCK_DATAFLOW_DUPLICATE_REF_DOCUMENT = (
+    "section Section1;\r\n"
+    "shared " + MOCK_DATAFLOW_DUPLICATE_REF_NAV_BLOCK + "shared " + MOCK_DATAFLOW_DUPLICATE_REF_ODBC_BLOCK
+)
+
+MOCK_DATAFLOW_DUPLICATE_REF_QUERIES_METADATA = {
+    "ActivityNav": {"queryId": "q1", "queryName": "ActivityNav", "loadEnabled": True},
+    "ActivityOdbc": {"queryId": "q2", "queryName": "ActivityOdbc", "loadEnabled": True},
+}
+
+MOCK_DATAFLOW_EXPORT_DUPLICATE_REF = DataflowExportResponse(
+    name="DuplicateRefDataflow",
+    entities=[
+        DataflowEntity(
+            name="ActivityNav",
+            attributes=[DataflowEntityAttribute(name="UserId", dataType="int64")],
+        ),
+    ],
+    **{
+        "pbi:mashup": DataflowMashup(
+            document=MOCK_DATAFLOW_DUPLICATE_REF_DOCUMENT,
+            queriesMetadata=MOCK_DATAFLOW_DUPLICATE_REF_QUERIES_METADATA,
+        )
+    },
+)
+
+
+# --- Non-admin owner resolution fixtures (neutral names) ---
+
+MOCK_WORKSPACE_USER_CONTRIBUTOR = PowerBIWorkspaceUser(
+    identifier="ada@example.com",
+    principalType="User",
+    displayName="Ada",
+    emailAddress="ada@example.com",
+    groupUserAccessRight="Contributor",
+)
+MOCK_WORKSPACE_USER_VIEWER = PowerBIWorkspaceUser(
+    identifier="viewer@example.com",
+    principalType="User",
+    displayName="Viewer",
+    emailAddress="viewer@example.com",
+    groupUserAccessRight="Viewer",
+)
+MOCK_WORKSPACE_GROUP = PowerBIWorkspaceUser(
+    identifier="group-object-id",
+    principalType="Group",
+    displayName="Analytics Team",
+    groupUserAccessRight="Member",
+)
+MOCK_WORKSPACE_APP = PowerBIWorkspaceUser(
+    identifier="app-object-id",
+    principalType="App",
+    displayName="Some App",
+    groupUserAccessRight="Admin",
 )
 
 
@@ -2563,3 +2800,1491 @@ class PowerBIUnitTest(TestCase):
         assert request.dataModelType == DataModelType.PowerBIDatamart
         assert request.columns == []
         assert request.sourceUrl.root.endswith("/groups/ws-1/datamarts/datamart_b?experience=power-bi")
+
+    @pytest.mark.order(60)
+    def test_parse_athena_source_navigation_default_catalog(self):
+        """
+        AmazonAthena.Databases navigation whose Kind="Database" level is the
+        literal AwsDataCatalog placeholder: the catalog is not an OM database.
+        """
+        result = self.powerbi._parse_athena_source(MOCK_ATHENA_NAV_EXP)
+        assert result is not None
+        assert len(result) == 1
+        table_info = result[0]
+        assert table_info["database"] is None
+        assert table_info["schema"] == "sales_db"
+        assert table_info["table"] == "orders"
+        assert table_info["dsn"] == "warehouse-dsn"
+
+    @pytest.mark.order(61)
+    def test_parse_athena_source_navigation_federated_catalog(self):
+        """
+        A Kind="Database" level that is not the AwsDataCatalog placeholder is a
+        real federated catalog, and is returned as the database.
+        """
+        result = self.powerbi._parse_athena_source(MOCK_ATHENA_NAV_FEDERATED_CATALOG_EXP)
+        assert result is not None
+        table_info = result[0]
+        assert table_info["database"] == "external_catalog"
+        assert table_info["schema"] == "sales_db"
+        assert table_info["table"] == "orders"
+        assert table_info["dsn"] == "analytics-dsn"
+
+    @pytest.mark.order(62)
+    def test_parse_athena_source_navigation_view_kind_and_step_name_variation(self):
+        """
+        Kind="View" is accepted like "Table", and unquoted, unsuffixed step
+        names (Navigation instead of #"Navigation 3") are tolerated because
+        parsing matches the {[Name=..., Kind=...]} record, never step names.
+        """
+        result = self.powerbi._parse_athena_source(MOCK_ATHENA_NAV_VIEW_EXP)
+        assert result is not None
+        table_info = result[0]
+        assert table_info["database"] is None
+        assert table_info["schema"] == "sales_db"
+        assert table_info["table"] == "orders_view"
+
+    @pytest.mark.order(63)
+    def test_parse_athena_source_odbc_query_uses_athena_dialect(self):
+        """
+        Odbc.Query SQL is extracted and parsed with Dialect.ATHENA so
+        double-quoted identifiers resolve to schema + table.
+        """
+        from metadata.ingestion.lineage.models import Dialect
+
+        with patch.object(
+            self.powerbi,
+            "_extract_tables_from_sql",
+            wraps=self.powerbi._extract_tables_from_sql,
+        ) as mock_extract:
+            result = self.powerbi._parse_athena_source(MOCK_ODBC_QUERY_EXP)
+
+        mock_extract.assert_called_once()
+        assert mock_extract.call_args.kwargs.get("dialect") == Dialect.ATHENA
+
+        assert result is not None
+        table_info = result[0]
+        assert table_info["schema"] == "sales_db"
+        assert table_info["table"] == "orders"
+        assert table_info["dsn"] == "warehouse-dsn"
+
+    @pytest.mark.order(64)
+    def test_parse_athena_source_non_athena_returns_none(self):
+        """Non-Athena/ODBC sources are left to the other parsers."""
+        assert self.powerbi._parse_athena_source(MOCK_REDSHIFT_EXP) is None
+
+    @pytest.mark.order(65)
+    def test_resolve_source_database_default_and_override(self):
+        """
+        Default resolve_source_database returns the parsed "database"; a
+        subclass override can map the DSN onto a different database.
+        """
+        table_info = {
+            "database": None,
+            "schema": "sales_db",
+            "table": "orders",
+            "dsn": "warehouse-dsn",
+        }
+        assert self.powerbi.resolve_source_database(table_info) is None
+        assert self.powerbi.resolve_source_database({"database": "raw_db"}) == "raw_db"
+
+        class DsnAwarePowerbiSource(PowerbiSource):
+            def resolve_source_database(self, table_info):
+                dsn_to_database = {"warehouse-dsn": "warehouse_catalog"}
+                return dsn_to_database.get(table_info.get("dsn")) or super().resolve_source_database(table_info)
+
+        override_source = DsnAwarePowerbiSource.__new__(DsnAwarePowerbiSource)
+        assert override_source.resolve_source_database(table_info) == "warehouse_catalog"
+        assert override_source.resolve_source_database({"database": "raw_db"}) == "raw_db"
+
+    @pytest.mark.order(66)
+    def test_resolve_source_database_override_changes_fqn_search_string(self):
+        """
+        A resolve_source_database override changes the database used to build
+        the FQN search string that search_in_any_service is queried with.
+        """
+        table = PowerBiTable(
+            name="orders",
+            source=[PowerBITableSource(expression=MOCK_ATHENA_NAV_EXP)],
+        )
+
+        self.powerbi.resolve_source_database = MagicMock(return_value="warehouse_catalog")
+        try:
+            with patch.object(self.powerbi.metadata, "search_in_any_service", return_value=None) as mock_search:
+                list(
+                    self.powerbi._get_table_and_datamodel_lineage(
+                        db_service_prefix=None,
+                        table=table,
+                        datamodel_entity=MOCK_DASHBOARD_DATA_MODEL,
+                    )
+                )
+        finally:
+            del self.powerbi.resolve_source_database
+
+        assert mock_search.call_count == 1
+        fqn_search_string = mock_search.call_args.kwargs["fqn_search_string"]
+        assert "warehouse_catalog" in fqn_search_string
+
+    @pytest.mark.order(67)
+    def test_parse_dataflow_m_document_multi_query_multi_dsn(self):
+        """
+        A dataflow document with two Athena-navigation queries against
+        different DSNs, plus one Odbc.Query-sourced entity, all parse
+        independently and keep their own dsn.
+        """
+        export = DataflowExportResponse(
+            name="AthenaDataflow",
+            entities=[],
+            **{
+                "pbi:mashup": DataflowMashup(
+                    document=MOCK_DATAFLOW_ATHENA_DOCUMENT,
+                    queriesMetadata=MOCK_DATAFLOW_ATHENA_QUERIES_METADATA,
+                )
+            },
+        )
+        result = self.powerbi._parse_dataflow_m_document(export)
+        entity_names = [r["entity_name"] for r in result]
+        assert "Orders" in entity_names
+        assert "Customers" in entity_names
+        assert "OrdersOdbc" in entity_names
+
+        orders_entry = next(r for r in result if r["entity_name"] == "Orders")
+        assert orders_entry["tables"][0]["dsn"] == "warehouse-dsn"
+        assert orders_entry["tables"][0]["schema"] == "sales_db"
+        assert orders_entry["tables"][0]["table"] == "orders"
+
+        customers_entry = next(r for r in result if r["entity_name"] == "Customers")
+        assert customers_entry["tables"][0]["dsn"] == "analytics-dsn"
+        assert customers_entry["tables"][0]["schema"] == "crm_db"
+        assert customers_entry["tables"][0]["table"] == "customers"
+
+        odbc_entry = next(r for r in result if r["entity_name"] == "OrdersOdbc")
+        assert odbc_entry["tables"][0]["dsn"] == "warehouse-dsn"
+        assert odbc_entry["tables"][0]["schema"] == "sales_db"
+        assert odbc_entry["tables"][0]["table"] == "orders"
+        assert odbc_entry["sql"] is not None
+
+    @pytest.mark.order(68)
+    def test_create_dataflow_table_lineage_athena_source(self):
+        """
+        End to end: _parse_dataflow_m_document over an Athena-sourced dataflow
+        document feeds create_dataflow_table_lineage, which resolves the table
+        and emits lineage into the dataflow entity.
+        """
+        mock_table_entity = MagicMock()
+        mock_table_entity.id = uuid.uuid4()
+        mock_table_entity.fullyQualifiedName = "athena_service.sales_db.orders"
+        mock_table_entity.columns = [
+            Column(
+                name="OrderId",
+                dataType=DataType.INT,
+                fullyQualifiedName="athena_service.sales_db.orders.OrderId",
+            ),
+        ]
+
+        mock_datamodel_entity = DashboardDataModel(
+            name="athena_dataflow_id",
+            id=uuid.uuid4(),
+            dataModelType=DataModelType.PowerBIDataFlow.value,
+            columns=[
+                Column(
+                    name="Orders",
+                    dataType=DataType.TABLE,
+                    children=[
+                        Column(
+                            name="OrderId",
+                            dataType=DataType.INT,
+                            fullyQualifiedName="service.athena_dataflow_id.Orders.OrderId",
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        mock_datamodel = Dataflow(name="AthenaDataflow", objectId="athena_dataflow_id")
+
+        with (
+            patch.object(
+                self.powerbi.metadata,
+                "search_in_any_service",
+                return_value=mock_table_entity,
+            ) as mock_search,
+            patch.object(self.powerbi, "_get_add_lineage_request") as mock_lineage_request,
+        ):
+            mock_lineage_request.return_value = MagicMock()
+
+            results = list(
+                self.powerbi.create_dataflow_table_lineage(
+                    datamodel=mock_datamodel,
+                    datamodel_entity=mock_datamodel_entity,
+                    dataflow_export=MOCK_DATAFLOW_EXPORT_ATHENA,
+                    db_service_prefix=None,
+                )
+            )
+
+        assert len(results) > 0
+        assert mock_search.call_count >= 1
+        assert any("sales_db" in c.kwargs["fqn_search_string"] for c in mock_search.call_args_list)
+        assert mock_lineage_request.call_count >= 1
+
+    @pytest.mark.order(69)
+    def test_dataset_upstream_dataflow_link_parses_row_shape(self):
+        """
+        The non-admin workspace-wide dataset->dataflow link row shape
+        ({datasetObjectId, dataflowObjectId, workspaceObjectId}) parses
+        directly, including a cross-workspace row (the dataflow lives in a
+        different workspace than the dataset it links from).
+        """
+        same_workspace_row = DatasetUpstreamDataflowLink(
+            datasetObjectId="dataset-1",
+            dataflowObjectId="dataflow-1",
+            workspaceObjectId="ws-1",
+        )
+        assert same_workspace_row.datasetObjectId == "dataset-1"
+        assert same_workspace_row.dataflowObjectId == "dataflow-1"
+        assert same_workspace_row.workspaceObjectId == "ws-1"
+
+        cross_workspace_row = DatasetUpstreamDataflowLink(
+            datasetObjectId="dataset-2",
+            dataflowObjectId="dataflow-in-other-workspace",
+            workspaceObjectId="ws-2",
+        )
+        assert cross_workspace_row.dataflowObjectId == "dataflow-in-other-workspace"
+        assert cross_workspace_row.workspaceObjectId == "ws-2"
+
+        response = DatasetUpstreamDataflowLinksResponse(
+            **{
+                "@odata.context": "http://example.com/$metadata",
+                "value": [
+                    {
+                        "datasetObjectId": "dataset-1",
+                        "dataflowObjectId": "dataflow-1",
+                        "workspaceObjectId": "ws-1",
+                    },
+                    {
+                        "datasetObjectId": "dataset-2",
+                        "dataflowObjectId": "dataflow-in-other-workspace",
+                        "workspaceObjectId": "ws-2",
+                    },
+                ],
+            }
+        )
+        assert len(response.value) == 2
+        assert response.value[1].workspaceObjectId == "ws-2"
+
+    @pytest.mark.order(70)
+    def test_get_org_workspace_data_wires_dataflows_and_dataset_links(self):
+        """
+        get_org_workspace_data (the non-admin path) populates workspace
+        dataflows, each dataflow's upstreamDataflows, and fills
+        Dataset.upstreamDataflows from the workspace-wide dataset->dataflow
+        links call.
+        """
+        workspace = Group(
+            id="ws-1",
+            name="Sales Workspace",
+            datasets=[Dataset(id="dataset-1", name="Sales Dataset")],
+        )
+
+        mock_api_client = MagicMock()
+        mock_api_client.fetch_all_workspaces.return_value = [workspace]
+        mock_api_client.fetch_all_org_dashboards.return_value = []
+        mock_api_client.fetch_all_org_tiles.return_value = []
+        mock_api_client.fetch_all_org_reports.return_value = []
+        mock_api_client.fetch_all_org_datasets.return_value = []
+        mock_api_client.fetch_dataset_tables.return_value = []
+        mock_api_client.fetch_all_org_dataflows.return_value = [Dataflow(name="SalesFlow", objectId="dataflow-1")]
+        mock_api_client.fetch_dataflow_upstream.return_value = [UpstreaDataflow(targetDataflowId="dataflow-0")]
+        mock_api_client.fetch_dataset_to_dataflow_links.return_value = [
+            DatasetUpstreamDataflowLink(
+                datasetObjectId="dataset-1",
+                dataflowObjectId="dataflow-1",
+                workspaceObjectId="ws-1",
+            )
+        ]
+
+        self.powerbi.client = MagicMock()
+        self.powerbi.client.api_client = mock_api_client
+
+        result_workspaces = list(self.powerbi.get_org_workspace_data())
+
+        assert len(result_workspaces) == 1
+        result_workspace = result_workspaces[0]
+        assert [d.id for d in result_workspace.dataflows] == ["dataflow-1"]
+        assert result_workspace.dataflows[0].upstreamDataflows[0].targetDataflowId == "dataflow-0"
+        assert result_workspace.datasets[0].upstreamDataflows[0].targetDataflowId == "dataflow-1"
+
+    @pytest.mark.order(71)
+    def test_metric_values_counts_dataflows_and_source_references(self):
+        """
+        metric_values() exposes plain counters for a metrics reporter: an
+        Athena source reference that resolves increments both the "parsed"
+        and "resolved" counters.
+        """
+        table = PowerBiTable(
+            name="orders",
+            source=[PowerBITableSource(expression=MOCK_ATHENA_NAV_EXP)],
+        )
+        mock_table_entity = MagicMock()
+        mock_table_entity.name.root = "orders"
+
+        with patch.object(self.powerbi.metadata, "search_in_any_service", return_value=mock_table_entity):
+            list(
+                self.powerbi._get_table_and_datamodel_lineage(
+                    db_service_prefix=None,
+                    table=table,
+                    datamodel_entity=MOCK_DASHBOARD_DATA_MODEL,
+                )
+            )
+
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_ATHENA_ODBC_QUERIES_SEEN] >= 1
+        assert metrics[PowerbiSource.METRIC_SOURCE_REFERENCES_PARSED] >= 1
+        assert metrics[PowerbiSource.METRIC_SOURCE_REFERENCES_RESOLVED] >= 1
+
+    @pytest.mark.order(72)
+    def test_queries_skipped_load_disabled_counts_only_recognized_sources(self):
+        """
+        queries_skipped_load_disabled only counts disabled queries that would
+        otherwise have reached the lineage parser (Athena/ODBC/Sql.Database
+        sourced). A disabled non-SQL helper query (SharePoint here) was never
+        going to be parsed for lineage and must not inflate the counter.
+        """
+        self.powerbi._metrics.clear()
+        result = self.powerbi._parse_dataflow_m_document(MOCK_DATAFLOW_EXPORT_LOAD_DISABLED)
+
+        assert result == []
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_QUERIES_SKIPPED_LOAD_DISABLED] == 1
+
+    @pytest.mark.order(73)
+    def test_athena_odbc_queries_seen_counts_disabled_blocks_too(self):
+        """
+        athena_odbc_queries_seen counts every recognized Athena/ODBC M block,
+        including ones skipped for loadEnabled - "seen" means detected, not
+        "successfully dispatched for parsing".
+        """
+        self.powerbi._metrics.clear()
+        self.powerbi._parse_dataflow_m_document(MOCK_DATAFLOW_EXPORT_LOAD_DISABLED)
+
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_ATHENA_ODBC_QUERIES_SEEN] == 1
+
+    @pytest.mark.order(74)
+    def test_source_references_dedup_counts_distinct_pairs_once(self):
+        """
+        The same table reached through two different M queries in one
+        dataflow (Athena navigation + Odbc.Query, resolving to the same
+        schema.table) is one distinct (data model, table reference) pair:
+        parsed/resolved must not double-count it, and resolved + unresolved
+        must equal parsed by construction.
+        """
+        mock_table_entity = MagicMock()
+        mock_table_entity.id = uuid.uuid4()
+        mock_table_entity.fullyQualifiedName = "athena_service.sales_db.user_activity"
+        mock_table_entity.columns = []
+
+        mock_datamodel_entity = DashboardDataModel(
+            name="duplicate_ref_dataflow_id",
+            id=uuid.uuid4(),
+            dataModelType=DataModelType.PowerBIDataFlow.value,
+            columns=[],
+        )
+        mock_datamodel = Dataflow(name="DuplicateRefDataflow", objectId="duplicate_ref_dataflow_id")
+
+        self.powerbi._metrics.clear()
+        self.powerbi._counted_source_references.clear()
+
+        with (
+            patch.object(self.powerbi.metadata, "search_in_any_service", return_value=mock_table_entity),
+            patch.object(self.powerbi, "_get_add_lineage_request", return_value=MagicMock()),
+        ):
+            results = list(
+                self.powerbi.create_dataflow_table_lineage(
+                    datamodel=mock_datamodel,
+                    datamodel_entity=mock_datamodel_entity,
+                    dataflow_export=MOCK_DATAFLOW_EXPORT_DUPLICATE_REF,
+                    db_service_prefix=None,
+                )
+            )
+
+        # Two M queries resolve to the same table, so two lineage edges may
+        # still be yielded (one per source query) - but the reconciliation
+        # counters must treat it as a single distinct reference.
+        assert len(results) == 2
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_SOURCE_REFERENCES_PARSED] == 1
+        assert metrics[PowerbiSource.METRIC_SOURCE_REFERENCES_RESOLVED] == 1
+        assert metrics.get(PowerbiSource.METRIC_SOURCE_REFERENCES_UNRESOLVED, 0) == 0
+        assert metrics[PowerbiSource.METRIC_SOURCE_REFERENCES_PARSED] == metrics[
+            PowerbiSource.METRIC_SOURCE_REFERENCES_RESOLVED
+        ] + metrics.get(PowerbiSource.METRIC_SOURCE_REFERENCES_UNRESOLVED, 0)
+
+    @pytest.mark.order(75)
+    def test_unresolved_source_reference_logged_and_bounded(self):
+        """
+        An unresolved reference is logged once at INFO with the data model
+        and the FQN search string, and logging stops once
+        _MAX_UNRESOLVED_LOGGED is reached even though the metric itself keeps
+        counting every distinct unresolved reference.
+        """
+        from metadata.ingestion.source.dashboard.powerbi import metadata as powerbi_metadata_module
+
+        table_a = PowerBiTable(
+            name="orders",
+            source=[PowerBITableSource(expression=MOCK_ATHENA_NAV_EXP)],
+        )
+        table_b = PowerBiTable(
+            name="orders2",
+            source=[PowerBITableSource(expression=MOCK_ATHENA_NAV_FEDERATED_CATALOG_EXP)],
+        )
+
+        self.powerbi._metrics.clear()
+        self.powerbi._counted_source_references.clear()
+        self.powerbi._unresolved_logged_count = 0
+        self.powerbi._MAX_UNRESOLVED_LOGGED = 1
+        try:
+            with (
+                patch.object(self.powerbi.metadata, "search_in_any_service", return_value=None),
+                patch.object(powerbi_metadata_module.logger, "info") as mock_info,
+            ):
+                list(
+                    self.powerbi._get_table_and_datamodel_lineage(
+                        db_service_prefix=None,
+                        table=table_a,
+                        datamodel_entity=MOCK_DASHBOARD_DATA_MODEL,
+                    )
+                )
+                list(
+                    self.powerbi._get_table_and_datamodel_lineage(
+                        db_service_prefix=None,
+                        table=table_b,
+                        datamodel_entity=MOCK_DASHBOARD_DATA_MODEL,
+                    )
+                )
+                unresolved_calls = [
+                    call
+                    for call in mock_info.call_args_list
+                    if call.args and "Unresolved PowerBI source reference" in call.args[0]
+                ]
+        finally:
+            del self.powerbi._MAX_UNRESOLVED_LOGGED
+
+        # Capped at 1 log line despite 2 distinct unresolved references.
+        assert len(unresolved_calls) == 1
+        assert "dummy_datamodel" in unresolved_calls[0].args[1]
+
+        metrics = self.powerbi.metric_values()
+        # The metric itself is not capped, only the log volume.
+        assert metrics[PowerbiSource.METRIC_SOURCE_REFERENCES_UNRESOLVED] == 2
+
+    @pytest.mark.order(76)
+    def test_get_org_workspace_data_counts_outside_scope_links(self):
+        """
+        A dataset->dataflow link whose workspaceObjectId is not one of the
+        workspaces this run processed is counted in
+        upstream_links_outside_scope and never appended to
+        Dataset.upstreamDataflows - it can never resolve, so it isn't tried.
+        """
+        workspace = Group(
+            id="ws-1",
+            name="Sales Workspace",
+            datasets=[Dataset(id="dataset-1", name="Sales Dataset")],
+        )
+
+        mock_api_client = MagicMock()
+        mock_api_client.fetch_all_workspaces.return_value = [workspace]
+        mock_api_client.fetch_all_org_dashboards.return_value = []
+        mock_api_client.fetch_all_org_tiles.return_value = []
+        mock_api_client.fetch_all_org_reports.return_value = []
+        mock_api_client.fetch_all_org_datasets.return_value = []
+        mock_api_client.fetch_dataset_tables.return_value = []
+        mock_api_client.fetch_all_org_dataflows.return_value = []
+        mock_api_client.fetch_dataflow_upstream.return_value = []
+        mock_api_client.fetch_dataset_to_dataflow_links.return_value = [
+            DatasetUpstreamDataflowLink(
+                datasetObjectId="dataset-1",
+                dataflowObjectId="foreign-dataflow-1",
+                workspaceObjectId="ws-outside-scope",
+            )
+        ]
+
+        self.powerbi.client = MagicMock()
+        self.powerbi.client.api_client = mock_api_client
+        self.powerbi._metrics.clear()
+
+        result_workspaces = list(self.powerbi.get_org_workspace_data())
+
+        assert len(result_workspaces) == 1
+        assert result_workspaces[0].datasets[0].upstreamDataflows == []
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_UPSTREAM_LINKS_OUTSIDE_SCOPE] == 1
+
+    @pytest.mark.order(77)
+    def test_get_org_workspace_data_in_scope_link_resolves_when_both_workspaces_ingested(self):
+        """
+        "Outside scope" means outside the set of workspaces processed in
+        this run: when the dataflow's own workspace is also being ingested
+        this run, the counter stays 0 and the link is appended normally.
+        """
+        workspace_a = Group(
+            id="ws-a",
+            name="Source Workspace",
+            datasets=[Dataset(id="dataset-1", name="Sales Dataset")],
+        )
+        workspace_b = Group(id="ws-b", name="Target Workspace")
+
+        mock_api_client = MagicMock()
+        mock_api_client.fetch_all_workspaces.return_value = [workspace_a, workspace_b]
+        mock_api_client.fetch_all_org_dashboards.return_value = []
+        mock_api_client.fetch_all_org_tiles.return_value = []
+        mock_api_client.fetch_all_org_reports.return_value = []
+        mock_api_client.fetch_all_org_datasets.return_value = []
+        mock_api_client.fetch_dataset_tables.return_value = []
+        mock_api_client.fetch_all_org_dataflows.return_value = []
+        mock_api_client.fetch_dataflow_upstream.return_value = []
+
+        def links_for_group(group_id):
+            if group_id == "ws-a":
+                return [
+                    DatasetUpstreamDataflowLink(
+                        datasetObjectId="dataset-1",
+                        dataflowObjectId="cross-workspace-dataflow",
+                        workspaceObjectId="ws-b",
+                    )
+                ]
+            return []
+
+        mock_api_client.fetch_dataset_to_dataflow_links.side_effect = links_for_group
+
+        self.powerbi.client = MagicMock()
+        self.powerbi.client.api_client = mock_api_client
+        self.powerbi._metrics.clear()
+
+        result_workspaces = list(self.powerbi.get_org_workspace_data())
+
+        resolved_workspace = next(w for w in result_workspaces if w.id == "ws-a")
+        assert resolved_workspace.datasets[0].upstreamDataflows[0].targetDataflowId == "cross-workspace-dataflow"
+        metrics = self.powerbi.metric_values()
+        assert metrics.get(PowerbiSource.METRIC_UPSTREAM_LINKS_OUTSIDE_SCOPE, 0) == 0
+
+    # -- Non-admin owner resolution -------------------------------------
+
+    @pytest.mark.order(78)
+    def test_principal_normalization_parses_user_group_and_app(self):
+        """`PowerBIPrincipal.from_workspace_user`/`from_dataset_user` normalize
+        both non-admin endpoints' rows, including Group and App principal
+        types the admin-scan-shaped `PowerBIUser` has no equivalent for.
+        """
+        user_principal = PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_CONTRIBUTOR)
+        assert user_principal == PowerBIPrincipal(
+            principal_type="User",
+            identifier="ada@example.com",
+            email="ada@example.com",
+            display_name="Ada",
+            access_right="Contributor",
+        )
+
+        group_principal = PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_GROUP)
+        assert group_principal.principal_type == "Group"
+        assert group_principal.display_name == "Analytics Team"
+        assert group_principal.email is None
+
+        app_principal = PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_APP)
+        assert app_principal.principal_type == "App"
+
+        # Dataset ACL rows carry no email/displayName - a User's `identifier`
+        # (documented as its UPN) is used as the email fallback, a Group's is not.
+        dataset_user = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(identifier="ada@example.com", principalType="User", datasetUserAccessRight="ReadWrite")
+        )
+        assert dataset_user.email == "ada@example.com"
+        dataset_group = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(identifier="group-object-id", principalType="Group", datasetUserAccessRight="ReadWrite")
+        )
+        assert dataset_group.email is None
+
+    @pytest.mark.order(79)
+    def test_non_admin_dataflow_owner_from_configured_by(self):
+        """Dataflow owners include `configuredBy` (the non-admin field the
+        `Dataflow` model previously never read - see `models.py`).
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow", configuredBy="ada@example.com")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is not None
+        assert len(result.root) == 1
+        assert result.root[0].name == "Ada"
+        mock_get_ref.assert_called_once_with("ada@example.com")
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_DATAFLOWS] == 1
+
+    @pytest.mark.order(80)
+    def test_non_admin_dataflow_excludes_viewer_includes_contributor(self):
+        """Contributor is the lowest workspace role that can write; Viewer
+        never becomes an owner (see the constants' generic-vs-policy note).
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[
+                PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_CONTRIBUTOR),
+                PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_VIEWER),
+            ],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is not None
+        assert len(result.root) == 1
+        assert result.root[0].name == "Ada"
+        mock_get_ref.assert_called_once_with("ada@example.com")
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 1
+
+    @pytest.mark.order(81)
+    def test_non_admin_datamodel_owners_from_dataset_acl_write_right_only(self):
+        """Dataset-ACL principals with a write-level right become owners;
+        read-only ACL principals are excluded.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="ada@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadWrite",
+                    )
+                ),
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="reader@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="Read",
+                    )
+                ),
+            ],
+        )
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(dataset)
+
+        assert result is not None
+        assert len(result.root) == 1
+        mock_get_ref.assert_called_once_with("ada@example.com")
+
+    @pytest.mark.order(82)
+    def test_non_admin_report_owners_inherit_from_dataset(self):
+        """Reports have no owner endpoint in non-admin mode (404) - they
+        inherit their semantic model's owners via `datasetId`.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataset = Dataset(id="dataset-1", name="Sales Semantic Model", configuredBy="ada@example.com")
+        workspace = Group(id="ws-a", name="Analytics Workspace", datasets=[dataset])
+        self.powerbi.state.enter(workspace)
+        report = PowerBIReport(id="report-1", name="Sales Report", datasetId="dataset-1")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(report)
+
+        assert result is not None
+        assert len(result.root) == 1
+        assert result.root[0].name == "Ada"
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_REPORTS] == 1
+
+    @pytest.mark.order(83)
+    def test_non_admin_dashboard_owners_union_reports(self):
+        """Dashboards have no owner endpoint in non-admin mode either - they
+        union the owners of every report behind their tiles.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataset_a = Dataset(id="dataset-a", name="Model A", configuredBy="ada@example.com")
+        dataset_b = Dataset(id="dataset-b", name="Model B", configuredBy="grace@example.com")
+        report_a = PowerBIReport(id="report-a", name="Report A", datasetId="dataset-a")
+        report_b = PowerBIReport(id="report-b", name="Report B", datasetId="dataset-b")
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            datasets=[dataset_a, dataset_b],
+            reports=[report_a, report_b],
+        )
+        self.powerbi.state.enter(workspace)
+        dashboard = PowerBIDashboard(
+            id="dashboard-1",
+            displayName="Executive Dashboard",
+            tiles=[
+                Tile(id="tile-1", reportId="report-a"),
+                Tile(id="tile-2", reportId="report-b"),
+            ],
+        )
+
+        def fake_get_reference_by_email(email):
+            name = {"ada@example.com": "Ada", "grace@example.com": "Grace"}[email]
+            return EntityReferenceList(root=[EntityReference(id=uuid.uuid4(), name=name, type="user")])
+
+        with patch.object(
+            self.powerbi.metadata,
+            "get_reference_by_email",
+            side_effect=fake_get_reference_by_email,
+        ):
+            result = self.powerbi.get_owner_ref(dashboard)
+
+        assert result is not None
+        assert {ref.name for ref in result.root} == {"Ada", "Grace"}
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_DASHBOARDS] == 1
+
+    @pytest.mark.order(84)
+    def test_non_admin_app_principal_never_resolved(self):
+        """`App` principals are never owners, regardless of their access right."""
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_APP)],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+
+        with (
+            patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref_email,
+            patch.object(self.powerbi.metadata, "get_reference_by_name") as mock_get_ref_name,
+        ):
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is None
+        mock_get_ref_email.assert_not_called()
+        mock_get_ref_name.assert_not_called()
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
+        assert metrics[PowerbiSource.METRIC_ASSETS_WITHOUT_OWNER] == 1
+
+    @pytest.mark.order(85)
+    def test_non_admin_unresolved_principal_leaves_asset_ownerless_and_counted(self):
+        """`resolve_owner_principal` returning None leaves the asset owner-less
+        and is counted, never treated as an error.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_CONTRIBUTOR)],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email", return_value=None):
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is None
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_UNRESOLVED] == 1
+        assert metrics[PowerbiSource.METRIC_ASSETS_WITHOUT_OWNER] == 1
+
+    @pytest.mark.order(86)
+    def test_non_admin_group_principal_resolved_via_is_owner_team_lookup(self):
+        """A `Group` principal is resolved as a Team by name with `is_owner=True`
+        (rejects a same-named Team of the wrong type - see `get_reference_by_name`).
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_GROUP)],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_name") as mock_get_ref_name:
+            mock_get_ref_name.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Analytics Team", type="team")]
+            )
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is not None
+        assert result.root[0].name == "Analytics Team"
+        mock_get_ref_name.assert_called_once_with(name="Analytics Team", is_owner=True)
+
+    @pytest.mark.order(87)
+    def test_resolve_owner_principal_override_is_honoured(self):
+        """`resolve_owner_principal` is the seam a subclass overrides to
+        provision missing principals; generic ingestion must call it (not
+        create users/teams directly), so an override changes the outcome.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_CONTRIBUTOR)],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+        provisioned_ref = EntityReference(id=uuid.uuid4(), name="Provisioned Ada", type="user")
+
+        with (
+            patch.object(self.powerbi, "resolve_owner_principal", return_value=provisioned_ref) as mock_override,
+            patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref,
+        ):
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is not None
+        assert result.root[0] == provisioned_ref
+        assert mock_override.called
+        # Generic ingestion never calls OpenMetadata directly once the seam is overridden.
+        mock_get_ref.assert_not_called()
+
+    @pytest.mark.order(88)
+    @patch("metadata.ingestion.ometa.ometa_api.OpenMetadata.get_reference_by_email")
+    def test_admin_mode_owner_resolution_is_unaffected(self, get_reference_by_email):
+        """`useAdminApis=True` (the mock config's default) still dispatches to
+        the admin-mode owner path, byte-for-byte the pre-existing behaviour.
+        """
+        assert self.powerbi.service_connection.useAdminApis is True
+        self.powerbi.metadata.get_reference_by_email.side_effect = [
+            MOCK_USER_1_ENITYTY_REF_LIST,
+            MOCK_USER_2_ENITYTY_REF_LIST,
+        ]
+        dashboard = PowerBIDashboard.model_validate(MOCK_DASHBOARD_WITH_OWNERS)
+
+        with patch.object(self.powerbi, "_get_owner_ref_non_admin") as mock_non_admin:
+            result = self.powerbi.get_owner_ref(dashboard)
+
+        assert result is not None
+        assert len(result.root) == 2
+        mock_non_admin.assert_not_called()
+
+    @pytest.mark.order(89)
+    def test_is_write_dataset_right_is_a_prefix_predicate_not_an_exact_set(self):
+        """Microsoft's documented dataset-right enum (Read, ReadWrite,
+        ReadReshare, ReadWriteReshare, Owner) is incomplete - a live probe of
+        a production workspace's dataset ACLs returned `Explore`-suffixed
+        variants beyond it. `is_write_dataset_right` must classify those by
+        capability (does it start with `ReadWrite`, or equal `Owner`?), not
+        by exact membership in the documented set.
+        """
+        # Observed live, 231/291 ACL rows in the probed workspace: write-level.
+        assert is_write_dataset_right("ReadWriteReshareExplore") is True
+        # Documented values.
+        assert is_write_dataset_right("ReadWrite") is True
+        assert is_write_dataset_right("ReadWriteReshare") is True
+        assert is_write_dataset_right("Owner") is True
+        # Read-only, including the observed `Explore` suffix on a read right
+        # (1/291 rows) - must NOT be treated as write just because it isn't
+        # in a fixed "read" list.
+        assert is_write_dataset_right("Read") is False
+        assert is_write_dataset_right("ReadExplore") is False
+        assert is_write_dataset_right("ReadReshare") is False
+        # Absent/unknown right: never a false positive.
+        assert is_write_dataset_right(None) is False
+        assert is_write_dataset_right("") is False
+        assert is_write_dataset_right("SomethingUnexpected") is False
+
+    @pytest.mark.order(90)
+    def test_non_admin_datamodel_owner_from_live_observed_explore_suffix_right(self):
+        """End-to-end (not just the predicate unit test above): a dataset-ACL
+        principal with the live-observed `ReadWriteReshareExplore` right - not
+        in Microsoft's documented enum - must still become an owner; a
+        principal with the also-observed `ReadExplore` (read-only) must not.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="ada@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadWriteReshareExplore",
+                    )
+                ),
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="reader@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadExplore",
+                    )
+                ),
+            ],
+        )
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(dataset)
+
+        assert result is not None
+        assert len(result.root) == 1
+        mock_get_ref.assert_called_once_with("ada@example.com")
+
+    @pytest.mark.order(91)
+    def test_non_admin_dataset_acl_group_with_no_usable_name_is_unresolved_not_crashed(self):
+        """A `Group` principal normalized from the dataset-ACL endpoint (which
+        carries no email or display name at all, only `identifier` and the
+        right - see `PowerBIPrincipal.from_dataset_user`) must resolve to
+        `None` and be counted unresolved, never crash and never be guessed at
+        from its opaque `identifier` object id.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        dataset_acl_group = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="group-object-id",
+                principalType="Group",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+        assert dataset_acl_group.email is None
+        assert dataset_acl_group.display_name is None
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[dataset_acl_group],
+        )
+
+        with (
+            patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref_email,
+            patch.object(self.powerbi.metadata, "get_reference_by_name") as mock_get_ref_name,
+        ):
+            result = self.powerbi.get_owner_ref(dataset)
+
+        assert result is None
+        mock_get_ref_email.assert_not_called()
+        mock_get_ref_name.assert_not_called()
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_UNRESOLVED] == 1
+        assert metrics[PowerbiSource.METRIC_ASSETS_WITHOUT_OWNER] == 1
+
+    @pytest.mark.order(92)
+    def test_non_admin_workspace_role_write_check_is_exact_match(self):
+        """Unlike the dataset right, the workspace-role write check is a plain
+        exact-match set (`POWERBI_WRITE_WORKSPACE_ROLES`) - verified live: a
+        production workspace's `GET .../users` rows returned only `Admin`,
+        `Member` and `Viewer`, all handled correctly by exact match.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            workspace_principals=[
+                PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_CONTRIBUTOR),  # Contributor
+                PowerBIPrincipal.from_workspace_user(MOCK_WORKSPACE_USER_VIEWER),  # Viewer
+            ],
+        )
+        self.powerbi.state.enter(workspace)
+        dataflow = Dataflow(objectId="dataflow-1", name="Orders Dataflow")
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result = self.powerbi.get_owner_ref(dataflow)
+
+        assert result is not None
+        assert len(result.root) == 1
+
+    @pytest.mark.order(93)
+    def test_non_admin_dataset_acl_app_excluded_by_app_rule_not_by_right(self):
+        """An `App` principal on a dataset's ACL holding a write-level right
+        (live-observed: `App|ReadWriteReshareExplore`, 21 rows in the probed
+        workspace) must still never become an owner - excluded by the `App`
+        principal-type rule specifically, not because its right happens to
+        fail the write-capability check. Paired with a `Group` holding the
+        observed read-only `ReadExplore` right, also excluded (by right).
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="app-object-id",
+                        principalType="App",
+                        datasetUserAccessRight="ReadWriteReshareExplore",
+                    )
+                ),
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="group-object-id",
+                        principalType="Group",
+                        datasetUserAccessRight="ReadExplore",
+                    )
+                ),
+            ],
+        )
+
+        with (
+            patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref_email,
+            patch.object(self.powerbi.metadata, "get_reference_by_name") as mock_get_ref_name,
+        ):
+            result = self.powerbi.get_owner_ref(dataset)
+
+        assert result is None
+        mock_get_ref_email.assert_not_called()
+        mock_get_ref_name.assert_not_called()
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 1
+        assert metrics[PowerbiSource.METRIC_ASSETS_WITHOUT_OWNER] == 1
+
+    @pytest.mark.order(94)
+    def test_metric_values_always_has_every_declared_key_at_zero(self):
+        """A freshly constructed source's `metric_values()` must contain every
+        declared `METRIC_*` key at 0, not merely the keys that happened to be
+        incremented. A bare `Counter()` only emits a key once it's first
+        incremented, making "this metric is legitimately 0" indistinguishable
+        from "this code path never ran" on the far side of a Prometheus
+        scrape - the failure mode that hid a real owners bug for a full run.
+        """
+        metrics = self.powerbi.metric_values()
+        expected_keys = self.powerbi._all_metric_keys()
+        # Guard against the guard: if this list is empty, the assertion below
+        # would pass vacuously.
+        assert len(expected_keys) > 10
+        for key in expected_keys:
+            assert key in metrics, f"metric_values() is missing declared key {key!r}"
+            assert metrics[key] == 0
+
+    @pytest.mark.order(95)
+    def test_metric_values_incrementing_one_key_leaves_others_at_zero(self):
+        """Incrementing one counter must not cause the others to vanish from
+        `metric_values()` - they stay present at 0, not absent.
+        """
+        self.powerbi._metrics.clear()
+        # clear() on a Counter drops every key back to unset; reseed exactly
+        # as __init__ does, so this test doesn't depend on __init__'s
+        # internals beyond the documented `_all_metric_keys()` seam.
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+
+        self.powerbi._metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_DATAFLOWS] += 1
+
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_DATAFLOWS] == 1
+        untouched_keys = [
+            k for k in self.powerbi._all_metric_keys() if k != PowerbiSource.METRIC_OWNERS_ASSIGNED_DATAFLOWS
+        ]
+        assert len(untouched_keys) > 5
+        for key in untouched_keys:
+            assert metrics[key] == 0
+
+    # -- Owner-computation memoisation ------------------------------------
+
+    @pytest.mark.order(96)
+    def test_non_admin_dataset_owner_principals_counted_once_across_dependents(self):
+        """A dataset reached directly, plus via three dependent reports, must
+        only run principal resolution once - `owner_principals_skipped_viewer`
+        counts the dataset's Viewer principal once, not four times, and
+        `owners_assigned_datamodels`/`owners_assigned_reports` still count
+        each top-level asset exactly once (memoisation must not suppress
+        those).
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        self.powerbi._metrics.clear()
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="ada@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadWrite",
+                    )
+                ),
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="reader@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="Read",
+                    )
+                ),
+            ],
+        )
+        report_a = PowerBIReport(id="report-a", name="Report A", datasetId="dataset-1")
+        report_b = PowerBIReport(id="report-b", name="Report B", datasetId="dataset-1")
+        report_c = PowerBIReport(id="report-c", name="Report C", datasetId="dataset-1")
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            datasets=[dataset],
+            reports=[report_a, report_b, report_c],
+        )
+        self.powerbi.state.enter(workspace)
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            dataset_result = self.powerbi.get_owner_ref(dataset)
+            report_a_result = self.powerbi.get_owner_ref(report_a)
+            report_b_result = self.powerbi.get_owner_ref(report_b)
+            report_c_result = self.powerbi.get_owner_ref(report_c)
+
+        for result in (dataset_result, report_a_result, report_b_result, report_c_result):
+            assert result is not None
+            assert len(result.root) == 1
+            assert result.root[0].name == "Ada"
+
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 1
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_DATAMODELS] == 1
+        assert metrics[PowerbiSource.METRIC_OWNERS_ASSIGNED_REPORTS] == 3
+        # get_reference_by_email is the observable stand-in for an OMD lookup:
+        # one call for the dataset's own resolution, never re-run for the
+        # three dependents.
+        assert mock_get_ref.call_count == 1
+
+    @pytest.mark.order(97)
+    def test_resolve_owner_principal_invoked_once_per_asset_not_per_dependent(self):
+        """`resolve_owner_principal` is the seam every OMD lookup goes
+        through - patch it directly (rather than `get_reference_by_email`) to
+        prove the memoisation boundary is at the right layer: one call for
+        the dataset's write-capable principal, reused by three reports and a
+        dashboard behind them, not four or five.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+        dataset = Dataset(
+            id="dataset-1",
+            name="Sales Semantic Model",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="ada@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadWrite",
+                    )
+                )
+            ],
+        )
+        report_a = PowerBIReport(id="report-a", name="Report A", datasetId="dataset-1")
+        report_b = PowerBIReport(id="report-b", name="Report B", datasetId="dataset-1")
+        dashboard = PowerBIDashboard(
+            id="dashboard-1",
+            displayName="Exec Dashboard",
+            tiles=[Tile(id="tile-1", reportId="report-a")],
+        )
+        workspace = Group(
+            id="ws-a",
+            name="Analytics Workspace",
+            datasets=[dataset],
+            reports=[report_a, report_b],
+        )
+        self.powerbi.state.enter(workspace)
+        provisioned_ref = EntityReference(id=uuid.uuid4(), name="Ada", type="user")
+
+        with patch.object(self.powerbi, "resolve_owner_principal", return_value=provisioned_ref) as mock_resolve:
+            self.powerbi.get_owner_ref(dataset)
+            self.powerbi.get_owner_ref(report_a)
+            self.powerbi.get_owner_ref(report_b)
+            self.powerbi.get_owner_ref(dashboard)
+
+        assert mock_resolve.call_count == 1
+
+    @pytest.mark.order(98)
+    def test_owner_refs_cache_cleared_between_workspaces(self):
+        """A dataset id reused across workspaces (unusual, but not impossible
+        for a stubbed/misbehaving tenant) must not let workspace B inherit
+        workspace A's cached owners - `WorkspaceState.exit()` must drop the
+        owner-refs cache alongside every other per-workspace cache.
+        """
+        self.powerbi.service_connection.useAdminApis = False
+        self.powerbi.source_config.includeOwners = True
+
+        dataset_a = Dataset(
+            id="dataset-1",
+            name="Workspace A Dataset",
+            dataset_principals=[
+                PowerBIPrincipal.from_dataset_user(
+                    PowerBIDatasetUser(
+                        identifier="ada@example.com",
+                        principalType="User",
+                        datasetUserAccessRight="ReadWrite",
+                    )
+                )
+            ],
+        )
+        workspace_a = Group(id="ws-a", name="Workspace A", datasets=[dataset_a])
+        self.powerbi.state.enter(workspace_a)
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            result_a = self.powerbi.get_owner_ref(dataset_a)
+        assert result_a is not None
+        assert result_a.root[0].name == "Ada"
+
+        self.powerbi.state.exit()
+
+        # Same dataset id, different (and this time ownerless) workspace.
+        dataset_b = Dataset(id="dataset-1", name="Workspace B Dataset", dataset_principals=[])
+        workspace_b = Group(id="ws-b", name="Workspace B", datasets=[dataset_b])
+        self.powerbi.state.enter(workspace_b)
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            result_b = self.powerbi.get_owner_ref(dataset_b)
+
+        assert result_b is None
+        mock_get_ref.assert_not_called()
+
+    # -- Owner judged by best row across sources, not first-seen row --------
+
+    @staticmethod
+    def _dataset_is_write_right(right):
+        return right in POWERBI_WRITE_WORKSPACE_ROLES or is_write_dataset_right(right)
+
+    @pytest.mark.order(99)
+    def test_dataset_acl_write_row_wins_over_workspace_viewer_row(self):
+        """A principal seen first as a workspace Viewer, but who also holds a
+        write-level dataset-ACL right (an ordinary setup: a workspace Viewer
+        with `ReadWriteReshareExplore` on one dataset), must be resolved as
+        an owner - judged by its best row across every source, not by
+        whichever row the dedup happened to see first. Must fail before the
+        group-then-judge fix (the Viewer row alone used to win and discard
+        the later write-level row).
+        """
+        self.powerbi._metrics.clear()
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+        viewer_row = PowerBIPrincipal.from_workspace_user(
+            PowerBIWorkspaceUser(
+                identifier="ada@example.com",
+                principalType="User",
+                displayName="Ada",
+                emailAddress="ada@example.com",
+                groupUserAccessRight="Viewer",
+            )
+        )
+        write_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="ada@example.com",
+                principalType="User",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            owner_refs = self.powerbi._resolve_write_principals([viewer_row, write_row], self._dataset_is_write_right)
+
+        assert len(owner_refs) == 1
+        assert owner_refs[0].name == "Ada"
+        mock_get_ref.assert_called_once_with("ada@example.com")
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0
+
+    @pytest.mark.order(100)
+    def test_workspace_write_role_wins_even_with_read_only_dataset_row(self):
+        """The reverse of the above: a workspace Member (write-capable at the
+        workspace level) who only has read-only `Read` on this particular
+        dataset is still an owner - the workspace row's write right is
+        enough on its own, the dataset row does not need to agree.
+        """
+        self.powerbi._metrics.clear()
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+        member_row = PowerBIPrincipal.from_workspace_user(
+            PowerBIWorkspaceUser(
+                identifier="ada@example.com",
+                principalType="User",
+                displayName="Ada",
+                emailAddress="ada@example.com",
+                groupUserAccessRight="Member",
+            )
+        )
+        read_only_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="ada@example.com",
+                principalType="User",
+                datasetUserAccessRight="Read",
+            )
+        )
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            owner_refs = self.powerbi._resolve_write_principals(
+                [member_row, read_only_row], self._dataset_is_write_right
+            )
+
+        assert len(owner_refs) == 1
+        assert owner_refs[0].name == "Ada"
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0
+
+    @pytest.mark.order(101)
+    def test_app_skipped_regardless_of_which_source_holds_the_write_right(self):
+        """An `App` principal holding a write-level right - whether on the
+        workspace-role row or the dataset-ACL row - is still skipped as App,
+        never resolved: apps are excluded by principal type, not by right.
+        """
+        self.powerbi._metrics.clear()
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+        workspace_admin_row = PowerBIPrincipal.from_workspace_user(
+            PowerBIWorkspaceUser(
+                identifier="app-object-id",
+                principalType="App",
+                displayName="Some App",
+                groupUserAccessRight="Admin",
+            )
+        )
+        dataset_write_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="app-object-id",
+                principalType="App",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+
+        with (
+            patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref_email,
+            patch.object(self.powerbi.metadata, "get_reference_by_name") as mock_get_ref_name,
+        ):
+            owner_refs = self.powerbi._resolve_write_principals(
+                [workspace_admin_row, dataset_write_row], self._dataset_is_write_right
+            )
+
+        assert owner_refs == []
+        mock_get_ref_email.assert_not_called()
+        mock_get_ref_name.assert_not_called()
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0
+
+    @pytest.mark.order(102)
+    def test_same_upn_different_case_counts_as_one_principal(self):
+        """A Power BI UPN is case-insensitive; two rows for the same person
+        returned with different casing by the two endpoints must count as
+        one principal, not two, and must not let a lower-privilege row in
+        one case discard a write-level row in another.
+        """
+        self.powerbi._metrics.clear()
+        self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+        lowercase_viewer_row = PowerBIPrincipal.from_workspace_user(
+            PowerBIWorkspaceUser(
+                identifier="ada@example.com",
+                principalType="User",
+                displayName="Ada",
+                emailAddress="ada@example.com",
+                groupUserAccessRight="Viewer",
+            )
+        )
+        uppercase_write_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="ADA@EXAMPLE.COM",
+                principalType="User",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+
+        with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+            mock_get_ref.return_value = EntityReferenceList(
+                root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+            )
+            owner_refs = self.powerbi._resolve_write_principals(
+                [lowercase_viewer_row, uppercase_write_row], self._dataset_is_write_right
+            )
+
+        assert len(owner_refs) == 1
+        # Exactly one resolution call, not two - proof the two differently-cased
+        # rows were treated as a single principal.
+        assert mock_get_ref.call_count == 1
+        metrics = self.powerbi.metric_values()
+        assert metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0
+
+    @pytest.mark.order(103)
+    def test_owner_resolution_is_independent_of_row_order(self):
+        """The same two rows (a Viewer row and a write-level row for the same
+        principal, plus an unrelated App row), in reversed order, must
+        produce the same owner set and the same counters - the fix must not
+        merely happen to work for one ordering.
+        """
+        viewer_row = PowerBIPrincipal.from_workspace_user(
+            PowerBIWorkspaceUser(
+                identifier="ada@example.com",
+                principalType="User",
+                displayName="Ada",
+                emailAddress="ada@example.com",
+                groupUserAccessRight="Viewer",
+            )
+        )
+        write_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="ada@example.com",
+                principalType="User",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+        app_row = PowerBIPrincipal.from_dataset_user(
+            PowerBIDatasetUser(
+                identifier="app-object-id",
+                principalType="App",
+                datasetUserAccessRight="ReadWriteReshareExplore",
+            )
+        )
+
+        def _run(rows):
+            self.powerbi._metrics.clear()
+            self.powerbi._metrics.update(dict.fromkeys(self.powerbi._all_metric_keys(), 0))
+            with patch.object(self.powerbi.metadata, "get_reference_by_email") as mock_get_ref:
+                mock_get_ref.return_value = EntityReferenceList(
+                    root=[EntityReference(id=uuid.uuid4(), name="Ada", type="user")]
+                )
+                owner_refs = self.powerbi._resolve_write_principals(rows, self._dataset_is_write_right)
+            return {ref.name for ref in owner_refs}, dict(self.powerbi.metric_values())
+
+        forward_owners, forward_metrics = _run([viewer_row, write_row, app_row])
+        reversed_owners, reversed_metrics = _run([app_row, write_row, viewer_row])
+
+        assert forward_owners == reversed_owners == {"Ada"}
+        assert forward_metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
+        assert reversed_metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] == 1
+        assert forward_metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0
+        assert reversed_metrics[PowerbiSource.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] == 0

@@ -12,9 +12,16 @@
 Postgres models
 """
 
+import warnings
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+# `schema` shadows BaseModel.schema(); pydantic warns at class creation - once per process, and a
+# usage run's parser pool imports this module in every worker. The alias is the wire name and the
+# attribute is read as `.schema` across the connector, so the warning is silenced rather than the
+# field renamed.
+warnings.filterwarnings("ignore", message='Field name "schema" in "PostgresStoredProcedure"')
 
 
 class PostgresStoredProcedure(BaseModel):

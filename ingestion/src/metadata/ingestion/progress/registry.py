@@ -82,6 +82,7 @@ class GlobalCounter:
     done: int = 0
     scope_estimates: Dict[str, int] = field(default_factory=dict)  # noqa: UP006
     reconcilable: bool = False
+    started_at: Optional[float] = None  # noqa: UP045  # monotonic time of the first track(); the ETA rate base
 
 
 class ProgressRegistry:
@@ -186,6 +187,8 @@ class ProgressRegistry:
             self._mark_started()
             counter = self._global.get(type_) if type_ is not None else None
             if counter is not None:
+                if counter.started_at is None:
+                    counter.started_at = time.monotonic()
                 counter.done += n
                 if counter.total is not None and counter.total < counter.done:
                     counter.total = counter.done
@@ -201,15 +204,19 @@ class ProgressRegistry:
             return [(type_, c.done, c.total) for type_, c in self._global.items()]
 
     def eta_seconds(self) -> Optional[int]:  # noqa: UP045
-        """Overall run ETA in seconds from the driver counter's cumulative rate:
-        ``elapsed * (total - done) / done``. ``None`` during warm-up (``done ==
-        0``), when there is no driver, when the driver is complete (``done >=
-        total``), or before elapsed time is available."""
+        """ETA in seconds for the driver counter from its own rate: ``elapsed
+        since its first track * (total - done) / done``. A multi-phase run (read,
+        parse, stage, publish) declares one counter per phase; measuring each from
+        its own start keeps the parse phase's ETA from being inflated by the
+        minutes the read phase took. ``None`` during warm-up (``done == 0``),
+        when there is no driver, or when the driver is complete."""
         driver = self._driver_counter()
         result = None
         if driver is not None:
-            _, done, total = driver
-            elapsed = self.elapsed_seconds()
+            type_, done, total = driver
+            with self._lock:
+                started = self._global[type_].started_at
+            elapsed = None if started is None else time.monotonic() - started
             if done > 0 and total is not None and done < total and elapsed is not None and elapsed > 0:
                 result = round(elapsed * (total - done) / done)
         return result
@@ -218,14 +225,22 @@ class ProgressRegistry:
         self,
         counters: "Optional[List[Tuple[str, int, Optional[int]]]]" = None,  # noqa: UP006,UP045
     ) -> "Optional[Tuple[str, int, Optional[int]]]":  # noqa: UP006,UP045
-        """The ETA driver: the last-declared global counter that has a known
-        total (finest-grained real unit of work), or ``None`` when no counter
-        declares a total."""
+        """The ETA driver: the last-declared global counter with a known total that
+        is still in progress (started and not complete) - the phase the run is in -
+        or, when no counter has started yet, the last-declared one with a total."""
         pool = self.global_counters() if counters is None else counters
+        with self._lock:
+            started = {type_ for type_, c in self._global.items() if c.started_at is not None}
         driver = None
         for counter in pool:
-            if counter[2] is not None:
+            if counter[2] is None:
+                continue
+            if counter[0] in started and counter[1] < counter[2]:
                 driver = counter
+        if driver is None:
+            for counter in pool:
+                if counter[2] is not None:
+                    driver = counter
         return driver
 
     def render_cli(self) -> str:

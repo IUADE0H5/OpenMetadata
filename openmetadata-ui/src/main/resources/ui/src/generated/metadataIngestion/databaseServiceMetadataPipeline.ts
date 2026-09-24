@@ -15,6 +15,21 @@
  */
 export interface DatabaseServiceMetadataPipeline {
     /**
+     * With Allow Emptying Schema, lets a single run soft delete every table of more than one
+     * schema - the unrestricted behaviour. Off by default: once a run has emptied one schema,
+     * further schemas that would be emptied are left untouched and reported.
+     */
+    allowEmptyingMultipleSchemas?: boolean;
+    /**
+     * Guard for Mark Deleted Tables. A run that produced no table at all for a schema it lists
+     * - a filter that matches nothing in the source, a source that failed for that schema -
+     * would soft delete every table of that schema. By default such a schema is left untouched
+     * and the run reports it as a failure. Enable this to let one run empty a single schema;
+     * deleting several schemas in one run needs Allow Emptying Multiple Schemas as well. A
+     * table the run failed on always counts as still present.
+     */
+    allowEmptyingSchema?: boolean;
+    /**
      * Regex to only include/exclude databases that matches the pattern.
      */
     databaseFilterPattern?: FilterPattern;

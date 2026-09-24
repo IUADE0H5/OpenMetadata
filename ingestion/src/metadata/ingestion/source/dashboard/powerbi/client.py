@@ -32,24 +32,34 @@ from metadata.ingestion.ometa.client import ClientConfig, LimitsException
 from metadata.ingestion.source.dashboard.powerbi.file_client import PowerBiFileClient
 from metadata.ingestion.source.dashboard.powerbi.models import (
     DashboardsResponse,
+    Dataflow,
     DataflowExportResponse,
+    DataflowsResponse,
     Dataset,
     DatasetResponse,
+    DatasetUpstreamDataflowLink,
+    DatasetUpstreamDataflowLinksResponse,
+    DatasetUsersResponse,
     Datasource,
     DatasourcesResponse,
     Group,
     GroupsResponse,
     PowerBIDashboard,
+    PowerBIDatasetUser,
     PowerBIReport,
     PowerBiTable,
     PowerBiToken,
+    PowerBIWorkspaceUser,
     ReportPagesAPIResponse,
     ReportsResponse,
     TablesResponse,
     Tile,
     TilesResponse,
+    UpstreaDataflow,
+    UpstreamDataflowsResponse,
     Workspaces,
     WorkSpaceScanResponse,
+    WorkspaceUsersResponse,
 )
 from metadata.utils.filters import validate_regex
 from metadata.utils.helpers import clean_uri
@@ -311,6 +321,120 @@ class PowerBiApiClient:
         except Exception as exc:  # pylint: disable=broad-except
             logger.debug(traceback.format_exc())
             logger.warning(f"Error fetching group datasets: {exc}")
+
+        return None
+
+    def fetch_all_org_dataflows(self, group_id: str) -> Optional[List[Dataflow]]:  # noqa: UP006, UP045
+        """Method to fetch all powerbi dataflows within the group (non-admin)
+        API: https://learn.microsoft.com/en-us/rest/api/power-bi/dataflows/get-dataflows
+        Returns:
+            List[Dataflow]
+        """
+        try:
+            logger.debug(
+                f"Calling the API({str(self.client._base_url)}/myorg/groups/{group_id}/dataflows)"  # pylint: disable=protected-access  # noqa: RUF010
+                " to get group dataflows"
+            )
+            response_data = self.client.get(f"/myorg/groups/{group_id}/dataflows")
+            if response_data:
+                response = DataflowsResponse.model_validate(response_data)
+                return response.value
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug(traceback.format_exc())
+            logger.warning(f"Error fetching group dataflows: {exc}")
+
+        return None
+
+    def fetch_dataflow_upstream(self, group_id: str, dataflow_id: str) -> Optional[List[UpstreaDataflow]]:  # noqa: UP006, UP045
+        """Method to fetch a dataflow's upstream dataflows (non-admin)
+        API: https://learn.microsoft.com/en-us/rest/api/power-bi/dataflows/get-upstream-dataflows-in-group
+        Returns:
+            List[UpstreaDataflow]
+        """
+        try:
+            path = f"/myorg/groups/{group_id}/dataflows/{dataflow_id}/upstreamDataflows"
+            logger.debug(
+                f"Calling the API({str(self.client._base_url)}{path})"  # pylint: disable=protected-access  # noqa: RUF010
+                " to get dataflow upstream dataflows"
+            )
+            response_data = self.client.get(path)
+            if response_data:
+                response = UpstreamDataflowsResponse.model_validate(response_data)
+                return response.value
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug(traceback.format_exc())
+            logger.warning(f"Error fetching upstream dataflows for dataflow {dataflow_id}: {exc}")
+
+        return None
+
+    def fetch_dataset_to_dataflow_links(self, group_id: str) -> Optional[List[DatasetUpstreamDataflowLink]]:  # noqa: UP006, UP045
+        """Method to fetch the workspace-wide dataset->dataflow link rows (non-admin)
+        API: https://learn.microsoft.com/en-us/rest/api/power-bi/datasets/get-dataset-to-dataflows-links-in-group
+
+        Unlike the per-dataflow ``upstreamDataflows`` call, this is scoped to
+        the whole workspace and covers every dataset in it in one call; its
+        row shape ({datasetObjectId, dataflowObjectId, workspaceObjectId}) is
+        distinct from the admin ``UpstreaDataflow`` shape.
+        Returns:
+            List[DatasetUpstreamDataflowLink]
+        """
+        try:
+            path = f"/myorg/groups/{group_id}/datasets/upstreamDataflows"
+            logger.debug(
+                f"Calling the API({str(self.client._base_url)}{path})"  # pylint: disable=protected-access  # noqa: RUF010
+                " to get dataset-to-dataflow links"
+            )
+            response_data = self.client.get(path)
+            if response_data:
+                response = DatasetUpstreamDataflowLinksResponse.model_validate(response_data)
+                return response.value
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug(traceback.format_exc())
+            logger.warning(f"Error fetching dataset-to-dataflow links: {exc}")
+
+        return None
+
+    def fetch_group_users(self, group_id: str) -> Optional[List[PowerBIWorkspaceUser]]:  # noqa: UP006, UP045
+        """Method to fetch a workspace's members (non-admin)
+        API: https://learn.microsoft.com/en-us/rest/api/power-bi/groups/get-group-users
+        Returns:
+            List[PowerBIWorkspaceUser]
+        """
+        try:
+            path = f"/myorg/groups/{group_id}/users"
+            logger.debug(
+                f"Calling the API({str(self.client._base_url)}{path})"  # pylint: disable=protected-access  # noqa: RUF010
+                " to get workspace users"
+            )
+            response_data = self.client.get(path)
+            if response_data:
+                response = WorkspaceUsersResponse.model_validate(response_data)
+                return response.value
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug(traceback.format_exc())
+            logger.warning(f"Error fetching workspace users for group {group_id}: {exc}")
+
+        return None
+
+    def fetch_dataset_users(self, group_id: str, dataset_id: str) -> Optional[List[PowerBIDatasetUser]]:  # noqa: UP006, UP045
+        """Method to fetch a dataset's ACL (non-admin)
+        API: https://learn.microsoft.com/en-us/rest/api/power-bi/datasets/get-dataset-users-in-group
+        Returns:
+            List[PowerBIDatasetUser]
+        """
+        try:
+            path = f"/myorg/groups/{group_id}/datasets/{dataset_id}/users"
+            logger.debug(
+                f"Calling the API({str(self.client._base_url)}{path})"  # pylint: disable=protected-access  # noqa: RUF010
+                " to get dataset users"
+            )
+            response_data = self.client.get(path)
+            if response_data:
+                response = DatasetUsersResponse.model_validate(response_data)
+                return response.value
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug(traceback.format_exc())
+            logger.warning(f"Error fetching dataset users for dataset {dataset_id}: {exc}")
 
         return None
 
@@ -694,21 +818,40 @@ class PowerBiApiClient:
 
         return False
 
-    def fetch_dataflow_export(self, dataflow_id: str) -> Optional[DataflowExportResponse]:  # noqa: UP045
-        """Method to export dataflow definition using admin API
-        API: https://api.powerbi.com/v1.0/myorg/admin/dataflows/{dataflowId}/export
+    def fetch_dataflow_export(
+        self,
+        dataflow_id: str,
+        group_id: Optional[str] = None,  # noqa: UP045
+    ) -> Optional[DataflowExportResponse]:  # noqa: UP045
+        """Method to export a dataflow's definition.
+
+        Admin API: https://api.powerbi.com/v1.0/myorg/admin/dataflows/{dataflowId}/export
         API doc: https://learn.microsoft.com/en-us/rest/api/power-bi/admin/dataflows-export-dataflow-as-admin
+
+        Non-admin API: https://api.powerbi.com/v1.0/myorg/groups/{groupId}/dataflows/{dataflowId}
+        API doc: https://learn.microsoft.com/en-us/rest/api/power-bi/dataflows/get-dataflow
+        (returns the same model.json-shaped body as the admin export)
         Args:
             dataflow_id: The ID of the dataflow to export
+            group_id: The workspace/group id; required when ``useAdminApis`` is False
         Returns:
             DataflowExportResponse containing entities and their attributes
         """
         try:
+            if self.config.useAdminApis:
+                path = f"/myorg/admin/dataflows/{dataflow_id}/export"
+            else:
+                if not group_id:
+                    logger.warning(
+                        f"Cannot export dataflow {dataflow_id}: group_id is required when useAdminApis is False"
+                    )
+                    return None
+                path = f"/myorg/groups/{group_id}/dataflows/{dataflow_id}"
             logger.debug(
-                f"Calling the API({str(self.client._base_url)}/myorg/admin/dataflows/{dataflow_id}/export)"  # pylint: disable=protected-access  # noqa: RUF010
+                f"Calling the API({str(self.client._base_url)}{path})"  # pylint: disable=protected-access  # noqa: RUF010
                 " to export dataflow definition"
             )
-            response_data = self.client.get(f"/myorg/admin/dataflows/{dataflow_id}/export")
+            response_data = self.client.get(path)
             if response_data:
                 return DataflowExportResponse(**response_data)
         except Exception as exc:  # pylint: disable=broad-except

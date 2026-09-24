@@ -21,6 +21,7 @@ from metadata.generated.schema.entity.services.ingestionPipelines.ingestionPipel
 )
 from metadata.generated.schema.metadataIngestion.workflow import LogLevels
 from metadata.utils.logger import set_loggers_level
+from metadata.workflow.application import ApplicationWorkflow
 from metadata.workflow.classification import AutoClassificationWorkflow
 from metadata.workflow.data_quality import TestSuiteWorkflow
 from metadata.workflow.metadata import MetadataWorkflow
@@ -36,6 +37,7 @@ WORKFLOW_MAP = {
     PipelineType.elasticSearchReindex.value: MetadataWorkflow,
     PipelineType.dbt.value: MetadataWorkflow,
     PipelineType.autoClassification.value: AutoClassificationWorkflow,
+    PipelineType.application.value: ApplicationWorkflow,
 }
 
 

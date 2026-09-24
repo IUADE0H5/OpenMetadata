@@ -82,8 +82,20 @@ class KeepAliveRetryAdapter(HTTPAdapter):
         return super().proxy_manager_for(proxy, **proxy_kwargs)
 
 
-def mount_resilient_adapter(session: requests.Session) -> None:
+# requests' default pool_maxsize is 10. Lineage can be written by many consumer threads at once
+# (see IngestionWorkflow concurrent lineage consume), and the periodic metrics thread plus bulk
+# flushes add more concurrent requests; a 10-slot pool would discard and reopen connections above
+# that, throwing away the keepalive win. This is only the baseline: a concurrent lineage run grows
+# the pool to its actual fan-out at runtime via REST.ensure_pool_maxsize.
+DEFAULT_POOL_MAXSIZE = 32
+
+
+def mount_resilient_adapter(session: requests.Session, pool_maxsize: int = DEFAULT_POOL_MAXSIZE) -> None:
     """Mount the keepalive + transport-retry adapter for http and https."""
-    adapter = KeepAliveRetryAdapter(max_retries=build_transport_retry())
+    adapter = KeepAliveRetryAdapter(
+        max_retries=build_transport_retry(),
+        pool_connections=pool_maxsize,
+        pool_maxsize=pool_maxsize,
+    )
     session.mount("https://", adapter)
     session.mount("http://", adapter)

@@ -20,6 +20,7 @@ To be extended by any other workflow:
 - data insights
 """
 
+import threading
 import traceback
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Type, cast  # noqa: UP035
@@ -36,6 +37,7 @@ from metadata.generated.schema.entity.services.serviceType import ServiceType
 from metadata.generated.schema.metadataIngestion.workflow import (
     OpenMetadataWorkflowConfig,
 )
+from metadata.ingestion.api.models import Entity
 from metadata.ingestion.api.parser import parse_workflow_config_gracefully
 from metadata.ingestion.api.step import Step
 from metadata.ingestion.api.steps import BulkSink, Processor, Sink, Source, Stage
@@ -165,17 +167,79 @@ class IngestionWorkflow(BaseWorkflow, ABC):
         Note how the Source class needs to be an Iterator. Specifically,
         we are defining Sources as Generators.
         """
-        for record in self.source.run():
-            processed_record = record
-            for step in self.steps:
-                # We only process the records for these Step types
-                if processed_record is not None and isinstance(step, (Processor, Stage, Sink)):
-                    processed_record = step.run(processed_record)
+        workers = self._consumer_workers()
+        if workers > 1:
+            self._consume_concurrent(workers)
+        else:
+            self._consume_serial()
 
         # Try to pick up the BulkSink and execute it, if needed
         bulk_sink = next((step for step in self.steps if isinstance(step, BulkSink)), None)
         if bulk_sink:
             bulk_sink.run()
+
+    def _apply_steps(self, record: Optional[Entity]) -> None:  # noqa: UP045
+        """Push one source record through the Processor/Stage/Sink chain."""
+        processed_record = record
+        for step in self.steps:
+            # We only process the records for these Step types
+            if processed_record is not None and isinstance(step, (Processor, Stage, Sink)):
+                processed_record = step.run(processed_record)
+
+    def _consume_serial(self) -> None:
+        for record in self.source.run():
+            self._apply_steps(record)
+
+    def _consumer_workers(self) -> int:
+        """Consumer threads for the source->sink chain. 1 (serial) for every workflow except
+        query-log lineage with ``threads`` > 1: there the sink writes one edge per remote round
+        trip and is the bottleneck (the producer already runs multi-threaded), so draining it with
+        several threads is what raises throughput. Any other pipeline keeps the exact serial loop."""
+        from metadata.generated.schema.metadataIngestion.databaseServiceQueryLineagePipeline import (
+            DatabaseServiceQueryLineagePipeline,
+        )
+
+        try:
+            source_config = self.config.source.sourceConfig.config
+            if isinstance(source_config, DatabaseServiceQueryLineagePipeline):
+                return max(1, int(getattr(source_config, "threads", 1) or 1))
+        except Exception as exc:  # pragma: no cover - defensive, never block the run on this
+            logger.debug(f"Could not resolve consumer worker count, running serially: {exc}")
+        return 1
+
+    def _consume_concurrent(self, workers: int) -> None:
+        """Drain the source through the step chain on a bounded thread pool. Each record is
+        independent (a lineage edge or a query), so order does not matter; the sink's shared buffers
+        are lock-guarded and its lineage edge cache is thread-safe. A bounded in-flight semaphore
+        keeps the pool from pulling the whole source into memory ahead of the sink."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Peak concurrent HTTP is the consumer threads plus the producer's per-thread table
+        # resolution fan-out (generate_lineage_with_processes runs `workers` producer threads, each
+        # resolving tables with its own pool). Size the client's connection pool to that peak so
+        # connections are reused, not opened-and-discarded. ~10x workers covers the resolve fan-out
+        # (DEFAULT_RESOLVE_WORKERS) plus the metrics thread and bulk flushes, with slack.
+        try:
+            self.metadata.client.ensure_pool_maxsize(workers * 10)
+        except Exception as exc:  # pragma: no cover - never block the run on a pool-resize
+            logger.debug(f"Could not grow the HTTP connection pool: {exc}")
+
+        inflight = threading.BoundedSemaphore(workers * 4)
+
+        def handle(record: Optional[Entity]) -> None:  # noqa: UP045
+            try:
+                self._apply_steps(record)
+            except Exception as exc:  # pragma: no cover - sink already records failures to status
+                logger.debug(f"Error consuming record: {exc}")
+                logger.debug(traceback.format_exc())
+            finally:
+                inflight.release()
+
+        logger.info(f"Consuming source records with `{workers}` sink worker threads")
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="om-consume") as executor:
+            for record in self.source.run():
+                inflight.acquire()
+                executor.submit(handle, record)
 
     def get_failures(self) -> List[StackTraceError]:  # noqa: UP006
         return self.source.get_status().failures

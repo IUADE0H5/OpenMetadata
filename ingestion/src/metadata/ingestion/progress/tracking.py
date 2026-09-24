@@ -61,6 +61,26 @@ class ProgressTracking:
         return self._manual
 
 
+def share_progress_tracking(source: Any, *steps: Any) -> None:
+    """Give processor/stage/sink steps the source's ``ProgressTracking`` so a
+    multi-step workflow (usage: read, parse, stage, publish) reports every phase
+    on the one progress line the workflow heartbeat renders. The workflow reads
+    the registry off the first step that has one, which stays the source."""
+    tracking = attach_progress_tracking(source)
+    for step in steps:
+        step.__dict__["_progress_tracking"] = tracking
+
+
+def shared_progress(step: Any) -> Optional[ManualProgress]:  # noqa: UP045
+    """The manual progress facade a non-source step was handed by
+    ``share_progress_tracking``, or ``None`` when the step runs on its own (unit
+    tests, a workflow that did not share) - callers guard on it."""
+    tracking = step.__dict__.get("_progress_tracking")
+    if tracking is None or tracking.mode is not ProgressMode.MANUAL:
+        return None
+    return tracking.manual
+
+
 def attach_progress_tracking(source: Any) -> ProgressTracking:
     """Lazily build and cache the source's ``ProgressTracking``. Kept a
     module-level helper (not a base class) so any host composes progress

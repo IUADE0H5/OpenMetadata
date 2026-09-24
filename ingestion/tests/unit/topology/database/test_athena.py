@@ -59,9 +59,14 @@ from metadata.generated.schema.type.basic import (
 )
 from metadata.generated.schema.type.entityLineage import ColumnLineage
 from metadata.generated.schema.type.entityReference import EntityReference
+from metadata.generated.schema.type.filterPattern import FilterPattern
 from metadata.ingestion.api.models import Either
+from metadata.ingestion.source.database.athena.lineage import AthenaLineageSource
 from metadata.ingestion.source.database.athena.metadata import AthenaSource
 from metadata.ingestion.source.database.athena.models import AthenaStatus
+from metadata.ingestion.source.database.athena.query_parser import (
+    AthenaQueryParserSource,
+)
 from metadata.ingestion.source.database.athena.usage import AthenaUsageSource
 from metadata.ingestion.source.database.athena.utils import get_columns
 from metadata.ingestion.source.database.common_db_source import TableNameAndType
@@ -345,6 +350,7 @@ class TestAthenaUsageYieldTableQueries:
         source = MagicMock()
         source.dialect.value = "athena"
         source.config.serviceName = "test_athena"
+        source.database_name = "default"
         source.start = datetime(2024, 1, 1)
         source.is_not_dbt_or_om_query.return_value = True
         return source
@@ -373,6 +379,19 @@ class TestAthenaUsageYieldTableQueries:
         assert len(results[0].queries) == 1
         assert results[0].queries[0].endTime == COMPLETION_DT.isoformat(" ", "seconds")
 
+    def test_database_name_is_set_on_table_query(self):
+        """Regression: TableQuery.databaseName must be set, or lineage/usage query
+        matching falls back to a wildcard instead of the database metadata sync used."""
+        status = AthenaStatus(State="SUCCEEDED", SubmissionDateTime=SUBMISSION_DT)
+
+        source = self._make_source()
+        source.database_name = "my_athena_account_id"
+        source.get_queries.return_value = [self._make_query_list(status)]
+
+        results = list(AthenaUsageSource.yield_table_queries(source))
+
+        assert results[0].queries[0].databaseName == "my_athena_account_id"
+
     def test_end_time_falls_back_to_submission_when_completion_missing(self):
         status = AthenaStatus(State="SUCCEEDED", SubmissionDateTime=SUBMISSION_DT)
 
@@ -384,6 +403,148 @@ class TestAthenaUsageYieldTableQueries:
         assert len(results) == 1
         assert len(results[0].queries) == 1
         assert results[0].queries[0].endTime == SUBMISSION_DT.isoformat(" ", "seconds")
+
+
+class TestAthenaLineageYieldTableQuery:
+    def _make_source(self, database_name="default"):
+        source = MagicMock()
+        source.dialect.value = "athena"
+        source.config.serviceName = "test_athena"
+        source.database_name = database_name
+        source.start = datetime(2024, 1, 1)
+        source.is_not_dbt_or_om_query.return_value = True
+        return source
+
+    def _make_query_list(self, status):
+        query = MagicMock()
+        query.Query = "SELECT 1"
+        query.Status = status
+        query_list = MagicMock()
+        query_list.QueryExecutions = [query]
+        return query_list
+
+    def test_database_name_is_set_on_table_query(self):
+        """Regression: databaseName must be set on the yielded TableQuery, or
+        lineage matching falls back to a wildcard instead of the database
+        metadata sync used, silently failing to resolve any table."""
+        status = AthenaStatus(State="SUCCEEDED", SubmissionDateTime=SUBMISSION_DT)
+        source = self._make_source(database_name="123456789012")
+        source.get_queries.return_value = [self._make_query_list(status)]
+
+        results = list(AthenaLineageSource.yield_table_query(source))
+
+        assert len(results) == 1
+        assert results[0].databaseName == "123456789012"
+
+    def test_defaults_to_default_when_no_database_name_configured(self):
+        status = AthenaStatus(State="SUCCEEDED", SubmissionDateTime=SUBMISSION_DT)
+        source = self._make_source(database_name="default")
+        source.get_queries.return_value = [self._make_query_list(status)]
+
+        results = list(AthenaLineageSource.yield_table_query(source))
+
+        assert results[0].databaseName == "default"
+
+
+class TestAthenaQueryParserDatabaseName:
+    """AthenaQueryParserSource.database_name mirrors CommonDbSourceService's
+    metadata-sync fallback, so usage/lineage query matching agrees with the
+    database name metadata sync actually used."""
+
+    def test_uses_configured_database_name(self):
+        source = MagicMock()
+        source.service_connection.databaseName = "my_custom_db"
+
+        assert AthenaQueryParserSource.database_name.fget(source) == "my_custom_db"
+
+    def test_falls_back_to_default_when_not_configured(self):
+        source = MagicMock()
+        source.service_connection.databaseName = None
+
+        assert AthenaQueryParserSource.database_name.fget(source) == "default"
+
+
+class TestAthenaGetWorkGroups:
+    """Work group filtering in AthenaQueryParserSource.get_work_groups"""
+
+    def _make_source(self, exclude_identity_center=True, workgroup_filter_pattern=None, work_groups=None):
+        source = MagicMock()
+        source.service_connection.excludeIdentityCenterWorkgroups = exclude_identity_center
+        source.service_connection.workgroupFilterPattern = workgroup_filter_pattern
+        source._get_work_group_response.return_value = {
+            "WorkGroups": work_groups or [],
+            "NextToken": None,
+        }
+        # MagicMock auto-mocks any attribute access, so without this the real
+        # `_skip_work_group` is shadowed by a truthy Mock and every work group
+        # looks skipped. Bind the real method so it runs against `source`.
+        source._skip_work_group = AthenaQueryParserSource._skip_work_group.__get__(source)
+        return source
+
+    def test_identity_center_workgroup_skipped_by_default(self):
+        source = self._make_source(
+            work_groups=[
+                {
+                    "Name": "idc_wg",
+                    "State": "ENABLED",
+                    "IdentityCenterApplicationArn": "arn:aws:sso::123456789012:application/x",
+                },
+                {"Name": "plain_wg", "State": "ENABLED"},
+            ]
+        )
+
+        result = list(AthenaQueryParserSource.get_work_groups(source))
+
+        assert result == ["plain_wg"]
+
+    def test_identity_center_workgroup_kept_when_flag_disabled(self):
+        source = self._make_source(
+            exclude_identity_center=False,
+            work_groups=[
+                {
+                    "Name": "idc_wg",
+                    "State": "ENABLED",
+                    "IdentityCenterApplicationArn": "arn:aws:sso::123456789012:application/x",
+                },
+            ],
+        )
+
+        result = list(AthenaQueryParserSource.get_work_groups(source))
+
+        assert result == ["idc_wg"]
+
+    def test_workgroup_filter_pattern_excludes_by_name(self):
+        source = self._make_source(
+            workgroup_filter_pattern=FilterPattern(excludes=["^noisy_.*$"]),
+            work_groups=[
+                {"Name": "noisy_wg", "State": "ENABLED"},
+                {"Name": "kept_wg", "State": "ENABLED"},
+            ],
+        )
+
+        result = list(AthenaQueryParserSource.get_work_groups(source))
+
+        assert result == ["kept_wg"]
+
+    def test_disabled_workgroup_still_skipped(self):
+        source = self._make_source(
+            work_groups=[
+                {"Name": "disabled_wg", "State": "DISABLED"},
+                {"Name": "kept_wg", "State": "ENABLED"},
+            ]
+        )
+
+        result = list(AthenaQueryParserSource.get_work_groups(source))
+
+        assert result == ["kept_wg"]
+
+    def test_first_call_failure_falls_back_to_default_workgroup(self):
+        source = self._make_source()
+        source._get_work_group_response.side_effect = Exception("AccessDenied")
+
+        result = list(AthenaQueryParserSource.get_work_groups(source))
+
+        assert result == [None]
 
 
 @pytest.fixture

@@ -57,7 +57,7 @@ from metadata.generated.schema.metadataIngestion.workflow import (
 )
 from metadata.generated.schema.type.entityReferenceList import EntityReferenceList
 from metadata.generated.schema.type.tagLabel import TagLabel
-from metadata.ingestion.api.delete import delete_entity_from_source
+from metadata.ingestion.api.delete import StaleDeleteGuard, delete_entity_from_source
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.api.steps import Source
 from metadata.ingestion.api.topology_runner import TopologyRunnerMixin
@@ -495,17 +495,37 @@ class DatabaseServiceSource(TopologyRunnerMixin, Source, ABC):  # pylint: disabl
         """
         Mark the table record as scanned and update the database_source_state
         """
+        self._register_table_seen(table_request.name.root)
+
+    def _register_table_seen(self, table_name: str) -> None:
         table_fqn = fqn.build(
             self.metadata,
             entity_type=Table,
             service_name=self.context.get().database_service,
             database_name=self.context.get().database,
             schema_name=self.context.get().database_schema,
-            table_name=table_request.name.root,
+            table_name=table_name,
             skip_es_search=True,
         )
 
         self.database_source_state.add(table_fqn)
+
+    def on_stage_failure(self, stage: NodeStage, node_entity: Any) -> None:
+        """A table the run failed on is unknown, not gone: keep it out of the stale set, or a
+        transient source error (a throttled catalog call) deletes it."""
+        if stage.type_ is Table and isinstance(node_entity, tuple) and node_entity:
+            self._register_table_seen(str(node_entity[0]))
+
+    @property
+    def stale_delete_guard(self) -> StaleDeleteGuard:
+        """One guard per run, shared by every schema's stale deletion."""
+        instance_dict = self.__dict__
+        if "_stale_delete_guard" not in instance_dict:
+            instance_dict["_stale_delete_guard"] = StaleDeleteGuard(
+                allow_empty_scope=bool(getattr(self.source_config, "allowEmptyingSchema", False)),
+                allow_multiple_empty_scopes=bool(getattr(self.source_config, "allowEmptyingMultipleSchemas", False)),
+            )
+        return instance_dict["_stale_delete_guard"]
 
     def register_record_stored_proc_request(self, stored_proc_request: CreateStoredProcedureRequest) -> None:
         """
@@ -770,6 +790,7 @@ class DatabaseServiceSource(TopologyRunnerMixin, Source, ABC):  # pylint: disabl
                     entity_source_state=self.database_source_state,
                     recursive=self.source_config.markDeletedTables,
                     params={"databaseSchema": schema_fqn},
+                    guard=self.stale_delete_guard,
                 )
 
     def mark_stored_procedures_as_deleted(self):

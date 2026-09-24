@@ -23,6 +23,7 @@ import re
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from math import floor, log
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union  # noqa: UP035
@@ -189,6 +190,38 @@ def has_table_name(name: Optional[str]) -> bool:  # noqa: UP045
     those, so they are dropped instead of failing later on while building the FQN.
     """
     return bool(name and name.rsplit(".", maxsplit=1)[-1].strip())
+
+
+# Table references a query parser hands back that no catalog will ever hold: resolving one costs
+# the usage sink an Elasticsearch search plus an API fallback per query, and any usage, query or
+# lifecycle record attributed to it is noise. Each pattern is matched, case-insensitively and in
+# full, against the table component of the reference; pipelines extend the list through the
+# query parser processor config.
+TRANSIENT_TABLE_PATTERNS: Tuple[str, ...] = (  # noqa: UP006
+    # awswrangler / pandas CTAS staging tables (Athena, Redshift): temp_table_<uuid4 hex>
+    r"temp_table_[0-9a-f]{32}",
+    # sqllineage models UNNEST(...) as a table called <default>.unnest
+    r"unnest",
+    # Iceberg metadata tables (Athena, Trino, Spark): <table>$snapshots, <table>$history, ...
+    r".+\$(snapshots|history|files|manifests|partitions|refs|entries|all_data_files|metadata_log_entries)",
+)
+
+
+@lru_cache(maxsize=64)
+def _compile_transient_table_patterns(patterns: Tuple[str, ...]) -> Tuple[re.Pattern, ...]:  # noqa: UP006
+    return tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
+
+
+def is_transient_table_name(name: Optional[str], patterns: Tuple[str, ...] = TRANSIENT_TABLE_PATTERNS) -> bool:  # noqa: UP006, UP045
+    """
+    Whether a table reference coming from a query parser names a table that never exists in a
+    catalog (see `TRANSIENT_TABLE_PATTERNS`), so it should be dropped before anything is
+    attributed to it or looked up.
+    """
+    if not name:
+        return False
+    table = name.rsplit(".", maxsplit=1)[-1].strip().strip('"`[]')
+    return any(pattern.fullmatch(table) for pattern in _compile_transient_table_patterns(patterns))
 
 
 def replace_special_with(raw: str, replacement: str) -> str:

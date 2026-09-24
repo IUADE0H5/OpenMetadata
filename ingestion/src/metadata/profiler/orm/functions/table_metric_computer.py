@@ -61,6 +61,14 @@ from metadata.utils.dependency_injector.dependency_injector import (
     Inject,
     inject,
 )
+from metadata.utils.glue_catalog import (
+    CatalogTable,
+    created_at,
+    declared_size_bytes,
+    glue_and_s3_clients,
+    load_catalog_table,
+    table_stats,
+)
 from metadata.utils.logger import profiler_interface_registry_logger
 
 logger = profiler_interface_registry_logger()
@@ -1025,6 +1033,81 @@ class TrinoTableMetricComputer(_StatsBasedTableMetricComputer):
         return super().compute()
 
 
+class AthenaTableMetricComputer(_StatsBasedTableMetricComputer):
+    """Athena Table Metric Computer, reading what the catalog already knows.
+
+    `sizeInBytes` and `createDateTime` are only ever set by a computer like this one, and Athena has
+    never had one, so an Athena table profile has shown a blank size and no creation date whatever
+    the table format.
+
+    Glue records a creation time for every table, so that field is filled for all of them. Size and
+    row count depend on the format:
+
+    * Iceberg -- the current snapshot's summary carries `total-files-size` and `total-records`, both
+      written by the engine on every commit. The row count is exact and free, where `count(*)` scans
+      the table; on a lake profiled daily that is the difference between a free pass and a billed
+      one.
+    * Hive-style -- the catalog carries whatever a crawler last measured. The size is taken from
+      there because the alternative is the empty field it is today. The row count is *not*: Hive
+      writes `numRows` as -1 or leaves it stale, and swapping a correct `count(*)` for a stale
+      number would be a regression, not a saving.
+
+    Nothing here is load-bearing. A catalog that cannot be read, a metadata document that is gone,
+    a snapshot summary without `total-records`, a table never committed to -- each falls back to the
+    base `count(*)`, and every field that could be established is still attached.
+    """
+
+    def compute(self):
+        catalog = self._load_catalog()
+        if catalog is None:
+            return super().compute()
+
+        extras = {}
+        created = created_at(catalog.entry)
+        if created is not None:
+            extras[CREATE_DATETIME] = created
+
+        if catalog.is_iceberg:
+            stats = table_stats(catalog.iceberg)
+            size, row_count = stats.size_bytes, stats.row_count
+        else:
+            size, row_count = declared_size_bytes(catalog.entry), None
+        if size is not None:
+            extras[SIZE_IN_BYTES] = size
+
+        row = super().compute() if row_count is None else self._build_result(row_count)
+        return self._with_extras(row, extras)
+
+    @staticmethod
+    def _with_extras(row, extras: dict):
+        """Fold the catalog-sourced fields into the row.
+
+        The caller reads the result with `_asdict()`, so they have to travel inside the row rather
+        than beside it.
+        """
+        if not extras:
+            return row
+        merged = {**(row._asdict() if row is not None else {}), **extras}
+        return namedtuple("Result", merged)(**merged)
+
+    def _load_catalog(self) -> Optional[CatalogTable]:  # noqa: UP045
+        aws_config = getattr(self.conn_config, "awsConfig", None)
+        if aws_config is None:
+            return None
+        try:
+            glue_client, s3_client = glue_and_s3_clients(aws_config)
+            return load_catalog_table(
+                glue_client,
+                s3_client,
+                self.schema_name,
+                self.table_name,
+                catalog_id=getattr(self.conn_config, "catalogId", None),
+            )
+        except Exception as exc:
+            logger.debug(f"Could not read the catalog entry for {self.schema_name}.{self.table_name}: {exc}")
+            return None
+
+
 class HiveTableMetricComputer(_StatsBasedTableMetricComputer):
     """Hive Table Metric Computer using DESCRIBE FORMATTED."""
 
@@ -1180,6 +1263,7 @@ table_metric_computer_factory.register(Dialects.Exasol, ExasolTableMetricCompute
 table_metric_computer_factory.register(Dialects.Teradata, TeradataTableMetricComputer)
 table_metric_computer_factory.register(Dialects.Trino, TrinoTableMetricComputer)
 table_metric_computer_factory.register(Dialects.Presto, TrinoTableMetricComputer)
+table_metric_computer_factory.register(Dialects.Athena, AthenaTableMetricComputer)
 table_metric_computer_factory.register(Dialects.Hive, HiveTableMetricComputer)
 table_metric_computer_factory.register(Dialects.Impala, ImpalaTableMetricComputer)
 table_metric_computer_factory.register(Dialects.Databricks, DatabricksTableMetricComputer)

@@ -67,6 +67,8 @@ verdict cites an artifact that was checked to still exist):
 | Doc | Purpose | Read when | Modified | Freshness |
 |---|---|---|---|---|
 | `docs/assets/` (4 PNGs) | Architecture/marketing diagrams for the "Open Context Layer for AI" — hero, architecture, context graph, memory-primitives | Editing the root `README.md` visuals | 2026-06-10 | CURRENT (sole consumer: root `README.md`) |
+| `docs/kafka-connector-behaviour.md` | What the stock Kafka/Redpanda connector collects, call by call (Metadata, DescribeConfigs, registry `<topic>-value`), which Topic fields each call fills, what it never collects (groups, offsets, ACLs, lineage), sample-data mechanics, why IAM-only MSK needs an `oauth_cb` extension, and the exact permissions | Before configuring a Kafka service, writing its IAM policy, or answering "what does the Kafka connector give us" | 2026-09-15 | REFERENCE |
+| `docs/kafka-connect-connector-bugs.md` | Defects found running the stock Kafka Connect pipeline connector against a Debezium cluster: Avro namespaces with hyphens dropped every field, CDC envelopes without `before` and union-wrapped rows gave no column lineage (both fixed), heartbeat-topic warning, what worked (service resolution by dbServiceNames, status semantics) | Before running or debugging the Kafka Connect connector | 2026-09-15 | REFERENCE |
 
 ## UI reference docs (outside `docs/`)
 

@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from metadata.generated.schema.api.lineage.addLineage import AddLineageRequest
 from metadata.generated.schema.entity.services.databaseService import DatabaseService
-from metadata.generated.schema.type.basic import FullyQualifiedEntityName, Uuid
+from metadata.generated.schema.type.basic import FullyQualifiedEntityName, SqlQuery, Uuid
 from metadata.generated.schema.type.entityLineage import (
     ColumnLineage,
     EntitiesEdge,
@@ -47,6 +47,51 @@ T = TypeVar("T", bound=BaseModel)
 
 search_cache = LRUCache(LRU_CACHE_SIZE)
 LINEAGE_ROUTE = "/lineage"
+
+
+STALE_EDGE = None  # what the patch methods return when the server refused the `test` on columnsLineage
+
+
+def _whole_list_column_ops(patch: Any, original_columns: Any, updated_columns: Any) -> Any:
+    """Send ``columnsLineage`` as one operation on the whole list instead of index-addressed ops,
+    guarded by a ``test`` on the list that was read.
+
+    ``build_patch`` diffs the list by index against the client's view of the stored edge. That view
+    and the server's list drift - the client-side edge cache holds what was last sent, a merge
+    collapses a duplicate, another pipeline appended - and an op then addresses an index past the
+    end and the whole patch is refused ("An array item index is out of range"). The merged list is
+    the intended end state, so it is sent as such. The ``test`` op makes the server refuse the
+    patch when the list is no longer what was merged from - another writer's pairs would otherwise
+    be overwritten - and the caller re-reads and merges again. An edge that held no column lineage
+    gets a plain ``add``. The other fields keep their ops.
+    """
+    ops = [op for op in patch if not str(op.get("path", "")).startswith("/columnsLineage")]
+    if len(ops) == len(patch):
+        return ops
+    as_json = lambda columns: [  # noqa: E731
+        c.model_dump(mode="json") if hasattr(c, "model_dump") else c for c in (columns or [])
+    ]
+    original = as_json(original_columns)
+    if original:
+        ops.append({"op": "test", "path": "/columnsLineage", "value": original})
+        ops.append({"op": "replace", "path": "/columnsLineage", "value": as_json(updated_columns)})
+    else:
+        ops.append({"op": "add", "path": "/columnsLineage", "value": as_json(updated_columns)})
+    return ops
+
+
+def _is_stale_edge_refusal(err: APIError, ops: Any) -> bool:
+    """A 400 on a patch that carried a `test`: the edge changed since it was read."""
+    return err.status_code == 400 and any(op.get("op") == "test" for op in ops or [])
+
+
+def _api_error_message(err: APIError) -> str:
+    """The server's own message for a failed call - a status code alone says nothing about which
+    of the patch's operations was refused, and the traceback only reaches the log at DEBUG."""
+    error = getattr(err, "_error", None)
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("error") or error)[:500]
+    return str(err)[:500]
 
 
 class OMetaLineageMixin(Generic[T]):
@@ -133,10 +178,12 @@ class OMetaLineageMixin(Generic[T]):
         self,
         from_entity: EntityReference,
         to_entity: EntityReference,
+        refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:  # noqa: UP006, UP045
+        """``refresh`` skips the cached copy: the server said the edge changed under us."""
         try:
             cache_key = self._lineage_edge_cache_key(from_entity, to_entity)
-            if cache_key in search_cache:
+            if not refresh and cache_key in search_cache:
                 return search_cache.get(cache_key)
             res = cast(
                 "dict[str, Any]",
@@ -161,7 +208,9 @@ class OMetaLineageMixin(Generic[T]):
         from_entity_fqn: str,
         to_entity_type: str,
         to_entity_fqn: str,
+        refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:  # noqa: UP006, UP045
+        """``refresh`` skips the cached copy: the server said the edge changed under us."""
         try:
             cache_key = self._lineage_edge_name_cache_key(
                 from_entity_type,
@@ -169,7 +218,7 @@ class OMetaLineageMixin(Generic[T]):
                 to_entity_type,
                 to_entity_fqn,
             )
-            if cache_key in search_cache:
+            if not refresh and cache_key in search_cache:
                 return search_cache.get(cache_key)
             res = cast(
                 "dict[str, Any]",
@@ -194,26 +243,44 @@ class OMetaLineageMixin(Generic[T]):
         original: Sequence[Dict[str, Any] | ColumnLineage] | None,  # noqa: UP006
         updated: Sequence[Dict[str, Any] | ColumnLineage] | None,  # noqa: UP006
     ) -> list[dict[str, Any]]:
-        flat_original_result = set()
-        flat_updated_result = set()
-        original_data: list[dict[str, Any]] = [
-            column.model_dump() if isinstance(column, ColumnLineage) else column for column in original or []
-        ]
+        # Stored pairs first, in their stored order, then the new ones; every pair once. An edge
+        # that already holds duplicates comes back collapsed, so the next patch removes them.
+        merged: list[dict[str, Any]] = []
+        seen: set = set()
         try:
-            for column in original_data:
-                if column.get("toColumn") and column.get("fromColumns"):
-                    flat_original_result.add((*column.get("fromColumns", []), column.get("toColumn")))
-            for column in updated or []:
+            for column in [*(original or []), *(updated or [])]:
                 data = column.model_dump() if isinstance(column, ColumnLineage) else column
-                if data.get("toColumn") and data.get("fromColumns"):
-                    flat_updated_result.add((*data.get("fromColumns", []), data.get("toColumn")))
+                if not (data.get("toColumn") and data.get("fromColumns")):
+                    continue
+                key = (*data.get("fromColumns", []), data.get("toColumn"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(dict(data))
         except Exception as exc:
             logger.debug(f"Error while merging column lineage: {exc}")
             logger.debug(traceback.format_exc())
-        union_result = flat_original_result.union(flat_updated_result)
-        if flat_original_result == union_result:
-            return original_data
-        return [{"fromColumns": list(col_data[:-1]), "toColumn": col_data[-1]} for col_data in union_result]
+        return merged
+
+    @staticmethod
+    def _stored_sql_query(edge: Optional[Dict[str, Any]]) -> Optional[str]:  # noqa: UP006, UP045
+        return ((edge or {}).get("edge") or {}).get("sqlQuery")
+
+    @staticmethod
+    def _remember_edge(cache_key: str, existing: Optional[Dict[str, Any]], details: LineageDetails) -> None:  # noqa: UP006, UP045
+        """Keep the edge cache in step with what was just written. The lookup is LRU-cached, so
+        without this every later write of the same edge merges against a stale copy and the JSON
+        patch re-adds column pairs already stored - one duplicate per repeated statement."""
+        edge = dict((existing or {}).get("edge") or {})
+        edge["columnsLineage"] = [
+            column.model_dump(mode="json") if isinstance(column, ColumnLineage) else column
+            for column in details.columnsLineage or []
+        ]
+        if details.sqlQuery:
+            edge["sqlQuery"] = model_str(details.sqlQuery)
+        if details.pipeline:
+            edge["pipeline"] = details.pipeline.model_dump(mode="json")
+        search_cache.put(cache_key, {**(existing or {}), "edge": edge})
 
     def _update_cache(self, request: AddLineageRequest, response: Dict[str, Any]):  # noqa: UP006
         try:
@@ -250,10 +317,15 @@ class OMetaLineageMixin(Generic[T]):
         FQN (e.g. the metadata sink) get it rebuilt from the request they already hold.
         """
         data = deepcopy(data)
+        edge = None
         try:
             patch_op_success = False
-            if check_patch and data.edge.lineageDetails:
-                edge = self._get_lineage_edge_for_references(data.edge.fromEntity, data.edge.toEntity)
+            for attempt in range(2) if check_patch and data.edge.lineageDetails else ():
+                edge = self._get_lineage_edge_for_references(
+                    data.edge.fromEntity, data.edge.toEntity, refresh=attempt > 0
+                )
+                if not edge:
+                    break
                 if edge:
                     original: AddLineageRequest = deepcopy(data)
                     original.edge.lineageDetails.columnsLineage = edge["edge"].get("columnsLineage", [])
@@ -265,9 +337,13 @@ class OMetaLineageMixin(Generic[T]):
                         if edge["edge"].get("pipeline")
                         else None
                     )
-                    # `original` mirrors `data`, so build_patch would see no sqlQuery diff. Null it so
-                    # the incoming query is added/updated, while a missing one keeps the stored value.
-                    original.edge.lineageDetails.sqlQuery = None  # pyright: ignore[reportOptionalMemberAccess]
+                    # `original` mirrors `data`, so build_patch would see no sqlQuery diff. Give it the
+                    # stored query so an incoming query is added or updated only when it differs, while
+                    # a missing incoming one keeps the stored value untouched.
+                    stored_query = self._stored_sql_query(edge) if data.edge.lineageDetails.sqlQuery else None
+                    original.edge.lineageDetails.sqlQuery = (  # pyright: ignore[reportOptionalMemberAccess]
+                        SqlQuery(stored_query) if stored_query else None
+                    )
                     # merge the original and new column level lineage
                     data.edge.lineageDetails.columnsLineage = self._merge_column_lineage(
                         original.edge.lineageDetails.columnsLineage,
@@ -289,11 +365,20 @@ class OMetaLineageMixin(Generic[T]):
                     if original.edge.lineageDetails.pipeline and not data.edge.lineageDetails.pipeline:
                         data.edge.lineageDetails.pipeline = original.edge.lineageDetails.pipeline
                     patch = self.patch_lineage_edge(original=original, updated=data)
+                    if patch is STALE_EDGE and attempt == 0:
+                        continue  # another writer changed the edge: read it fresh and merge again
                     if patch:
                         patch_op_success = True
+                break
 
             if patch_op_success is False:
                 self.client.put(self.get_suffix(AddLineageRequest), data=data.model_dump_json())
+            if check_patch and data.edge.lineageDetails:
+                self._remember_edge(
+                    self._lineage_edge_cache_key(data.edge.fromEntity, data.edge.toEntity),
+                    edge,
+                    data.edge.lineageDetails,
+                )
 
         except APIError as err:
             logger.debug(traceback.format_exc())
@@ -324,15 +409,19 @@ class OMetaLineageMixin(Generic[T]):
         return_lineage: bool = True,
     ) -> Dict[str, Any]:  # noqa: UP006
         lineage_details = deepcopy(lineage_details) if lineage_details else LineageDetails.model_validate({})
+        edge = None
         try:
             patch_op_success = False
-            if check_patch and lineage_details:
+            for attempt in range(2) if check_patch and lineage_details else ():
                 edge = self.get_lineage_edge_by_name(
                     from_entity_type,
                     from_entity_fqn,
                     to_entity_type,
                     to_entity_fqn,
+                    refresh=attempt > 0,
                 )
+                if not edge:
+                    break
                 if edge:
                     original_columns = cast("list[dict[str, Any]]", edge["edge"].get("columnsLineage") or [])
                     original_pipeline = (
@@ -340,14 +429,15 @@ class OMetaLineageMixin(Generic[T]):
                         if edge["edge"].get("pipeline")
                         else None
                     )
-                    # sqlQuery is intentionally left out so it defaults to None: that forces build_patch
-                    # to add/update the incoming query. Do not populate it from the stored edge here.
+                    # The stored query is set only when one is incoming, so build_patch adds or updates
+                    # it when it differs and leaves a stored query alone when the incoming one is empty.
                     original = LineageDetails.model_validate(
                         {
                             "columnsLineage": [
                                 ColumnLineage.model_validate(column_lineage) for column_lineage in original_columns
                             ],
                             "pipeline": original_pipeline,
+                            "sqlQuery": self._stored_sql_query(edge) if lineage_details.sqlQuery else None,
                         }
                     )
                     updated_columns = [
@@ -371,14 +461,23 @@ class OMetaLineageMixin(Generic[T]):
                         original=original,
                         updated=lineage_details,
                     )
+                    if patch is STALE_EDGE and attempt == 0:
+                        continue  # another writer changed the edge: read it fresh and merge again
                     if patch:
                         patch_op_success = True
+                break
 
             if patch_op_success is False:
                 self.client.put(
                     f"{LINEAGE_ROUTE}/"
                     f"{self._lineage_edge_path_by_name(from_entity_type, from_entity_fqn, to_entity_type, to_entity_fqn)}",
                     data=lineage_details.model_dump_json(),
+                )
+            if check_patch:
+                self._remember_edge(
+                    self._lineage_edge_name_cache_key(from_entity_type, from_entity_fqn, to_entity_type, to_entity_fqn),
+                    edge,
+                    lineage_details,
                 )
 
         except APIError as err:
@@ -449,17 +548,27 @@ class OMetaLineageMixin(Generic[T]):
                 allowed_fields=allowed_fields,
                 remove_change_description=False,
             )
+            ops = []
             if patch:
+                ops = _whole_list_column_ops(
+                    patch.patch,
+                    original.edge.lineageDetails.columnsLineage,
+                    updated.edge.lineageDetails.columnsLineage,
+                )
                 self.client.patch(
                     f"{self.get_suffix(AddLineageRequest)}/"
                     f"{self._lineage_edge_path(original.edge.fromEntity, original.edge.toEntity)}",
-                    data=str(patch),
+                    data=json.dumps(ops),
                 )
             return True  # noqa: TRY300
         except APIError as err:
             logger.debug(traceback.format_exc())
+            if _is_stale_edge_refusal(err, ops):
+                logger.debug(f"Lineage edge changed since it was read, re-reading: {original.edge.fromEntity.id}")
+                return STALE_EDGE
             logger.warning(
-                f"Error Patching Lineage Edge {err.status_code} for {original.edge.fromEntity.fullyQualifiedName}"
+                f"Error Patching Lineage Edge {err.status_code} for {original.edge.fromEntity.fullyQualifiedName}: "
+                f"{_api_error_message(err)}"
             )
         except ValueError as err:
             logger.debug(str(err))
@@ -482,18 +591,25 @@ class OMetaLineageMixin(Generic[T]):
                 allowed_fields=allowed_fields,
                 remove_change_description=False,
             )
+            ops = []
             if patch:
+                ops = _whole_list_column_ops(patch.patch, original.columnsLineage, updated.columnsLineage)
                 self.client.patch(
                     f"{LINEAGE_ROUTE}/"
                     f"{self._lineage_edge_path_by_name(from_entity_type, from_entity_fqn, to_entity_type, to_entity_fqn)}",
-                    data=str(patch),
+                    data=json.dumps(ops),
                 )
             return True  # noqa: TRY300
         except APIError as err:
             logger.debug(traceback.format_exc())
+            if _is_stale_edge_refusal(err, ops):
+                logger.debug(
+                    f"Lineage edge changed since it was read, re-reading: {from_entity_fqn} -> {to_entity_fqn}"
+                )
+                return STALE_EDGE
             logger.warning(
                 f"Error Patching Lineage Edge {err.status_code} for "
-                f"{from_entity_type}:{from_entity_fqn} -> {to_entity_type}:{to_entity_fqn}"
+                f"{from_entity_type}:{from_entity_fqn} -> {to_entity_type}:{to_entity_fqn}: {_api_error_message(err)}"
             )
         return False
 

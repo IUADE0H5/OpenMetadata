@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 from pydantic import BaseModel, Field
 from typing_extensions import Annotated  # noqa: UP035
 
+from metadata.generated.schema.entity.services.ingestionPipelines.status import StackTraceError
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.api.topology_runner import TopologyRunnerMixin
 from metadata.ingestion.models.topology import (
@@ -316,3 +317,52 @@ class TopologyRunnerTest(TestCase):
             yielded,
             [MockSchema(name="schema1", sourceHash="ddb43c9d34ccbe2363a37db746211fcb")],
         )
+
+
+class FailingTablesSource(MockSource):
+    """One table errors inside its processor, one is reported as a Left; both must reach the hook."""
+
+    failed: List = []  # noqa: RUF012, UP006
+
+    @staticmethod
+    def get_schemas():
+        yield "schema1"  # one parent, so each table is produced once
+
+    @staticmethod
+    def get_tables():
+        yield "table_ok"
+        yield "table_left"
+        yield "table_raises"
+
+    @staticmethod
+    def yield_tables(name: str):
+        if name == "table_raises":
+            raise RuntimeError("Rate exceeded")
+        if name == "table_left":
+            yield Either(left=StackTraceError(name=name, error="ThrottlingException", stackTrace=None))
+            return
+        yield Either(right=MockTable(name=name, columns=["c1"]))
+
+    def on_stage_failure(self, stage: NodeStage, node_entity) -> None:
+        self.failed.append((stage.context, node_entity))
+
+
+class TopologyRunnerFailureHookTest(TestCase):
+    """A stage that fails for an entity tells the source, so the source can keep the entity as seen."""
+
+    def test_failed_entities_reach_the_hook_and_good_ones_do_not(self):
+        source = FailingTablesSource()
+        source.failed = []
+        source.context = TopologyContextManager(source.topology)
+        source.context.set_threads(0)
+        source.metadata = MagicMock()
+        source.status = MagicMock()
+
+        with patch("metadata.ingestion.models.topology.TopologyContextManager.pop", return_value=None):
+            list(source._iter())
+
+        self.assertEqual(sorted(source.failed), [("tables", "table_left"), ("tables", "table_raises")])
+
+    def test_the_default_hook_is_a_no_op(self):
+        source = MockSource()
+        source.on_stage_failure(source.topology.tables.stages[0], "table1")

@@ -15,7 +15,19 @@ import traceback
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, List, Optional, Union  # noqa: UP035
+from functools import partial
+from typing import (  # noqa: UP035
+    Any,
+    Callable,
+    ClassVar,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+)
 
 from pydantic import EmailStr
 from pydantic_core import PydanticCustomError
@@ -55,6 +67,7 @@ from metadata.generated.schema.type.basic import (
     SourceUrl,
 )
 from metadata.generated.schema.type.entityLineage import ColumnLineage
+from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.generated.schema.type.entityReferenceList import EntityReferenceList
 from metadata.generated.schema.type.filterPattern import FilterPattern
 from metadata.ingestion.api.models import Either
@@ -63,36 +76,53 @@ from metadata.ingestion.lineage.models import Dialect
 from metadata.ingestion.lineage.parser import LineageParser
 from metadata.ingestion.lineage.sql_lineage import get_column_fqn
 from metadata.ingestion.models.barrier import Barrier
+from metadata.ingestion.ometa.client import APIError
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
 from metadata.ingestion.ometa.utils import model_str
 from metadata.ingestion.progress.modes import ProgressMode
 from metadata.ingestion.source.dashboard.dashboard_service import DashboardServiceSource
 from metadata.ingestion.source.dashboard.powerbi.constants import (
+    ATHENA_DATABASES_EXPRESSION_KW,
+    ATHENA_DEFAULT_CATALOG,
     BIGQUERY_QUERY_EXPRESSION_KW,
     DATABRICKS_QUERY_EXPRESSION_KW,
     DEFAULT_REPORTS_PREFIX,
     MAX_PROJECT_FILTER_SIZE,
+    ODBC_DATASOURCE_EXPRESSION_KW,
+    ODBC_QUERY_EXPRESSION_KW,
     OWNER_ACCESS_RIGHTS_KEYWORDS,
+    POWERBI_APP_PRINCIPAL_TYPE,
+    POWERBI_GROUP_PRINCIPAL_TYPE,
+    POWERBI_USER_PRINCIPAL_TYPE,
+    POWERBI_VISUAL_TYPE_TO_CHART_TYPE,
+    POWERBI_WRITE_WORKSPACE_ROLES,
     RDL_REPORT_FORMAT,
     RDL_REPORTS_PREFIX,
     SNOWFLAKE_QUERY_EXPRESSION_KW,
     SQL_DATABASE_EXPRESSION_KW,
     SQL_LINE_COMMENT_PATTERN,
+    is_write_dataset_right,
 )
 from metadata.ingestion.source.dashboard.powerbi.databricks_parser import (
     parse_databricks_native_query_source,
 )
+from metadata.ingestion.source.dashboard.powerbi.fabric_client import FabricApiClient
 from metadata.ingestion.source.dashboard.powerbi.models import (
     Dataflow,
     DataflowExportResponse,
     Datamart,
     Dataset,
     Group,
+    PowerBiColumns,
     PowerBIDashboard,
     PowerBiMeasureModel,
+    PowerBiMeasures,
+    PowerBIPrincipal,
     PowerBIReport,
     PowerBiTable,
+    PowerBITableSource,
     ReportPage,
+    UpstreaDataflow,
 )
 from metadata.ingestion.source.dashboard.powerbi.workspace_state import WorkspaceState
 from metadata.ingestion.source.database.column_helpers import truncate_column_name
@@ -131,6 +161,66 @@ DASHBOARD_TARGET = LineageTargetSpec(
 )
 
 
+# --- Report-column-usage feature: structural contract for the objects
+# `report_definition.py`, `tmdl.py` and `column_usage.py` produce. -------------------
+#
+# These are `Protocol`s, not imports of the real dataclasses: the parser modules are
+# built in parallel (a sibling task) and may not exist in every checkout yet, and this
+# connector must import cleanly either way. A `Protocol` gives real structural type
+# checking against the real dataclasses once they land (matching field names satisfy it
+# automatically) without a hard `import` dependency. The actual parsing calls
+# (`_parse_report_definition`, `_parse_semantic_model_definition`,
+# `_compute_column_usage`) import the real modules lazily and degrade to a logged no-op
+# if the module isn't present yet - see those methods.
+class FieldRefLike(Protocol):
+    kind: str  # "column" | "measure" | "hierarchy_level"
+    table: str
+    name: str
+
+
+class VisualDefinitionLike(Protocol):
+    visual_id: str
+    page_id: str
+    page_display_name: Optional[str]  # noqa: UP045
+    visual_type: str
+    title: Optional[str]  # noqa: UP045
+    refs: List[FieldRefLike]  # noqa: UP006
+    is_data_visual: bool
+
+
+class ReportDefinitionLike(Protocol):
+    format: Optional[str]  # noqa: UP045
+    visuals: List[VisualDefinitionLike]  # noqa: UP006
+
+
+class ColumnUseLike(Protocol):
+    table: str
+    column: str
+    via_measure: Optional[str]  # noqa: UP045
+
+
+class ModelColumnUsageLike(Protocol):
+    business_columns: frozenset
+    used: frozenset
+    unused: frozenset
+    wholly_unused_tables: frozenset
+    per_visual: Mapping[Tuple[str, str], List[ColumnUseLike]]  # noqa: UP006
+    dangling: Mapping[str, List[FieldRefLike]]  # noqa: UP006
+    dax_unresolved: set
+    counters: Mapping[str, int]
+
+
+class DataflowSourceRefLike(Protocol):
+    workspace_id: Optional[str]  # noqa: UP045
+    dataflow_id: str
+    entity: str
+
+
+class ColumnMappingLike(Protocol):
+    mapped: Mapping[str, str]
+    unmapped: List[str]  # noqa: UP006
+
+
 class PowerbiSource(DashboardServiceSource):
     """PowerBi Source Class"""
 
@@ -138,6 +228,134 @@ class PowerbiSource(DashboardServiceSource):
 
     config: WorkflowSource
     metadata_config: OpenMetadataConnection
+
+    # `metric_values()` keys - plain counters an external metrics reporter
+    # can read after ingestion without re-deriving them from logs.
+    METRIC_DATAFLOWS_FETCHED = "dataflows_fetched"
+    # Recognized Athena/ODBC M query blocks, counted once per block regardless
+    # of loadEnabled - "seen" means detected, not "successfully dispatched".
+    METRIC_ATHENA_ODBC_QUERIES_SEEN = "athena_odbc_queries_seen"
+    # Distinct (data model, table reference) pairs per run; resolved + unresolved
+    # == parsed by construction (see `_record_source_reference`).
+    METRIC_SOURCE_REFERENCES_PARSED = "source_references_parsed"
+    METRIC_SOURCE_REFERENCES_RESOLVED = "source_references_resolved"
+    METRIC_SOURCE_REFERENCES_UNRESOLVED = "source_references_unresolved"
+    # Only queries recognized as Athena/ODBC/Sql.Database sourced (i.e. that
+    # would otherwise have reached the lineage parser) and skipped because
+    # loadEnabled is not true - not every disabled query in the document.
+    METRIC_QUERIES_SKIPPED_LOAD_DISABLED = "queries_skipped_load_disabled"
+    # Dataset->dataflow links whose workspaceObjectId is not one of the
+    # workspaces this run processed (outside projectFilterPattern, or not
+    # visible to the caller); never resolved, logged once per foreign workspace.
+    METRIC_UPSTREAM_LINKS_OUTSIDE_SCOPE = "upstream_links_outside_scope"
+
+    # Non-admin owner resolution (`_get_owner_ref_non_admin`) only - the admin
+    # scan's owner path (`_get_owner_ref_admin`) isn't metered, it always had
+    # the entity's `users` inline.
+    # `owners_assigned_*` is always per asset: a report that inherits its
+    # owners from a cached dataset computation still gets its own increment
+    # here (`_get_owner_ref_non_admin` bumps it once per top-level
+    # `get_owner_ref` call, independent of whether the underlying
+    # `_compute_*_owner_refs` call was a cache hit).
+    METRIC_OWNERS_ASSIGNED_DATAMODELS = "owners_assigned_datamodels"
+    METRIC_OWNERS_ASSIGNED_DATAFLOWS = "owners_assigned_dataflows"
+    METRIC_OWNERS_ASSIGNED_REPORTS = "owners_assigned_reports"
+    METRIC_OWNERS_ASSIGNED_DASHBOARDS = "owners_assigned_dashboards"
+    # Per-(owning asset, principal) counters, not per dependent that reaches
+    # that asset: `_compute_datamodel_owner_refs`/`_compute_dataflow_owner_refs`
+    # memoise the owner set per dataset/dataflow id in `WorkspaceState`
+    # (cleared per workspace), so a dataset with three dependent reports
+    # counts its principals once here, not three times - a report/dashboard
+    # inheriting a cached owner set never re-enters principal resolution.
+    # A future counter that is instead meant to count once per dependent
+    # traversal (rather than once per owning asset) should carry an
+    # `_occurrences` suffix to say so, not this shape.
+    METRIC_OWNER_PRINCIPALS_SKIPPED_APP = "owner_principals_skipped_app"
+    METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER = "owner_principals_skipped_viewer"
+    METRIC_OWNER_PRINCIPALS_UNRESOLVED = "owner_principals_unresolved"
+    METRIC_ASSETS_WITHOUT_OWNER = "assets_without_owner"
+
+    # Report -> semantic-model column usage (`report_column_usage_enabled`). Off by
+    # default - see the class attribute below; every key here still seeds at 0
+    # regardless, same as every other METRIC_*.
+    METRIC_REPORT_DEFINITIONS_FETCHED = "report_definitions_fetched"
+    METRIC_REPORT_DEFINITIONS_CACHE_SKIPPED = "report_definitions_cache_skipped"
+    METRIC_REPORT_DEFINITIONS_FAILED = "report_definitions_failed"
+    METRIC_MODEL_DEFINITIONS_FETCHED = "model_definitions_fetched"
+    METRIC_MODEL_DEFINITIONS_CACHE_SKIPPED = "model_definitions_cache_skipped"
+    METRIC_MODEL_DEFINITIONS_FAILED = "model_definitions_failed"
+    # `list_reports_last_updated`/`list_semantic_models_last_updated` (one call per
+    # workspace per run) failing - the cache key then falls back to `None` for that
+    # workspace's items, degrading to within-run-only dedup for it.
+    METRIC_REPORT_LAST_UPDATED_LISTING_FAILED = "report_last_updated_listing_failed"
+    METRIC_MODEL_LAST_UPDATED_LISTING_FAILED = "model_last_updated_listing_failed"
+    METRIC_REPORTS_FORMAT_LEGACY = "reports_format_legacy"
+    METRIC_REPORTS_FORMAT_PBIR = "reports_format_pbir"
+    METRIC_REPORTS_FORMAT_UNKNOWN = "reports_format_unknown"
+    METRIC_VISUALS_DATA = "visuals_data"
+    METRIC_VISUALS_NON_DATA = "visuals_non_data"
+    METRIC_VISUALS_SKIPPED = "visuals_skipped"
+    METRIC_COLUMN_REFS_RESOLVED = "column_refs_resolved"
+    METRIC_COLUMN_REFS_DANGLING = "column_refs_dangling"
+    METRIC_MEASURES_RESOLVED_TRANSITIVELY = "measures_resolved_transitively"
+    METRIC_DAX_UNRESOLVED = "dax_unresolved"
+    METRIC_REPORT_VISUAL_CHARTS_CREATED = "report_visual_charts_created"
+    METRIC_MODEL_COLUMNS_INGESTED = "model_columns_ingested"
+    METRIC_AUTO_DATE_TABLES_SKIPPED = "auto_date_tables_skipped"
+    METRIC_COLUMN_LINEAGE_EMITTED = "column_lineage_emitted"
+    METRIC_COLUMN_LINEAGE_VERIFIED = "column_lineage_verified"
+    METRIC_COLUMN_LINEAGE_DROPPED_BY_SERVER = "column_lineage_dropped_by_server"
+    METRIC_DATAFLOW_MODEL_COLUMNS_MAPPED = "dataflow_model_columns_mapped"
+    METRIC_DATAFLOW_MODEL_COLUMNS_UNMAPPED = "dataflow_model_columns_unmapped"
+    METRIC_MODEL_COLUMNS_USED = "model_columns_used"
+    METRIC_MODEL_COLUMNS_UNUSED = "model_columns_unused"
+    # Per-edge-kind breakdown, so a dev run can reconcile
+    # entries_emitted == entries_verified + entries_dropped, per kind - the
+    # METRIC_COLUMN_LINEAGE_* trio above stays as the cross-kind aggregate.
+    # "Edges written" counts distinct (from, to) pairs (post-dedup - see
+    # `WorkspaceState.has_emitted_column_lineage_edge`), never re-emissions.
+    METRIC_COLUMN_LINEAGE_EDGES_WRITTEN_MODEL_REPORT = "column_lineage_edges_written_model_report"
+    METRIC_COLUMN_LINEAGE_ENTRIES_EMITTED_MODEL_REPORT = "column_lineage_entries_emitted_model_report"
+    METRIC_COLUMN_LINEAGE_ENTRIES_VERIFIED_MODEL_REPORT = "column_lineage_entries_verified_model_report"
+    METRIC_COLUMN_LINEAGE_ENTRIES_DROPPED_MODEL_REPORT = "column_lineage_entries_dropped_model_report"
+    METRIC_COLUMN_LINEAGE_EDGES_WRITTEN_DATAFLOW_DATASET = "column_lineage_edges_written_dataflow_dataset"
+    METRIC_COLUMN_LINEAGE_ENTRIES_EMITTED_DATAFLOW_DATASET = "column_lineage_entries_emitted_dataflow_dataset"
+    METRIC_COLUMN_LINEAGE_ENTRIES_VERIFIED_DATAFLOW_DATASET = "column_lineage_entries_verified_dataflow_dataset"
+    METRIC_COLUMN_LINEAGE_ENTRIES_DROPPED_DATAFLOW_DATASET = "column_lineage_entries_dropped_dataflow_dataset"
+    # A model->chart use whose (table, column) has no matching column on the
+    # `DashboardDataModel` entity itself - distinct from METRIC_COLUMN_REFS_DANGLING,
+    # which counts the parser's own dangling refs (a name that never resolved to any
+    # model column at all). This one means the parser resolved the ref to a real TMDL
+    # column, but that column didn't make it onto the ingested entity - expected 0
+    # once auto-date columns are filtered out of `per_visual` upstream.
+    METRIC_COLUMN_LINEAGE_SOURCE_COLUMN_MISSING = "column_lineage_source_column_missing"
+
+    # Canonical `edge_kind` values `_track_column_lineage_edge`/`_verify_column_lineage_edges`
+    # dispatch the per-kind metrics above on - distinct from `error_name` (which is
+    # free-text, used in log messages and shared by edge kinds this dedup doesn't
+    # cover, e.g. dataset-upstream-dataset).
+    EDGE_KIND_MODEL_REPORT = "model_report"
+    EDGE_KIND_DATAFLOW_DATASET = "dataflow_dataset"
+
+    # Report -> semantic-model column usage: fetches report/model definitions from
+    # Fabric (`fabric_client.py`), ingests model columns from TMDL instead of the
+    # (always-empty, non-admin) push-dataset tables call, creates one Chart per data
+    # visual, and emits model-column -> chart / dataflow-column -> model-column
+    # lineage. Off by default: `powerBIConnection.json` has `additionalProperties:
+    # false` so there is no config flag for it - a subclass (e.g. a bank-specific one)
+    # opts in by overriding this ClassVar to True. With it False, behaviour is
+    # byte-for-byte identical to before this feature existed - see
+    # `test_report_column_usage_disabled_is_unchanged` for the proof.
+    report_column_usage_enabled: ClassVar[bool] = False
+
+    # Bounded per CLAUDE.md's cache rule: this de-dupes (data model, table
+    # reference) pairs for one connector run. A tenant's total distinct
+    # references realistically stays far under this; beyond it we degrade to
+    # per-occurrence counting (resolved/unresolved still stay consistent with
+    # parsed) rather than grow unbounded.
+    _MAX_TRACKED_SOURCE_REFERENCES = 50_000
+    # Caps the volume of "unresolved reference" INFO log lines per run.
+    _MAX_UNRESOLVED_LOGGED = 50
 
     def __init__(
         self,
@@ -148,6 +366,112 @@ class PowerbiSource(DashboardServiceSource):
         self.pagination_entity_per_page = min(100, self.service_connection.pagination_entity_per_page)
         self.datamodel_file_mappings = []
         self.state = WorkspaceState()
+        # Every declared METRIC_* key starts at 0, not merely absent. A bare
+        # Counter() only emits a key once it's first incremented, so a metric
+        # that is legitimately always 0 for a run (e.g. no unresolved owners)
+        # is indistinguishable on the far side of a Prometheus scrape from
+        # "this code path never ran" - exactly the failure mode that hid a
+        # real bug for a full run. Seeding every key here, from the class's
+        # own METRIC_* attributes rather than a hand-maintained list, makes
+        # that impossible to forget when a metric is added.
+        self._metrics = Counter(dict.fromkeys(self._all_metric_keys(), 0))
+        self._counted_source_references: set = set()
+        self._unresolved_logged_count = 0
+        # Fabric client for report/model `getDefinition` calls - only constructed
+        # when the feature is switched on, so a connector run with it off never even
+        # builds one. `FabricApiClient.__init__` itself does no network I/O (its
+        # msal client is built lazily, on first token request - see its docstring),
+        # so building it here eagerly is safe even though - unlike `PowerBiApiClient`
+        # (client.py), which sits behind the connection-test lifecycle
+        # (`connection.py`'s `PowerBIConnection._get_client`) - this constructor runs
+        # before `test_connection()`. The try/except is still worth keeping as a
+        # last-resort guard against a malformed config value: every consumer already
+        # treats `fabric_client is None` as "feature unavailable this run" (logs +
+        # a `*_failed` metric), the same degrade-gracefully contract as an
+        # individual fetch failing.
+        self.fabric_client: Optional[FabricApiClient] = None  # noqa: UP045
+        if self.report_column_usage_enabled:
+            try:
+                self.fabric_client = FabricApiClient(self.service_connection)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(f"Could not construct the Fabric API client: {exc}")
+                logger.debug(traceback.format_exc())
+        # (from_entity_id, to_entity_id, edge_kind, emitted_column_count) for every
+        # column-lineage edge yielded this run - read back and compared against what
+        # the server actually stored once the workspace's lineage barrier flushes.
+        self._pending_column_lineage_edges: List[Tuple[str, str, str, int]] = []  # noqa: UP006
+
+    @classmethod
+    def _all_metric_keys(cls) -> List[str]:  # noqa: UP006
+        """Every ``METRIC_*`` class attribute's value, walking the full MRO so a
+        subclass's own metrics are included too - the single source of truth
+        for ``metric_values()``'s full key set.
+        """
+        return [
+            name
+            for name in (getattr(cls, attr) for attr in dir(cls) if attr.startswith("METRIC_"))
+            if isinstance(name, str)
+        ]
+
+    def metric_values(self) -> dict[str, int]:
+        """Cheap, side-effect free snapshot of dataflow/M-parsing volume counters.
+
+        Always returns the full, stable set of ``METRIC_*`` keys (each starts
+        at 0 in ``__init__``) - never a partial dict missing a key that just
+        happened not to be incremented this run.
+
+        A subclass's metrics reporter picks this up automatically after
+        ingestion; see the ``METRIC_*`` class attributes for the keys.
+        """
+        return dict(self._metrics)
+
+    def on_datamodel_column_usage(
+        self,
+        datamodel_entity: DashboardDataModel,
+        usage: ModelColumnUsageLike,
+    ) -> None:
+        """Overridable hook: called once per semantic model with its computed
+        report-column usage, so a subclass can act on it (e.g. tag unused columns).
+
+        No-op by default - generic ingestion never writes anything from this hook on
+        its own. Only called when `report_column_usage_enabled` is True, once per
+        model, after that model entity (with its persisted columns) exists in
+        OpenMetadata - i.e. after the per-workspace lineage-flush Barrier, the same
+        point `yield_dashboard_lineage_details` already relies on for every other
+        cross-entity lookup in this connector.
+        """
+        return
+
+    def _record_source_reference(
+        self,
+        datamodel_entity: DashboardDataModel,
+        fqn_search_string: str,
+        resolved: bool,
+    ) -> None:
+        """Count one distinct (data model, table reference) pair, once per run.
+
+        Keeps ``source_references_parsed == resolved + unresolved`` true by
+        construction: both counters are updated together for the same key,
+        and a key already seen (e.g. the same table reached via two different
+        M queries in one dataflow) is not counted again. Unresolved references
+        are logged at INFO, once per pair, up to ``_MAX_UNRESOLVED_LOGGED``.
+        """
+        key = (model_str(datamodel_entity.name), fqn_search_string)
+        if key in self._counted_source_references:
+            return
+        if len(self._counted_source_references) < self._MAX_TRACKED_SOURCE_REFERENCES:
+            self._counted_source_references.add(key)
+        self._metrics[self.METRIC_SOURCE_REFERENCES_PARSED] += 1
+        self._metrics[
+            self.METRIC_SOURCE_REFERENCES_RESOLVED if resolved else self.METRIC_SOURCE_REFERENCES_UNRESOLVED
+        ] += 1
+        if not resolved and self._unresolved_logged_count < self._MAX_UNRESOLVED_LOGGED:
+            self._unresolved_logged_count += 1
+            logger.info(
+                "Unresolved PowerBI source reference: data model=[%s] fqn_search_string=[%s]",
+                datamodel_entity.displayName or model_str(datamodel_entity.name),
+                fqn_search_string,
+            )
 
     def get_org_workspace_data(self) -> Iterable[Optional[Group]]:  # noqa: UP045
         """
@@ -160,9 +484,20 @@ class PowerbiSource(DashboardServiceSource):
                 f"Paginating workspace fetch with {len(paginated_filter_patterns)}"
                 f" batches to accommodate OData filter node limit"
             )
+
+        # Fetch every batch's workspace list up front (`fetch_all_workspaces`
+        # already returns a materialized list per batch) so a dataset->dataflow
+        # link's `workspaceObjectId` can be judged against the complete set of
+        # workspaces this run will process, not just the ones seen so far in
+        # this generator's stream.
+        workspace_batches = [
+            self.client.api_client.fetch_all_workspaces(pattern) or [] for pattern in paginated_filter_patterns
+        ]
+        known_workspace_ids = {workspace.id for batch in workspace_batches for workspace in batch}
+        outside_scope_link_counts: Counter = Counter()
+
         workspace_total = 0
-        for filter_pattern in paginated_filter_patterns:
-            workspaces = self.client.api_client.fetch_all_workspaces(filter_pattern)
+        for workspaces in workspace_batches:
             if workspaces:
                 workspace_total += len(workspaces)
                 self.progress_tracking.manual.set_total("Workspaces", workspace_total)
@@ -191,9 +526,74 @@ class PowerbiSource(DashboardServiceSource):
                             self.client.api_client.fetch_dataset_tables(group_id=workspace.id, dataset_id=dataset.id)
                             or []
                         )
+                        # add this dataset's ACL, for non-admin owner resolution
+                        # (see `_compute_datamodel_owner_refs`) - this endpoint
+                        # may list principals who aren't workspace members.
+                        dataset.dataset_principals = [
+                            principal
+                            for principal in (
+                                PowerBIPrincipal.from_dataset_user(user)
+                                for user in self.client.api_client.fetch_dataset_users(
+                                    group_id=workspace.id, dataset_id=dataset.id
+                                )
+                                or []
+                            )
+                            if principal
+                        ]
+
+                    # add this workspace's membership, for non-admin owner
+                    # resolution (see `_compute_dataflow_owner_refs` and
+                    # `_compute_datamodel_owner_refs`) - non-admin entities
+                    # never carry `users` inline the way the admin scan does.
+                    workspace.workspace_principals = [
+                        principal
+                        for principal in (
+                            PowerBIPrincipal.from_workspace_user(user)
+                            for user in self.client.api_client.fetch_group_users(group_id=workspace.id) or []
+                        )
+                        if principal
+                    ]
+
+                    # add the dataflows to the workspace, and each dataflow's own
+                    # upstream dataflows (non-admin has no bulk equivalent of the
+                    # admin scan's inline upstreamDataflows, so this is per-dataflow)
+                    workspace.dataflows.extend(
+                        self.client.api_client.fetch_all_org_dataflows(group_id=workspace.id) or []
+                    )
+                    for dataflow in workspace.dataflows:
+                        dataflow.upstreamDataflows.extend(
+                            self.client.api_client.fetch_dataflow_upstream(
+                                group_id=workspace.id, dataflow_id=dataflow.id
+                            )
+                            or []
+                        )
+
+                    # non-admin datasets never carry upstreamDataflows inline (unlike
+                    # the admin scan); the link only exists via this workspace-wide call
+                    dataset_by_id = {dataset.id: dataset for dataset in workspace.datasets}
+                    for link in self.client.api_client.fetch_dataset_to_dataflow_links(group_id=workspace.id) or []:
+                        dataset = dataset_by_id.get(link.datasetObjectId)
+                        if dataset is None or not link.dataflowObjectId:
+                            continue
+                        if link.workspaceObjectId and link.workspaceObjectId not in known_workspace_ids:
+                            # The target dataflow's workspace isn't ingested this
+                            # run, so it can never resolve - don't even try.
+                            outside_scope_link_counts[link.workspaceObjectId] += 1
+                            continue
+                        dataset.upstreamDataflows.append(UpstreaDataflow(targetDataflowId=link.dataflowObjectId))
+
                     yield workspace
             else:
                 logger.error("Unable to fetch any PowerBI workspaces")
+
+        for foreign_workspace_id, count in outside_scope_link_counts.items():
+            self._metrics[self.METRIC_UPSTREAM_LINKS_OUTSIDE_SCOPE] += count
+            logger.info(
+                "PowerBI dataset-to-dataflow links reference workspace [%s], which is outside "
+                "this run's scope (%d link(s)); not resolved.",
+                foreign_workspace_id,
+                count,
+            )
 
     def _paginate_project_filter_pattern(self, filter_pattern):
         """
@@ -524,6 +924,26 @@ class PowerbiSource(DashboardServiceSource):
                     )
                 else:
                     description = Markdown(dashboard_details.description) if dashboard_details.description else None
+                    # Report-visual charts only exist when the feature is on (see
+                    # `yield_dashboard_chart`); with it off, `charts` stays unset here
+                    # exactly as before the feature existed, not an explicit `[]`
+                    # (which would serialize differently).
+                    report_charts_kwarg: dict = {}
+                    if self.report_column_usage_enabled:
+                        report_chart_ids = self.state.pop_dashboard_chart_ids(dashboard_details.id)
+                        if report_chart_ids:
+                            report_charts_kwarg["charts"] = [
+                                FullyQualifiedEntityName(chart_fqn)
+                                for chart in report_chart_ids
+                                if (
+                                    chart_fqn := fqn.build(
+                                        self.metadata,
+                                        entity_type=Chart,
+                                        service_name=self.context.get().dashboard_service,  # pyright: ignore[reportAttributeAccessIssue]
+                                        chart_name=chart,
+                                    )
+                                )
+                            ]
                     dashboard_request = CreateDashboardRequest(
                         name=EntityName(dashboard_details.id),
                         dashboardType=DashboardType.Report,
@@ -538,6 +958,7 @@ class PowerbiSource(DashboardServiceSource):
                         description=description,
                         service=self.context.get().dashboard_service,  # pyright: ignore[reportAttributeAccessIssue]
                         owners=self.get_owner_ref(dashboard_details=dashboard_details),
+                        **report_charts_kwarg,
                     )
                 yield Either(right=dashboard_request)
                 self.register_record(dashboard_request=dashboard_request)
@@ -594,6 +1015,186 @@ class PowerbiSource(DashboardServiceSource):
                                 stackTrace=traceback.format_exc(),
                             )
                         )
+            elif isinstance(dashboard_details, PowerBIReport) and self.report_column_usage_enabled:
+                yield from self._yield_report_visual_charts(dashboard_details)
+
+    @staticmethod
+    def _visual_chart_name(report_id: str, visual_id: str) -> str:
+        """Stable, service-unique Chart entity name for one report visual."""
+        return f"{report_id}_{visual_id}"
+
+    def _get_report_visual_url(self, workspace_id: str, report_id: str, page_id: Optional[str]) -> str:  # noqa: UP045
+        """Deep link to the report page a visual lives on - same URL shape as `_get_report_url`."""
+        page_suffix = f"/{page_id}" if page_id else ""
+        return (
+            f"{clean_uri(self.service_connection.hostPort)}/groups/"
+            f"{workspace_id}/{DEFAULT_REPORTS_PREFIX}/{report_id}{page_suffix}?experience=power-bi"
+        )
+
+    def _get_report_last_updated(self, workspace_id: str) -> Mapping[str, Optional[str]]:  # noqa: UP045
+        """`{report id: lastUpdatedTimeUtc}` for the current workspace - one Fabric
+        listing call per workspace per run (`WorkspaceState.report_last_updated` is a
+        write-once memo), not one per report. `{}` - not `None` - once resolved,
+        whether the listing succeeded empty or failed outright, so a lookup miss
+        never re-triggers the listing call for the rest of this workspace.
+        """
+        cached = self.state.report_last_updated
+        if cached is not None:
+            return cached
+        mapping: dict = {}
+        if self.fabric_client:
+            fetched = self.fabric_client.list_reports_last_updated(workspace_id)
+            if fetched is None:
+                self._metrics[self.METRIC_REPORT_LAST_UPDATED_LISTING_FAILED] += 1
+            else:
+                mapping = dict(fetched)
+        self.state.set_report_last_updated(mapping)
+        return mapping
+
+    def _get_report_definition(
+        self, dashboard_details: PowerBIReport, workspace_id: str
+    ) -> Optional[ReportDefinitionLike]:  # noqa: UP045
+        """Fetch (Fabric, cached by lastUpdatedTimeUtc within this run) and parse a
+        report's definition. Returns `None` - logging and metering why - on any
+        failure: no Fabric client (feature off), the fetch itself failing, or the
+        `report_definition` parser module not being available yet.
+        """
+        cached = self.state.get_report_definition(dashboard_details.id)
+        if cached is not None:
+            return cached  # pyright: ignore[reportReturnType]
+        if not self.fabric_client:
+            return None
+        last_updated = self._get_report_last_updated(workspace_id).get(dashboard_details.id)
+        result = self.fabric_client.get_report_definition(workspace_id, dashboard_details.id, last_updated)
+        if result is None:
+            self._metrics[self.METRIC_REPORT_DEFINITIONS_FAILED] += 1
+            return None
+        if result.from_cache:
+            self._metrics[self.METRIC_REPORT_DEFINITIONS_CACHE_SKIPPED] += 1
+        else:
+            self._metrics[self.METRIC_REPORT_DEFINITIONS_FETCHED] += 1
+        report_definition = self._parse_report_definition(result.parts)
+        if report_definition is not None:
+            self.state.cache_report_definition(dashboard_details.id, report_definition)
+        return report_definition
+
+    def _parse_report_definition(self, parts: Mapping[str, bytes]) -> Optional[Any]:  # noqa: UP045
+        """Deferred import of `report_definition.parse_report_definition` (a sibling
+        module built in parallel with this one - see the `*Like` Protocols above).
+        Importing lazily, inside the call, means this connector still imports cleanly
+        before that module lands; once it does, this starts working with no other
+        change here.
+        """
+        try:
+            from metadata.ingestion.source.dashboard.powerbi.report_definition import (
+                parse_report_definition,
+            )
+        except ImportError:
+            logger.debug("report_definition.parse_report_definition is not available yet")
+            return None
+        try:
+            report_definition = parse_report_definition(parts)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"Error parsing report definition: {exc}")
+            logger.debug(traceback.format_exc())
+            return None
+        report_format = getattr(report_definition, "format", None)
+        if report_format == "legacy":
+            self._metrics[self.METRIC_REPORTS_FORMAT_LEGACY] += 1
+        elif report_format == "pbir":
+            self._metrics[self.METRIC_REPORTS_FORMAT_PBIR] += 1
+        else:
+            self._metrics[self.METRIC_REPORTS_FORMAT_UNKNOWN] += 1
+        return report_definition
+
+    def _yield_report_visual_charts(self, dashboard_details: PowerBIReport) -> Iterable[Either[CreateChartRequest]]:
+        """One Chart per *distinct* data visual in `dashboard_details`'s report
+        definition - a visual id can repeat within one report (small-multiples
+        containers), so this dedupes on `visual_id`, keeping the first occurrence.
+
+        Non-data visuals (`is_data_visual=False`) get no Chart, only a metric.
+
+        `yield_dashboard_chart` is a topology `NodeStage` on the "dashboard" node,
+        whose producer yields once per report in the workspace - and its own body
+        then loops every report in the workspace again on each of those calls. Without
+        this guard a report's charts (and the visuals/charts-created metrics, and
+        `state._dashboard_charts`, which would gain duplicate chart ids feeding
+        duplicate FQNs into the report's `charts=` list) would be reprocessed and
+        recounted once per *other* report too.
+        """
+        if self.state.has_processed_report_charts(dashboard_details.id):
+            return
+        workspace_id = self.context.get().workspace.id  # pyright: ignore[reportAttributeAccessIssue]
+        report_definition = self._get_report_definition(dashboard_details, workspace_id)
+        if report_definition is None:
+            return
+        self.state.mark_report_charts_processed(dashboard_details.id)
+        # A visual id can repeat within one report (small-multiples containers) -
+        # `{report_id}_{visual_id}` would then collide, so dedupe on visual_id,
+        # keep the first occurrence, and only log a later one when it actually
+        # differs (title or visual_type) from what was kept.
+        seen_visual_ids: dict = {}
+        logged_duplicate_visual_ids: set = set()
+        for visual in report_definition.visuals or []:
+            try:
+                visual_id = visual.visual_id
+                if visual_id in seen_visual_ids:
+                    kept_title, kept_type = seen_visual_ids[visual_id]
+                    if (visual.title, visual.visual_type) != (
+                        kept_title,
+                        kept_type,
+                    ) and visual_id not in logged_duplicate_visual_ids:
+                        logged_duplicate_visual_ids.add(visual_id)
+                        logger.debug(
+                            "Duplicate visual id [%s] in report [%s] differs from the kept one "
+                            "(kept title=%r type=%r, duplicate title=%r type=%r) - keeping the first",
+                            visual_id,
+                            dashboard_details.id,
+                            kept_title,
+                            kept_type,
+                            visual.title,
+                            visual.visual_type,
+                        )
+                    continue
+                seen_visual_ids[visual_id] = (visual.title, visual.visual_type)
+                if not visual.is_data_visual:
+                    self._metrics[self.METRIC_VISUALS_NON_DATA] += 1
+                    continue
+                self._metrics[self.METRIC_VISUALS_DATA] += 1
+                chart_name = self._visual_chart_name(dashboard_details.id, visual.visual_id)
+                display_name = visual.title or f"{visual.page_display_name or visual.page_id} / {visual.visual_type}"
+                if filter_by_chart(self.source_config.chartFilterPattern, display_name):
+                    self.status.filter(display_name, "Chart Pattern not Allowed")
+                    continue
+                chart_type = ChartType(POWERBI_VISUAL_TYPE_TO_CHART_TYPE.get(visual.visual_type, ChartType.Other.value))
+                chart_request = CreateChartRequest(
+                    name=EntityName(chart_name),
+                    displayName=display_name,
+                    chartType=chart_type,
+                    sourceUrl=SourceUrl(
+                        self._get_report_visual_url(
+                            workspace_id=workspace_id,
+                            report_id=dashboard_details.id,
+                            page_id=visual.page_id,
+                        )
+                    ),
+                    service=FullyQualifiedEntityName(self.context.get().dashboard_service),  # pyright: ignore[reportAttributeAccessIssue]
+                )
+                yield Either(right=chart_request)  # pyright: ignore[reportCallIssue]
+                self.state.add_dashboard_chart(dashboard_details.id, chart_name)
+                self.register_record_chart(chart_request=chart_request)
+                self._metrics[self.METRIC_REPORT_VISUAL_CHARTS_CREATED] += 1
+                self._advance_group_progress(self._progress_group_name(), "Chart")
+            except Exception as exc:  # pylint: disable=broad-except
+                self._metrics[self.METRIC_VISUALS_SKIPPED] += 1
+                yield Either(  # pyright: ignore[reportCallIssue]
+                    left=StackTraceError(
+                        name=getattr(visual, "visual_id", "visual"),
+                        error=f"Error creating chart for visual [{getattr(visual, 'visual_id', '?')}] "
+                        f"on report [{dashboard_details.id}]: {exc}",
+                        stackTrace=traceback.format_exc(),
+                    )
+                )
 
     def _get_child_measures(self, table: PowerBiTable) -> List[Column]:  # noqa: UP006
         """
@@ -768,6 +1369,150 @@ class PowerbiSource(DashboardServiceSource):
         self.state.set_filtered_datamodels(filtered)
         return filtered
 
+    def _get_semantic_model_last_updated(self, workspace_id: str) -> Mapping[str, Optional[str]]:  # noqa: UP045
+        """`{model id: lastUpdatedTimeUtc}` for the current workspace - see `_get_report_last_updated`."""
+        cached = self.state.semantic_model_last_updated
+        if cached is not None:
+            return cached
+        mapping: dict = {}
+        if self.fabric_client:
+            fetched = self.fabric_client.list_semantic_models_last_updated(workspace_id)
+            if fetched is None:
+                self._metrics[self.METRIC_MODEL_LAST_UPDATED_LISTING_FAILED] += 1
+            else:
+                mapping = dict(fetched)
+        self.state.set_semantic_model_last_updated(mapping)
+        return mapping
+
+    def _get_semantic_model_definition(self, dataset: Dataset, workspace_id: str) -> Optional[object]:  # noqa: UP045
+        """Fetch (Fabric TMDL, cached by lastUpdatedTimeUtc within this run) and parse
+        a semantic model's definition. `None` on any failure - no Fabric client, the
+        fetch failing, or the `tmdl` parser module not being available yet.
+        """
+        cached = self.state.get_semantic_model_definition(dataset.id)
+        if cached is not None:
+            return cached
+        if not self.fabric_client:
+            return None
+        last_updated = self._get_semantic_model_last_updated(workspace_id).get(dataset.id)
+        result = self.fabric_client.get_semantic_model_definition(workspace_id, dataset.id, last_updated)
+        if result is None:
+            self._metrics[self.METRIC_MODEL_DEFINITIONS_FAILED] += 1
+            return None
+        if result.from_cache:
+            self._metrics[self.METRIC_MODEL_DEFINITIONS_CACHE_SKIPPED] += 1
+        else:
+            self._metrics[self.METRIC_MODEL_DEFINITIONS_FETCHED] += 1
+        model_definition = self._parse_semantic_model_definition(result.parts)
+        if model_definition is not None:
+            self.state.cache_semantic_model_definition(dataset.id, model_definition)
+        return model_definition
+
+    def _parse_semantic_model_definition(self, parts: Mapping[str, bytes]) -> Optional[object]:  # noqa: UP045
+        """Deferred import of `tmdl.parse_tmdl` - see `_parse_report_definition` for why."""
+        try:
+            from metadata.ingestion.source.dashboard.powerbi.tmdl import parse_tmdl
+        except ImportError:
+            logger.debug("tmdl.parse_tmdl is not available yet")
+            return None
+        try:
+            return parse_tmdl(parts)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"Error parsing semantic model TMDL definition: {exc}")
+            logger.debug(traceback.format_exc())
+            return None
+
+    def _tmdl_table_to_powerbi_table(self, table: object) -> Optional[PowerBiTable]:  # noqa: UP045
+        """Adapt one TMDL table (from `tmdl.parse_tmdl`) into the same `PowerBiTable`
+        shape the non-admin push-dataset tables call used to produce, so
+        `_get_column_info`/`_get_child_columns`/`_get_child_measures` run unchanged
+        against TMDL-sourced tables. Auto-date tables are the caller's job to skip.
+        """
+        name = getattr(table, "name", None)
+        if not name:
+            return None
+        try:
+            columns = [
+                PowerBiColumns(
+                    name=getattr(column, "name", None),
+                    dataType=getattr(column, "data_type", None),
+                    description=getattr(column, "description", None),
+                )
+                for column in getattr(table, "columns", None) or []
+                if getattr(column, "name", None)
+            ]
+            measures = [
+                PowerBiMeasures(
+                    name=getattr(measure, "name", None),
+                    expression=getattr(measure, "expression", None),
+                    description=getattr(measure, "description", None),
+                    isHidden=getattr(measure, "is_hidden", False),
+                )
+                for measure in getattr(table, "measures", None) or []
+                if getattr(measure, "name", None)
+            ]
+            # Set directly rather than via `partitions=` - `PowerBiTable`'s
+            # `extract_source_from_partitions` validator expects `partitions` as raw
+            # dicts (it's a `mode="before"` validator meant for the push-dataset
+            # tables API's own JSON body) and does `partitions[0].get("source")`,
+            # which raises on an already-built `PowerBIPartition` object. Setting
+            # `source` ourselves is simpler and skips that branch entirely (the
+            # validator only derives `source` from `partitions` when `source` is
+            # absent). Keeps the existing M-based lineage parsing
+            # (`_parse_table_info_from_source_exp` et al.) working unchanged against
+            # TMDL-sourced tables, same as for the push-dataset-tables response.
+            source_expression = next(
+                (
+                    partition_source
+                    for partition in getattr(table, "partitions", None) or []
+                    if (partition_source := getattr(partition, "source", None))
+                ),
+                None,
+            )
+            return PowerBiTable(
+                name=name,
+                columns=columns,
+                measures=measures,
+                description=getattr(table, "description", None),
+                source=[PowerBITableSource(expression=source_expression)] if source_expression else None,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"Error adapting TMDL table [{name}] to PowerBiTable: {exc}")
+            logger.debug(traceback.format_exc())
+            return None
+
+    def _replace_dataset_tables_with_tmdl(self, dataset: Dataset) -> None:
+        """Populate `dataset.tables` from the semantic model's TMDL definition,
+        in place, skipping auto-date tables. A no-op (dataset keeps whatever
+        `tables` it already had) if the definition can't be fetched or parsed.
+
+        `yield_datamodel` is a topology `NodeStage` on the "dashboard" node, called
+        once per report in the workspace, and its own body loops every dataset in
+        the workspace on each call - so without this guard a dataset's TMDL tables
+        would be rebuilt, and METRIC_MODEL_COLUMNS_INGESTED/METRIC_AUTO_DATE_TABLES_SKIPPED
+        recounted, once per *other* report too. Safe to skip entirely once done:
+        `dataset` is the same cached object every call (`_filtered_datamodels`'s
+        memo), so `dataset.tables` set here on the first pass is still there.
+        """
+        if self.state.has_processed_dataset_tmdl(dataset.id):
+            return
+        workspace_id = self.context.get().workspace.id  # pyright: ignore[reportAttributeAccessIssue]
+        model_definition = self._get_semantic_model_definition(dataset, workspace_id)
+        if model_definition is None:
+            return
+        self.state.mark_dataset_tmdl_processed(dataset.id)
+        tables: List[PowerBiTable] = []  # noqa: UP006
+        for table in getattr(model_definition, "tables", None) or []:
+            if getattr(table, "is_auto_date", False):
+                self._metrics[self.METRIC_AUTO_DATE_TABLES_SKIPPED] += 1
+                continue
+            powerbi_table = self._tmdl_table_to_powerbi_table(table)
+            if powerbi_table is not None:
+                tables.append(powerbi_table)
+                self._metrics[self.METRIC_MODEL_COLUMNS_INGESTED] += len(powerbi_table.columns or [])
+        if tables:
+            dataset.tables = tables
+
     def yield_datamodel(self, dashboard_details: Group) -> Iterable[Either[CreateDashboardDataModelRequest]]:
         """
         Get All the Powerbi Datasets
@@ -789,6 +1534,11 @@ class PowerbiSource(DashboardServiceSource):
             try:
                 if isinstance(dataset, Dataset):
                     data_model_type = DataModelType.PowerBIDataModel.value
+                    if self.report_column_usage_enabled:
+                        # Replaces `dataset.tables` with TMDL-derived tables before
+                        # `_get_column_info` reads them - the non-admin push-dataset
+                        # tables call this otherwise relies on always returns none.
+                        self._replace_dataset_tables_with_tmdl(dataset)
                     datamodel_columns = self._get_column_info(dataset)
                     source_url = self._get_dataset_url(
                         workspace_id=self.context.get().workspace.id,  # pyright: ignore[reportAttributeAccessIssue]
@@ -802,10 +1552,14 @@ class PowerbiSource(DashboardServiceSource):
                         dataflow_id=dataset.id,
                     )
                     # dataflow export api for detailed metadata
-                    # api: https://api.powerbi.com/v1.0/myorg/admin/dataflows/DATAFLOW_ID/export
-                    # doc: https://learn.microsoft.com/en-us/rest/api/power-bi/admin/dataflows-export-dataflow-as-admin
-                    dataflow_export = self.client.api_client.fetch_dataflow_export(dataflow_id=dataset.id)
+                    # admin api: https://api.powerbi.com/v1.0/myorg/admin/dataflows/DATAFLOW_ID/export
+                    # non-admin api: https://api.powerbi.com/v1.0/myorg/groups/GROUP_ID/dataflows/DATAFLOW_ID
+                    dataflow_export = self.client.api_client.fetch_dataflow_export(
+                        dataflow_id=dataset.id,
+                        group_id=self.context.get().workspace.id,  # pyright: ignore[reportAttributeAccessIssue]
+                    )
                     if dataflow_export:
+                        self._metrics[self.METRIC_DATAFLOWS_FETCHED] += 1
                         self.state.cache_dataflow_export(dataset.id, dataflow_export)
                         datamodel_columns = self._get_dataflow_column_info(dataflow_export)
                 elif isinstance(dataset, Datamart):
@@ -915,13 +1669,28 @@ class PowerbiSource(DashboardServiceSource):
             logger.debug(f"Extracted dataset IDs from report datasources API call for report_id={report_id}")
         return dataset_ids
 
+    def _resolve_report_dataset_ids(self, dashboard_details: PowerBIReport) -> List[str]:  # noqa: UP006
+        """Dataset ids `dashboard_details` links to: its own `datasetId` field, or -
+        when that's absent - whatever `_get_dataset_ids_from_report_datasources`
+        extracts from its datasources. Shared by `create_datamodel_report_lineage`
+        and the column-usage pass so both agree on which model(s) a report uses.
+        """
+        if dashboard_details.datasetId:
+            return [dashboard_details.datasetId]
+        return self._get_dataset_ids_from_report_datasources(report_id=dashboard_details.id)
+
     def create_datamodel_report_lineage(
         self,
         db_service_prefix: Optional[str],  # noqa: UP045
         dashboard_details: PowerBIReport,
-    ) -> Iterable[Either[CreateDashboardRequest]]:
+    ) -> Iterable[Either[AddLineageRequest]]:
         """
         create the lineage between datamodel and report
+
+        Pre-existing signature said `Either[CreateDashboardRequest]`, which this
+        method never actually yields (it's lineage, not a dashboard request) - fixed
+        while wiring column lineage through it, which is what made the mismatch
+        start failing basedpyright.
         """
         try:
             logger.debug(f"Processing to create datamodel and report lineage for report: {dashboard_details.id}")
@@ -940,15 +1709,7 @@ class PowerbiSource(DashboardServiceSource):
                     f"Report entity not found to create lineage between datamodel and report for report: {dashboard_details.id}"
                 )
                 return
-            dataset_ids = []
-            if dashboard_details.datasetId:
-                logger.debug(f"Report linked datasetId is present in api response for report: {dashboard_details.id}")
-                dataset_ids = [dashboard_details.datasetId]
-            else:
-                logger.debug(
-                    f"Processing to get report datasources from API to extract datasetIds for report: {dashboard_details.id} as datasetId is not present in api response"
-                )
-                dataset_ids = self._get_dataset_ids_from_report_datasources(report_id=dashboard_details.id)
+            dataset_ids = self._resolve_report_dataset_ids(dashboard_details)
 
             if dataset_ids:
                 for dataset_id in dataset_ids:
@@ -967,13 +1728,56 @@ class PowerbiSource(DashboardServiceSource):
                             f"Data model entity not found for dataset_id={str(dataset_id)} while creating lineage with report={str(dashboard_details.id)}"  # noqa: RUF010
                         )
                     if datamodel_entity and report_entity:
+                        edge_already_written = (
+                            self.report_column_usage_enabled
+                            and self.state.has_emitted_column_lineage_edge(
+                                str(datamodel_entity.id.root), str(report_entity.id.root)
+                            )
+                        )
+                        if edge_already_written:
+                            # This exact (datamodel, report) edge was already
+                            # written once, in full, earlier in this workspace -
+                            # `yield_dashboard_lineage_details` re-processes every
+                            # report x db-service-prefix pair, so without this the
+                            # same edge gets rewritten repeatedly. A later
+                            # columnless rewrite of the same edge would silently
+                            # erase the columnsLineage the first write set, since
+                            # `addLineage` replaces an edge's lineageDetails wholesale
+                            # rather than merging - so once written, skip entirely.
+                            logger.debug(
+                                f"Skipping repeat datamodel-report lineage write for datamodel={dataset_id} report={dashboard_details.id} (already written this workspace)"
+                            )
+                            continue
                         logger.debug(
                             f"Creating lineage between datamodel={str(dataset_id)} and report={str(dashboard_details.id)}"  # noqa: RUF010
                         )
-                        yield self._get_add_lineage_request(
+                        column_lineage = None
+                        if self.report_column_usage_enabled:
+                            usage = self.state.get_column_usage(dataset_id)
+                            if usage is not None:
+                                column_lineage = self._create_datamodel_report_column_lineage(
+                                    datamodel_entity=datamodel_entity,
+                                    report_id=dashboard_details.id,
+                                    usage=usage,  # pyright: ignore[reportArgumentType]
+                                )
+                        lineage_request = self._get_add_lineage_request(
                             to_entity=report_entity,
                             from_entity=datamodel_entity,
+                            column_lineage=column_lineage,  # pyright: ignore[reportArgumentType]
                         )
+                        if self.report_column_usage_enabled:
+                            self.state.mark_column_lineage_edge_emitted(
+                                str(datamodel_entity.id.root), str(report_entity.id.root)
+                            )
+                            if column_lineage:
+                                self._track_column_lineage_edge(
+                                    from_entity=datamodel_entity,
+                                    to_entity=report_entity,
+                                    edge_kind=self.EDGE_KIND_MODEL_REPORT,
+                                    emitted_count=len(column_lineage),
+                                )
+                        if lineage_request is not None:
+                            yield lineage_request
             else:
                 logger.debug(
                     f"Skipping datamodel and report lineage for report: {dashboard_details.id} as datasetId is not found on api response and also could not be extracted from report datasources API call"
@@ -987,6 +1791,161 @@ class PowerbiSource(DashboardServiceSource):
                     stackTrace=traceback.format_exc(),
                 )
             )
+
+    def _create_datamodel_report_column_lineage(
+        self,
+        datamodel_entity: DashboardDataModel,
+        report_id: str,
+        usage: ModelColumnUsageLike,
+    ) -> List[ColumnLineage]:  # noqa: UP006
+        """Model column -> chart lineage for one report, from `usage.per_visual`.
+
+        A column reached through two different measures produces two `ColumnLineage`
+        entries (not merged into one) - `LineageRepository.validateLineageDetails`
+        filters `columnsLineage` per-entry and never dedupes/merges entries that share
+        a `toColumn`, so repeated `toColumn`s round-trip intact (see
+        `openmetadata-service/.../jdbi3/LineageRepository.java:718-751`). Each entry's
+        `function` is `measure:<name>` for a column reached via a measure, unset for a
+        direct column reference - `via_measure` on `ColumnUse` already carries exactly
+        the name to use (the first, visual-facing measure on the path).
+
+        Does NOT increment METRIC_COLUMN_REFS_RESOLVED or
+        METRIC_MEASURES_RESOLVED_TRANSITIVELY - both must be distinct-per-report/
+        distinct-per-model counts, not per-lineage-entry ones, so `_ensure_column_usage_computed`
+        derives them straight from `usage` instead (see its docstring).
+        """
+        column_lineage: List[ColumnLineage] = []  # noqa: UP006
+        service_name = self.context.get().dashboard_service  # pyright: ignore[reportAttributeAccessIssue]
+        # A (table, column) the parser resolved to a real TMDL column but that isn't
+        # on the ingested `datamodel_entity` - logged once per report, not once per
+        # visual it happens to appear in.
+        seen_missing_source_column: set = set()
+        for (visual_report_id, visual_id), column_uses in (usage.per_visual or {}).items():
+            if visual_report_id != report_id:
+                continue
+            chart_name = self._visual_chart_name(report_id, visual_id)
+            chart_fqn = fqn.build(
+                self.metadata,
+                entity_type=Chart,
+                service_name=service_name,
+                chart_name=chart_name,
+            )
+            if not chart_fqn:
+                continue
+            chart_entity = self.metadata.get_by_name(entity=Chart, fqn=chart_fqn)
+            if not chart_entity:
+                continue
+            to_column = chart_entity.fullyQualifiedName.root
+            # The raw report JSON can repeat the same field ref inside one visual
+            # (e.g. a slicer's `cachedFilterDisplayItems` re-references the same
+            # column the slicer itself projects) - dedupe on (table, column,
+            # via_measure) per visual before building entries, reset per visual
+            # since the same physical column legitimately appears once per visual
+            # it's actually used in.
+            seen_in_visual: set = set()
+            for use in column_uses or []:
+                via_measure = getattr(use, "via_measure", None)
+                dedupe_key = (use.table, use.column, via_measure)
+                if dedupe_key in seen_in_visual:
+                    continue
+                seen_in_visual.add(dedupe_key)
+                from_column_fqn = self._get_downstream_data_model_column_fqn(
+                    data_model_entity=datamodel_entity,
+                    table_name=use.table,
+                    column=use.column,
+                )
+                if not from_column_fqn:
+                    missing_key = (use.table, use.column)
+                    if missing_key not in seen_missing_source_column:
+                        seen_missing_source_column.add(missing_key)
+                        self._metrics[self.METRIC_COLUMN_LINEAGE_SOURCE_COLUMN_MISSING] += 1
+                        logger.info(
+                            "Model column referenced by report [%s] has no matching column on model [%s]: "
+                            "table=%s column=%s",
+                            report_id,
+                            datamodel_entity.name.root,
+                            use.table,
+                            use.column,
+                        )
+                    continue
+                entry_kwargs: dict = {"fromColumns": [from_column_fqn], "toColumn": to_column}
+                if via_measure:
+                    entry_kwargs["function"] = f"measure:{via_measure}"
+                column_lineage.append(ColumnLineage(**entry_kwargs))
+                self._metrics[self.METRIC_COLUMN_LINEAGE_EMITTED] += 1
+        return column_lineage
+
+    def _track_column_lineage_edge(
+        self,
+        from_entity: Union[DashboardDataModel, Dashboard],  # noqa: UP007
+        to_entity: Union[DashboardDataModel, Dashboard],  # noqa: UP007
+        edge_kind: str,
+        emitted_count: int,
+    ) -> None:
+        """Remember one column-lineage edge so `_verify_column_lineage_edges` can read
+        it back, once this workspace's lineage writes have flushed, and compare what
+        the server actually stored against what was emitted. Called at most once per
+        distinct (from, to) edge per workspace (see `has_emitted_column_lineage_edge`),
+        so "edges written" here is always a distinct-edge count, never an emission count.
+        """
+        self._pending_column_lineage_edges.append(
+            (str(from_entity.id.root), str(to_entity.id.root), edge_kind, emitted_count)
+        )
+        if edge_kind == self.EDGE_KIND_MODEL_REPORT:
+            self._metrics[self.METRIC_COLUMN_LINEAGE_EDGES_WRITTEN_MODEL_REPORT] += 1
+            self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_EMITTED_MODEL_REPORT] += emitted_count
+        elif edge_kind == self.EDGE_KIND_DATAFLOW_DATASET:
+            self._metrics[self.METRIC_COLUMN_LINEAGE_EDGES_WRITTEN_DATAFLOW_DATASET] += 1
+            self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_EMITTED_DATAFLOW_DATASET] += emitted_count
+
+    def _get_lineage_edge_bypass_cache(self, from_id: str, to_id: str) -> Optional[Any]:  # noqa: UP045
+        """Read one lineage edge straight from the API, bypassing
+        `OpenMetadata.get_lineage_edge`'s module-level `search_cache`
+        (`lineage_mixin.py`), which is never invalidated on write and can hand back
+        a pre-write value read right after this run's own `addLineage` call -
+        exactly the case read-back verification exists to catch.
+        """
+        path = f"{self.metadata.get_suffix(AddLineageRequest)}/getLineageEdge/{from_id}/{to_id}"
+        try:
+            return self.metadata.client.get(path)
+        except APIError as err:
+            if err.status_code != 404:
+                logger.warning(f"Error reading back column lineage edge {from_id}->{to_id}: {err}")
+                logger.debug(traceback.format_exc())
+            return None
+
+    def _verify_column_lineage_edges(self) -> None:
+        """Read back every tracked column-lineage edge - once each, since
+        `_track_column_lineage_edge` is only ever called once per distinct edge per
+        workspace - and compare its stored `columnsLineage` length against what was
+        emitted, counting the difference as server-side drops (a `fromColumn`/
+        `toColumn` `validateLineageDetails` filtered out - see
+        `_create_datamodel_report_column_lineage`'s docstring). Clears the pending
+        list either way, so a verification pass never double-counts.
+        """
+        pending = self._pending_column_lineage_edges
+        self._pending_column_lineage_edges = []
+        for from_id, to_id, edge_kind, emitted_count in pending:
+            try:
+                edge = self._get_lineage_edge_bypass_cache(from_id, to_id)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(f"Error reading back column lineage edge {from_id}->{to_id}: {exc}")
+                logger.debug(traceback.format_exc())
+                continue
+            stored_count = len((edge or {}).get("lineageDetails", {}).get("columnsLineage") or [])
+            verified = min(stored_count, emitted_count)
+            dropped = max(emitted_count - stored_count, 0)
+            self._metrics[self.METRIC_COLUMN_LINEAGE_VERIFIED] += verified
+            if dropped:
+                self._metrics[self.METRIC_COLUMN_LINEAGE_DROPPED_BY_SERVER] += dropped
+            if edge_kind == self.EDGE_KIND_MODEL_REPORT:
+                self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_VERIFIED_MODEL_REPORT] += verified
+                if dropped:
+                    self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_DROPPED_MODEL_REPORT] += dropped
+            elif edge_kind == self.EDGE_KIND_DATAFLOW_DATASET:
+                self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_VERIFIED_DATAFLOW_DATASET] += verified
+                if dropped:
+                    self._metrics[self.METRIC_COLUMN_LINEAGE_ENTRIES_DROPPED_DATAFLOW_DATASET] += dropped
 
     @staticmethod
     def _get_data_model_column_fqn(data_model_entity: DashboardDataModel, column: str) -> Optional[str]:  # noqa: UP045
@@ -1466,6 +2425,85 @@ class PowerbiSource(DashboardServiceSource):
             logger.debug(traceback.format_exc())
         return None
 
+    def resolve_source_database(self, table_info: dict) -> Optional[str]:  # noqa: UP045
+        """Database to resolve a parsed M source against.
+
+        Defaults to whatever the M parser found (``None`` for an Athena source
+        whose catalog level is the ``AwsDataCatalog`` placeholder). A subclass
+        may override this to map a data-source name (``table_info["dsn"]``,
+        set by ``_parse_athena_source``/``_extract_tables_from_sql``) onto a
+        database/catalog when the expression itself doesn't name one - e.g. to
+        tell apart two AWS accounts that are ingested as two OM databases
+        under one PowerBI service but only differ by DSN.
+        """
+        return table_info.get("database")
+
+    def _parse_athena_source(self, source_expression: str) -> Optional[List[dict]]:  # noqa: UP006, UP045
+        """
+        Parse Power Query M expressions sourced from the Athena PowerBI
+        connector (``AmazonAthena.Databases``) or a generic ODBC DSN pointed
+        at Athena (``Odbc.Query`` / ``Odbc.DataSource``).
+
+        The Athena connector's catalog navigation always has exactly three
+        levels - Database, Schema, Table (or View) - reached through
+        ``Source{[Name = "...", Kind = "..."]}[Data]`` records; step names
+        vary (``Navigation`` vs ``#"Navigation 3"``) so matching is done on
+        the record itself, never on step names. The ``Kind="Database"`` level
+        is Athena's default-catalog placeholder (``AwsDataCatalog``) unless a
+        real federated catalog is configured, so a placeholder value is
+        dropped rather than returned as an OM database - see
+        ``resolve_source_database`` for how a subclass can still use it (via
+        the returned ``dsn``) to pick an OM database.
+        """
+        try:
+            is_athena = ATHENA_DATABASES_EXPRESSION_KW in source_expression
+            is_odbc = (
+                ODBC_QUERY_EXPRESSION_KW in source_expression or ODBC_DATASOURCE_EXPRESSION_KW in source_expression
+            )
+            if not is_athena and not is_odbc:
+                return None
+            self._metrics[self.METRIC_ATHENA_ODBC_QUERIES_SEEN] += 1
+
+            if is_athena:
+                dsn_match = re.search(r'AmazonAthena\.Databases\(\s*"([^"]+)"', source_expression)
+            else:
+                dsn_match = re.search(r'Odbc\.(?:Query|DataSource)\(\s*"dsn=([^"]+?)"', source_expression)
+            dsn = dsn_match.group(1) if dsn_match else None
+
+            query_match = re.search(
+                r'Odbc\.Query\(\s*"dsn=[^"]+"\s*,\s*"((?:[^"]|"")*)"',
+                source_expression,
+                re.DOTALL,
+            )
+            if query_match:
+                sql_query = query_match.group(1)
+                return self._extract_tables_from_sql(sql_query, database=None, server=dsn, dialect=Dialect.ATHENA)
+
+            nav_matches = re.findall(
+                r'\{\[\s*Name\s*=\s*"([^"]+)"\s*,\s*Kind\s*=\s*"([^"]+)"\s*\]\}',
+                source_expression,
+            )
+            if not nav_matches:
+                return None
+            kind_to_name = {kind: name for name, kind in nav_matches}
+            table = kind_to_name.get("Table") or kind_to_name.get("View")
+            if not table:
+                return None
+            catalog = kind_to_name.get("Database")
+            database = None if catalog == ATHENA_DEFAULT_CATALOG else catalog
+            return [
+                {
+                    "database": database,
+                    "schema": kind_to_name.get("Schema"),
+                    "table": table,
+                    "dsn": dsn,
+                }
+            ]
+        except Exception as exc:
+            logger.debug(f"Error to parse Athena/ODBC table source: {exc}")
+            logger.debug(traceback.format_exc())
+        return None
+
     def _parse_table_info_from_source_exp(
         self, table: PowerBiTable, datamodel_entity: DashboardDataModel
     ) -> Optional[List[dict]]:  # noqa: UP006, UP045
@@ -1496,6 +2534,18 @@ class PowerbiSource(DashboardServiceSource):
             table_info_list = self._parse_databricks_source(source_expression, datamodel_entity)
             if isinstance(table_info_list, List):  # noqa: UP006
                 return table_info_list
+
+            # parse Athena / ODBC-to-Athena source
+            # `PowerBITableSource.expression`'s "before" validator already joins a
+            # list of M lines into one string before storage, but its declared type
+            # stays `str | List[str]`; normalize again so this narrows to `str`.
+            athena_source_expression = (
+                "\n".join(source_expression) if isinstance(source_expression, list) else source_expression
+            )
+            if isinstance(athena_source_expression, str):
+                table_info_list = self._parse_athena_source(athena_source_expression)
+                if isinstance(table_info_list, List):  # noqa: UP006
+                    return table_info_list
 
             # parse generic Sql.Database source
             # (inline query, native query, catalog access)
@@ -1545,7 +2595,7 @@ class PowerbiSource(DashboardServiceSource):
                 for table_info in table_info_list:
                     table_name = table_info.get("table") or table.name
                     schema_name = table_info.get("schema")
-                    database_name = table_info.get("database")
+                    database_name = self.resolve_source_database(table_info)
                     if prefix_table_name and table_name and prefix_table_name.lower() != table_name.lower():
                         logger.debug(f"Table {table_name} does not match prefix {prefix_table_name}")
                         return
@@ -1574,6 +2624,7 @@ class PowerbiSource(DashboardServiceSource):
                         entity_type=Table,
                         fqn_search_string=fqn_search_string,
                     )
+                    self._record_source_reference(datamodel_entity, fqn_search_string, resolved=bool(table_entity))
                     if table_entity and datamodel_entity:
                         logger.debug(
                             "Creating lineage between db table=%s and datamodel=%s",
@@ -1648,10 +2699,19 @@ class PowerbiSource(DashboardServiceSource):
         target: LineageTargetSpec,
         error_name: str,
         column_lineage_builder: Optional[Callable[..., Optional[List[ColumnLineage]]]] = None,  # noqa: UP006, UP045
+        column_lineage_edge_kind: Optional[str] = None,  # noqa: UP045
     ) -> Iterable[Either[AddLineageRequest]]:
         """Resolve target entities in OM and yield lineage from each into `to_entity`.
 
         Silent skip on falsy or missing target; failures surface as `Either.left`.
+
+        When `column_lineage_builder` is set and the feature is on, an edge already
+        written once (with its full `columnsLineage`) earlier in this workspace is
+        skipped entirely on every later encounter, never rewritten columnless -
+        `yield_dashboard_lineage_details` re-processes every report/datamodel x
+        db-service-prefix pair, and `addLineage` replaces an edge's whole
+        `lineageDetails` per call rather than merging, so a later columnless pass
+        over the same edge would erase what the first pass wrote.
         """
         service_name = self.context.get().dashboard_service  # pyright: ignore[reportAttributeAccessIssue]
         for target_id in target_ids:
@@ -1690,6 +2750,17 @@ class PowerbiSource(DashboardServiceSource):
                         to_entity.name.root,
                     )
                     continue
+                dedupe_column_edges = self.report_column_usage_enabled and column_lineage_builder is not None
+                if dedupe_column_edges and self.state.has_emitted_column_lineage_edge(
+                    str(target_entity.id.root), str(to_entity.id.root)
+                ):
+                    logger.debug(
+                        "Skipping repeat %s write for target=%s to=%s (already written this workspace)",
+                        error_name,
+                        target_entity.name.root,
+                        to_entity.name.root,
+                    )
+                    continue
                 column_lineage = column_lineage_builder(to_entity, target_entity) if column_lineage_builder else None
                 lineage_request = self._get_add_lineage_request(
                     from_entity=target_entity,
@@ -1704,6 +2775,15 @@ class PowerbiSource(DashboardServiceSource):
                         to_entity.name.root,
                     )
                     continue
+                if dedupe_column_edges:
+                    self.state.mark_column_lineage_edge_emitted(str(target_entity.id.root), str(to_entity.id.root))
+                    if column_lineage:
+                        self._track_column_lineage_edge(
+                            from_entity=target_entity,
+                            to_entity=to_entity,
+                            edge_kind=column_lineage_edge_kind or error_name,
+                            emitted_count=len(column_lineage),
+                        )
                 yield lineage_request
             except Exception as exc:  # pylint: disable=broad-except
                 yield Either(
@@ -1721,12 +2801,135 @@ class PowerbiSource(DashboardServiceSource):
         datamodel_entity: DashboardDataModel,
     ) -> Iterable[Either[AddLineageRequest]]:
         """Create lineage between dataset and upstreamDataflow."""
+        column_lineage_builder = None
+        if self.report_column_usage_enabled:
+            column_lineage_builder = partial(self._create_dataset_upstream_dataflow_column_lineage, datamodel)
         yield from self._emit_om_target_lineage(
             to_entity=datamodel_entity,
             target_ids=(u.targetDataflowId for u in datamodel.upstreamDataflows or []),
             target=DATAMODEL_TARGET,
             error_name="Dataset and UpstreamDataflow Lineage",
+            column_lineage_builder=column_lineage_builder,
+            column_lineage_edge_kind=self.EDGE_KIND_DATAFLOW_DATASET,
         )
+
+    def _parse_dataflow_source_ref(self, m_expression: str) -> Optional[Any]:  # noqa: UP045
+        """Deferred import of `dataflow_mapping.parse_partition_dataflow_source`."""
+        try:
+            from metadata.ingestion.source.dashboard.powerbi.dataflow_mapping import (
+                parse_partition_dataflow_source,
+            )
+        except ImportError:
+            logger.debug("dataflow_mapping.parse_partition_dataflow_source is not available yet")
+            return None
+        try:
+            return parse_partition_dataflow_source(m_expression)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug(f"Error parsing partition dataflow source: {exc}")
+            logger.debug(traceback.format_exc())
+            return None
+
+    def _map_columns_to_dataflow(
+        self,
+        columns: List[str],  # noqa: UP006
+        source_ref: Any,
+        entity_attribute_names: List[str],  # noqa: UP006
+    ) -> Optional[Any]:  # noqa: UP045
+        """Deferred import of `dataflow_mapping.map_columns_to_dataflow`."""
+        try:
+            from metadata.ingestion.source.dashboard.powerbi.dataflow_mapping import (
+                map_columns_to_dataflow,
+            )
+        except ImportError:
+            logger.debug("dataflow_mapping.map_columns_to_dataflow is not available yet")
+            return None
+        try:
+            return map_columns_to_dataflow(columns, source_ref, entity_attribute_names)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"Error mapping columns to dataflow: {exc}")
+            logger.debug(traceback.format_exc())
+            return None
+
+    def _create_dataset_upstream_dataflow_column_lineage(
+        self,
+        datamodel: Dataset,
+        to_entity: DashboardDataModel,
+        target_entity: DashboardDataModel,
+    ) -> List[ColumnLineage]:  # noqa: UP006
+        """Dataflow column -> model column lineage for every TMDL table whose
+        partition M expression navigates into `target_entity` (the upstream
+        dataflow), matched by dataflow id. `to_entity` is the dataset's own
+        `DashboardDataModel` (the `_emit_om_target_lineage` naming: the edge always
+        points *to* it); named that way here only to match the shared
+        `column_lineage_builder(to_entity, target_entity)` call signature.
+
+        Reads the cached `SemanticModelDefinition` (not the adapted
+        `dataset.tables`/`PowerBiTable`, which drops `sourceColumn`) because
+        `map_columns_to_dataflow` reverse-walks `Table.RenameColumns` M steps
+        against each column's *source* name - the query-level name before the model
+        renamed it to its display name - and that only survives on the TMDL
+        `TmdlColumn.source_column`, not on the OM `PowerBiColumns` shape.
+        """
+        datamodel_entity = to_entity
+        dataflow_entity = target_entity
+        dataflow_id = dataflow_entity.name.root
+        model_definition = self.state.get_semantic_model_definition(datamodel.id)
+        column_lineage: List[ColumnLineage] = []  # noqa: UP006
+        for table in getattr(model_definition, "tables", None) or []:
+            table_name = getattr(table, "name", None)
+            if not table_name:
+                continue
+            for partition in getattr(table, "partitions", None) or []:
+                source_expression = getattr(partition, "source", None)
+                if not source_expression:
+                    continue
+                source_ref = self._parse_dataflow_source_ref(source_expression)
+                if source_ref is None or source_ref.dataflow_id != dataflow_id:
+                    continue
+                entity_column = next(
+                    (c for c in dataflow_entity.columns if c.name.root.lower() == source_ref.entity.lower()),
+                    None,
+                )
+                if entity_column is None:
+                    continue
+                entity_attribute_names = [c.name.root for c in entity_column.children or []]
+                # source (query-level) name -> model (display) name.
+                source_to_model_column = {
+                    (getattr(column, "source_column", None) or column.name): column.name
+                    for column in getattr(table, "columns", None) or []
+                    if getattr(column, "name", None)
+                }
+                mapping = self._map_columns_to_dataflow(
+                    columns=list(source_to_model_column.keys()),
+                    source_ref=source_ref,
+                    entity_attribute_names=entity_attribute_names,
+                )
+                if mapping is None:
+                    continue
+                for source_column_name, attribute_name in (mapping.mapped or {}).items():
+                    model_column_name = source_to_model_column.get(source_column_name, source_column_name)
+                    attribute_column = next(
+                        (c for c in entity_column.children or [] if c.name.root.lower() == attribute_name.lower()),
+                        None,
+                    )
+                    to_column_fqn = self._get_downstream_data_model_column_fqn(
+                        data_model_entity=datamodel_entity,
+                        table_name=table_name,
+                        column=model_column_name,
+                    )
+                    attribute_column_fqn = attribute_column.fullyQualifiedName if attribute_column else None
+                    if attribute_column_fqn is None or not to_column_fqn:
+                        self._metrics[self.METRIC_DATAFLOW_MODEL_COLUMNS_UNMAPPED] += 1
+                        continue
+                    column_lineage.append(
+                        ColumnLineage(
+                            fromColumns=[attribute_column_fqn],
+                            toColumn=FullyQualifiedEntityName(to_column_fqn),
+                        )
+                    )
+                    self._metrics[self.METRIC_DATAFLOW_MODEL_COLUMNS_MAPPED] += 1
+                self._metrics[self.METRIC_DATAFLOW_MODEL_COLUMNS_UNMAPPED] += len(mapping.unmapped or [])
+        return column_lineage
 
     def _get_downstream_data_model_column_fqn(
         self, data_model_entity: DashboardDataModel, table_name: str, column: str
@@ -1831,12 +3034,30 @@ class PowerbiSource(DashboardServiceSource):
                 continue
             entity_name = name_match.group(1) or name_match.group(2)
 
+            # Detected independently of loadEnabled: "seen" means the block is
+            # Athena/ODBC-shaped, whether or not it ends up dispatched below.
+            is_athena_or_odbc_block = any(
+                kw in block
+                for kw in (ATHENA_DATABASES_EXPRESSION_KW, ODBC_QUERY_EXPRESSION_KW, ODBC_DATASOURCE_EXPRESSION_KW)
+            )
+            is_recognized_source_block = is_athena_or_odbc_block or SQL_DATABASE_EXPRESSION_KW in block
+
             # Only process entities that have loadEnabled=true in queriesMetadata
             query_meta = queries_metadata.get(entity_name, {})
             if isinstance(query_meta, dict) and not query_meta.get("loadEnabled", False):
+                if is_athena_or_odbc_block:
+                    self._metrics[self.METRIC_ATHENA_ODBC_QUERIES_SEEN] += 1
+                # Only queries recognized as Athena/ODBC/Sql.Database sourced
+                # would otherwise have reached the lineage parser below - a
+                # disabled SharePoint/Web helper query was never going to be
+                # parsed for lineage, so it doesn't belong in this counter.
+                if is_recognized_source_block:
+                    self._metrics[self.METRIC_QUERIES_SKIPPED_LOAD_DISABLED] += 1
                 continue
 
-            table_info_list = self._parse_sql_source(block)
+            table_info_list = self._parse_athena_source(block)
+            if not isinstance(table_info_list, List):  # noqa: UP006
+                table_info_list = self._parse_sql_source(block)
             if table_info_list:
                 sql_query = None
                 for table_info in table_info_list:
@@ -1930,12 +3151,16 @@ class PowerbiSource(DashboardServiceSource):
         sql_query: str,
         database: Optional[str],  # noqa: UP045
         server: Optional[str],  # noqa: UP045
+        dialect: Dialect = Dialect.TSQL,
     ) -> Optional[List[dict]]:  # noqa: UP006, UP045
         """
-        Extract table references from a T-SQL query found in a dataflow M expression
-        sourced from the Power Query Sql.Database / Value.NativeQuery connector
-        (SQL Server / Azure SQL). Uses LineageParser with the TSQL dialect so
-        bracket-quoted identifiers like [Column Name] parse correctly.
+        Extract table references from a SQL query found in a dataflow M expression.
+
+        Defaults to the TSQL dialect for the Power Query Sql.Database /
+        Value.NativeQuery connector (SQL Server / Azure SQL), whose queries use
+        bracket-quoted identifiers like [Column Name]. Callers sourcing Athena
+        SQL (``Odbc.Query`` DSNs) pass ``dialect=Dialect.ATHENA`` so
+        double-quoted identifiers like "schema"."table" parse correctly instead.
         """
         try:
             # Clean PowerBI special characters
@@ -1950,7 +3175,7 @@ class PowerbiSource(DashboardServiceSource):
             try:
                 parser = LineageParser(
                     cleaned_sql,
-                    dialect=Dialect.TSQL,
+                    dialect=dialect,
                     timeout_seconds=30,
                     parser_type=self.get_query_parser_type(),
                 )
@@ -1985,14 +3210,15 @@ class PowerbiSource(DashboardServiceSource):
                         schema_name = schema_str
 
                 if table_name:
-                    lineage_tables.append(
-                        {
-                            "database": database_name,
-                            "schema": schema_name,
-                            "table": table_name,
-                            "sql": cleaned_sql,
-                        }
-                    )
+                    table_info = {
+                        "database": database_name,
+                        "schema": schema_name,
+                        "table": table_name,
+                        "sql": cleaned_sql,
+                    }
+                    if dialect == Dialect.ATHENA:
+                        table_info["dsn"] = server
+                    lineage_tables.append(table_info)
             return lineage_tables if lineage_tables else None  # noqa: TRY300
         except Exception as exc:
             logger.debug(f"Error extracting tables from dataflow SQL: {exc}")
@@ -2046,7 +3272,7 @@ class PowerbiSource(DashboardServiceSource):
                 for table_info in parsed_entity.get("tables", []):
                     table_name = table_info.get("table")
                     schema_name = table_info.get("schema")
-                    database_name = table_info.get("database")
+                    database_name = self.resolve_source_database(table_info)
 
                     if not table_name:
                         continue
@@ -2064,7 +3290,11 @@ class PowerbiSource(DashboardServiceSource):
                             service_name=prefix_service_name or "*",
                             table_name=prefix_table_name or table_name,
                             schema_name=prefix_schema_name or schema_name,
-                            database_name=prefix_database_name or database_name,
+                            # `or "*"` mirrors build_es_fqn_search_string's own
+                            # internal `database_name or "*"` fallback, so this
+                            # narrows the static type to `str` with no behavior
+                            # change versus passing a possibly-`None` value through.
+                            database_name=(prefix_database_name or database_name) or "*",
                         )
                     except ValueError:
                         logger.debug(f"Skipping table '{table_name}' with invalid FQN characters")
@@ -2073,6 +3303,7 @@ class PowerbiSource(DashboardServiceSource):
                         entity_type=Table,
                         fqn_search_string=fqn_search_string,
                     )
+                    self._record_source_reference(datamodel_entity, fqn_search_string, resolved=bool(table_entity))
                     if table_entity and datamodel_entity:
                         column_lineage = self._get_dataflow_column_lineage(
                             table_entity=table_entity,
@@ -2154,6 +3385,132 @@ class PowerbiSource(DashboardServiceSource):
             error_name="Datamart and UpstreamDatamart Lineage",
         )
 
+    def _reports_for_datamodel(self, dataset_id: str) -> List[PowerBIReport]:  # noqa: UP006
+        """Reports in the current workspace whose resolved dataset id(s)
+        (`_resolve_report_dataset_ids`) include `dataset_id`."""
+        reports = []
+        for dashboard in self.state.filtered_dashboards:
+            details = self.get_dashboard_details(dashboard)
+            if isinstance(details, PowerBIReport) and dataset_id in self._resolve_report_dataset_ids(details):
+                reports.append(details)
+        return reports
+
+    def _compute_column_usage(self, model_definition: Any, reports: Mapping[str, Any]) -> Optional[Any]:  # noqa: UP045
+        """Deferred import of `column_usage.resolve_column_usage`."""
+        try:
+            from metadata.ingestion.source.dashboard.powerbi.column_usage import (
+                resolve_column_usage,
+            )
+        except ImportError:
+            logger.debug("column_usage.resolve_column_usage is not available yet")
+            return None
+        try:
+            return resolve_column_usage(model_definition, reports)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"Error resolving column usage: {exc}")
+            logger.debug(traceback.format_exc())
+            return None
+
+    @staticmethod
+    def _report_ref_keys(report_definition: Any) -> set:
+        """Every distinct (kind, table, name) triple `report_definition` (a
+        `ReportDefinitionLike`) references, across every visual, every page's own
+        filters, and the report-level filters - the same universe
+        `column_usage.resolve_column_usage` classifies as either resolved (surfacing
+        in `usage.per_visual`) or dangling (`usage.dangling`)."""
+        keys: set = set()
+        for visual in getattr(report_definition, "visuals", None) or []:
+            for ref in getattr(visual, "refs", None) or []:
+                keys.add((getattr(ref, "kind", None), getattr(ref, "table", None), getattr(ref, "name", None)))
+        for ref in getattr(report_definition, "report_refs", None) or []:
+            keys.add((getattr(ref, "kind", None), getattr(ref, "table", None), getattr(ref, "name", None)))
+        for page_refs in (getattr(report_definition, "page_refs", None) or {}).values():
+            for ref in page_refs or []:
+                keys.add((getattr(ref, "kind", None), getattr(ref, "table", None), getattr(ref, "name", None)))
+        return keys
+
+    def _ensure_column_usage_computed(self) -> None:
+        """Compute and cache `ModelColumnUsage` for every dataset in the current
+        workspace that has a cached semantic model definition (i.e. TMDL fetch +
+        parse succeeded in `yield_datamodel`) - memoised so repeat calls within the
+        same workspace (`yield_dashboard_lineage_details` runs once per
+        `db_service_prefix`) are a no-op. Logs dangling refs at INFO and calls the
+        `on_datamodel_column_usage` hook once per model, after the model entity
+        exists in OM.
+
+        METRIC_COLUMN_REFS_RESOLVED and METRIC_MEASURES_RESOLVED_TRANSITIVELY are
+        computed here, not in `_create_datamodel_report_column_lineage` - both must
+        be distinct counts (distinct resolved (kind, table, name) refs per report;
+        distinct measures in the transitive closure of used measures, per model),
+        not a tally of lineage entries, which double-counts a column reached via
+        multiple measures or used in multiple visuals.
+        """
+        if self.state.column_usage_computed:
+            return
+        self.state.mark_column_usage_computed()
+        for datamodel in self._filtered_datamodels():
+            if not isinstance(datamodel, Dataset):
+                continue
+            model_definition = self.state.get_semantic_model_definition(datamodel.id)
+            if model_definition is None:
+                continue
+            reports = {
+                report.id: report_definition
+                for report in self._reports_for_datamodel(datamodel.id)
+                if (report_definition := self.state.get_report_definition(report.id)) is not None
+            }
+            usage = self._compute_column_usage(model_definition, reports)
+            if usage is None:
+                continue
+            self.state.cache_column_usage(datamodel.id, usage)
+            self._metrics[self.METRIC_MODEL_COLUMNS_USED] += len(usage.used or frozenset())
+            self._metrics[self.METRIC_MODEL_COLUMNS_UNUSED] += len(usage.unused or frozenset())
+            self._metrics[self.METRIC_DAX_UNRESOLVED] += len(usage.dax_unresolved or set())
+            # Distinct measures in the transitive closure of used measures, for this
+            # model - column_usage.py's own counter, already deduped; not a count of
+            # lineage entries (one measure can feed many (visual, column) uses).
+            self._metrics[self.METRIC_MEASURES_RESOLVED_TRANSITIVELY] += (usage.counters or {}).get(
+                "measures_transitive", 0
+            )
+            for report_id, report_definition in reports.items():
+                dangling_this_report = {
+                    (getattr(ref, "kind", None), getattr(ref, "table", None), getattr(ref, "name", None))
+                    for ref in (usage.dangling or {}).get(report_id, [])
+                }
+                self._metrics[self.METRIC_COLUMN_REFS_RESOLVED] += len(
+                    self._report_ref_keys(report_definition) - dangling_this_report
+                )
+            for report_id, dangling_refs in (usage.dangling or {}).items():
+                # The same (kind, table, name) dangling ref can appear more than
+                # once per report (once per context it's referenced in - filter,
+                # projection, sort, ...); count and log each distinct triple once
+                # per report, not once per raw occurrence.
+                seen_this_report: set = set()
+                for ref in dangling_refs or []:
+                    key = (getattr(ref, "kind", None), getattr(ref, "table", None), getattr(ref, "name", None))
+                    if key in seen_this_report:
+                        continue
+                    seen_this_report.add(key)
+                    self._metrics[self.METRIC_COLUMN_REFS_DANGLING] += 1
+                    logger.info(
+                        "Dangling column/measure reference in report [%s]: table=%s name=%s (kind=%s)",
+                        report_id,
+                        key[1],
+                        key[2],
+                        key[0],
+                    )
+            datamodel_fqn = fqn.build(
+                self.metadata,
+                entity_type=DashboardDataModel,
+                service_name=self.context.get().dashboard_service,  # pyright: ignore[reportAttributeAccessIssue]
+                data_model_name=datamodel.id,
+            )
+            datamodel_entity = (
+                self.metadata.get_by_name(entity=DashboardDataModel, fqn=datamodel_fqn) if datamodel_fqn else None
+            )
+            if datamodel_entity:
+                self.on_datamodel_column_usage(datamodel_entity, usage)
+
     def yield_dashboard_lineage_details(
         self,
         dashboard_details: Group,
@@ -2164,6 +3521,14 @@ class PowerbiSource(DashboardServiceSource):
         tables - datamodel - report - dashboard
         """
         (prefix_service_name, *_) = self.parse_db_service_prefix(db_service_prefix)
+
+        if self.report_column_usage_enabled:
+            # Must run before the report loop below: `create_datamodel_report_lineage`
+            # needs each dataset's `ModelColumnUsage` (cached here) to build its
+            # model -> chart column lineage. Memoised per workspace
+            # (`state.column_usage_computed`) since this method can run once per
+            # `db_service_prefix`.
+            self._ensure_column_usage_computed()
 
         for dashboard in self.state.filtered_dashboards:
             dashboard_details = self.get_dashboard_details(dashboard)
@@ -2262,6 +3627,11 @@ class PowerbiSource(DashboardServiceSource):
         ws_id = self.context.get().workspace.id  # pyright: ignore[reportAttributeAccessIssue]
         yield Either(right=Barrier(reason=f"powerbi_ws:{ws_id}"))  # pyright: ignore[reportCallIssue]
         yield from super().yield_dashboard_lineage(dashboard_details)
+        if self.report_column_usage_enabled and self._pending_column_lineage_edges:
+            # Flush the column-lineage edges just yielded above before reading any
+            # of them back - `get_lineage_edge` would otherwise see a pre-write state.
+            yield Either(right=Barrier(reason=f"powerbi_column_lineage_verify:{ws_id}"))  # pyright: ignore[reportCallIssue]
+            self._verify_column_lineage_edges()
 
     def yield_datamodel_dashboard_lineage(
         self,
@@ -2286,9 +3656,7 @@ class PowerbiSource(DashboardServiceSource):
             logger.warning(f"Error fetching project name for {dashboard_details.id}: {exc}")
         return None
 
-    def get_owner_ref(  # pylint: disable=unused-argument, useless-return  # noqa: C901
-        self, dashboard_details: Any
-    ) -> Optional[EntityReferenceList]:  # noqa: UP045
+    def get_owner_ref(self, dashboard_details: Any) -> Optional[EntityReferenceList]:  # noqa: UP045
         """
         Method to process the dashboard owners
         """
@@ -2296,74 +3664,353 @@ class PowerbiSource(DashboardServiceSource):
             if not self.source_config.includeOwners:
                 logger.debug(f"Skipping owner processing for {dashboard_details.id} as includeOwners is False")
                 return None
-            owner_ref_list = []  # to assign multiple owners to entity if they exist
-            for owner in dashboard_details.users or []:
-                owner_ref = None
-                # put filtering conditions
-                if isinstance(dashboard_details, Dataset):
-                    access_right = owner.datasetUserAccessRight
-                elif isinstance(dashboard_details, Dataflow):
-                    access_right = owner.dataflowUserAccessRight
-                elif isinstance(dashboard_details, Datamart):
-                    access_right = owner.datamartUserAccessRight
-                elif isinstance(dashboard_details, PowerBIReport):
-                    access_right = owner.reportUserAccessRight
-                elif isinstance(dashboard_details, PowerBIDashboard):
-                    access_right = owner.dashboardUserAccessRight
-
-                if owner.userType != "Member":
-                    logger.debug(
-                        f"User is not a member of {dashboard_details.id}: ({owner.displayName}, {owner.email})"
-                    )
-                    continue
-                if access_right and any(keyword in access_right.lower() for keyword in OWNER_ACCESS_RIGHTS_KEYWORDS):
-                    if owner.email:
-                        try:
-                            owner_email = EmailStr._validate(owner.email)
-                        except PydanticCustomError:
-                            logger.debug(f"Invalid email for owner: {owner.email}")
-                            owner_email = None
-                        if owner_email:
-                            try:
-                                owner_ref = self.metadata.get_reference_by_email(owner_email.lower())
-                            except Exception as err:
-                                logger.debug(
-                                    f"Could not process owner data with email"
-                                    f" {owner.email} in {dashboard_details.id}: {err}"
-                                )
-                    elif owner.displayName:
-                        try:
-                            owner_ref = self.metadata.get_reference_by_name(name=owner.displayName)
-                        except Exception as err:
-                            logger.debug(
-                                f"Could not process owner data with name"
-                                f" {owner.displayName} in {dashboard_details.id}: {err}"
-                            )
-                    if owner_ref:
-                        owner_ref_list.append(owner_ref.root[0])
-                else:
-                    logger.debug(
-                        f"User does not have owner, admin or write access to"
-                        f" {dashboard_details.id}: ({owner.displayName}, {owner.email})"
-                    )
-            # check for last modified, configuredBy user
-            current_active_user = None
-            if isinstance(dashboard_details, Dataset):
-                current_active_user = dashboard_details.configuredBy
-            elif isinstance(dashboard_details, (Dataflow, PowerBIReport, Datamart)):
-                current_active_user = dashboard_details.modifiedBy
-            if current_active_user:
-                try:
-                    owner_ref = self.metadata.get_reference_by_email(current_active_user.lower())
-                    if owner_ref and owner_ref.root[0] not in owner_ref_list:
-                        owner_ref_list.append(owner_ref.root[0])
-                except Exception as err:
-                    logger.debug(f"Could not fetch current active user due to {err}")
-            if len(owner_ref_list) > 0:
-                logger.debug(f"Successfully fetched owners data for {dashboard_details.id}")
-                return EntityReferenceList(root=owner_ref_list)
-            return None  # noqa: TRY300
+            if self.service_connection.useAdminApis:
+                return self._get_owner_ref_admin(dashboard_details)
+            return self._get_owner_ref_non_admin(dashboard_details)
         except Exception as err:
             logger.debug(traceback.format_exc())
             logger.warning(f"Could not fetch owner data due to {err}")
+        return None
+
+    def _get_owner_ref_admin(  # pylint: disable=unused-argument, useless-return  # noqa: C901
+        self, dashboard_details: Any
+    ) -> Optional[EntityReferenceList]:  # noqa: UP045
+        """
+        Admin-mode owner resolution: reads the per-entity `users` array that the
+        admin workspace scan embeds inline (`getArtifactUsers`). Non-admin GET
+        endpoints never populate that array - see `_get_owner_ref_non_admin`.
+        """
+        owner_ref_list = []  # to assign multiple owners to entity if they exist
+        for owner in dashboard_details.users or []:
+            owner_ref = None
+            # put filtering conditions
+            access_right: Optional[str] = None  # noqa: UP045
+            if isinstance(dashboard_details, Dataset):
+                access_right = owner.datasetUserAccessRight
+            elif isinstance(dashboard_details, Dataflow):
+                access_right = owner.dataflowUserAccessRight
+            elif isinstance(dashboard_details, Datamart):
+                access_right = owner.datamartUserAccessRight
+            elif isinstance(dashboard_details, PowerBIReport):
+                access_right = owner.reportUserAccessRight
+            elif isinstance(dashboard_details, PowerBIDashboard):
+                access_right = owner.dashboardUserAccessRight
+
+            if owner.userType != "Member":
+                logger.debug(f"User is not a member of {dashboard_details.id}: ({owner.displayName}, {owner.email})")
+                continue
+            if access_right and any(keyword in access_right.lower() for keyword in OWNER_ACCESS_RIGHTS_KEYWORDS):
+                if owner.email:
+                    try:
+                        owner_email = EmailStr._validate(owner.email)  # pyright: ignore[reportAttributeAccessIssue]
+                    except PydanticCustomError:
+                        logger.debug(f"Invalid email for owner: {owner.email}")
+                        owner_email = None
+                    if owner_email:
+                        try:
+                            owner_ref = self.metadata.get_reference_by_email(owner_email.lower())
+                        except Exception as err:
+                            logger.debug(
+                                f"Could not process owner data with email"
+                                f" {owner.email} in {dashboard_details.id}: {err}"
+                            )
+                elif owner.displayName:
+                    try:
+                        owner_ref = self.metadata.get_reference_by_name(name=owner.displayName)
+                    except Exception as err:
+                        logger.debug(
+                            f"Could not process owner data with name"
+                            f" {owner.displayName} in {dashboard_details.id}: {err}"
+                        )
+                if owner_ref:
+                    owner_ref_list.append(owner_ref.root[0])
+            else:
+                logger.debug(
+                    f"User does not have owner, admin or write access to"
+                    f" {dashboard_details.id}: ({owner.displayName}, {owner.email})"
+                )
+        # check for last modified, configuredBy user
+        current_active_user = None
+        if isinstance(dashboard_details, Dataset):
+            current_active_user = dashboard_details.configuredBy
+        elif isinstance(dashboard_details, (Dataflow, PowerBIReport, Datamart)):
+            current_active_user = dashboard_details.modifiedBy
+        if current_active_user:
+            try:
+                owner_ref = self.metadata.get_reference_by_email(current_active_user.lower())
+                if owner_ref and owner_ref.root[0] not in owner_ref_list:
+                    owner_ref_list.append(owner_ref.root[0])
+            except Exception as err:
+                logger.debug(f"Could not fetch current active user due to {err}")
+        if len(owner_ref_list) > 0:
+            logger.debug(f"Successfully fetched owners data for {dashboard_details.id}")
+            return EntityReferenceList(root=owner_ref_list)
+        return None
+
+    def resolve_owner_principal(self, principal: PowerBIPrincipal) -> Optional[EntityReference]:  # noqa: UP045
+        """Resolve one Power BI principal to an OpenMetadata owner reference.
+
+        Looks the principal up in OpenMetadata and returns None when it does
+        not exist. Subclasses may override to provision missing principals -
+        this default implementation never creates a user or team, so generic
+        ingestion never writes one as a side effect of owner resolution.
+        """
+        if principal.principal_type == POWERBI_APP_PRINCIPAL_TYPE:
+            return None
+        try:
+            if principal.email:
+                owner_ref_list = self.metadata.get_reference_by_email(principal.email.lower())
+            elif principal.display_name:
+                # `is_owner=True` rejects a Team match whose type isn't Group -
+                # `get_reference_by_name` can otherwise return the wrong kind
+                # of Team for a Power BI security group.
+                owner_ref_list = self.metadata.get_reference_by_name(
+                    name=principal.display_name,
+                    is_owner=(principal.principal_type == POWERBI_GROUP_PRINCIPAL_TYPE),
+                )
+            else:
+                # A Group normalized from the dataset-ACL endpoint has neither
+                # (that endpoint carries no email or display name at all - see
+                # `PowerBIPrincipal.from_dataset_user`) - counted unresolved,
+                # never guessed at from `identifier` (an opaque object id).
+                return None
+        except Exception as err:
+            logger.debug(f"Could not resolve owner principal {principal.identifier}: {err}")
+            return None
+        if owner_ref_list and owner_ref_list.root:
+            return owner_ref_list.root[0]
+        return None
+
+    def _resolve_write_principals(
+        self,
+        principals: Iterable[PowerBIPrincipal],
+        is_write_right: Callable[[Optional[str]], bool],  # noqa: UP045
+    ) -> List[EntityReference]:  # noqa: UP006
+        """Resolve every distinct write-capable principal in `principals` to an
+        owner reference via `resolve_owner_principal` (the seam subclasses use
+        to provision missing users/teams). Viewer-level and unresolved
+        principals are counted, never treated as owners; `App` principals are
+        never resolved at all - a Power BI app is not a person or a team.
+
+        Groups every row by `(principal_type, identifier)` first - the
+        identifier lower-cased, since a Power BI UPN is case-insensitive and
+        the two source endpoints are not guaranteed to agree on case (not
+        observed to actually differ live; defensive) - and only then decides
+        write-capability, across every row in the group. A principal reached
+        from two sources (e.g. a workspace member who also has a row on a
+        dataset's ACL) can hold a low-privilege row from one and a
+        write-level row from the other (a workspace Viewer with
+        `ReadWriteReshareExplore` on the dataset is an ordinary setup); it
+        must be judged an owner by its best row, not by whichever row the
+        dedup happened to see first - grouping before judging makes the
+        outcome independent of input order.
+
+        `is_write_right` decides write-capability from a row's own
+        `access_right` (a workspace role or a dataset right, depending on
+        where that row came from) - a predicate, not a fixed set, because a
+        dataset right is not exact-matched (see `is_write_dataset_right`'s
+        docstring).
+        """
+        groups: dict[tuple[str, str], List[PowerBIPrincipal]] = {}  # noqa: UP006
+        for principal in principals:
+            key = (principal.principal_type, principal.identifier.lower())
+            groups.setdefault(key, []).append(principal)
+
+        owner_refs: List[EntityReference] = []  # noqa: UP006
+        for (principal_type, _), rows in groups.items():
+            if principal_type == POWERBI_APP_PRINCIPAL_TYPE:
+                self._metrics[self.METRIC_OWNER_PRINCIPALS_SKIPPED_APP] += 1
+                continue
+            if not any(is_write_right(row.access_right) for row in rows):
+                self._metrics[self.METRIC_OWNER_PRINCIPALS_SKIPPED_VIEWER] += 1
+                continue
+            principal = self._merge_principal_rows(rows)
+            try:
+                owner_ref = self.resolve_owner_principal(principal)
+            except Exception as err:
+                logger.debug(f"Could not resolve owner principal {principal.identifier}: {err}")
+                owner_ref = None
+            if owner_ref is None:
+                self._metrics[self.METRIC_OWNER_PRINCIPALS_UNRESOLVED] += 1
+                continue
+            owner_refs.append(owner_ref)
+        return owner_refs
+
+    @staticmethod
+    def _merge_principal_rows(rows: List[PowerBIPrincipal]) -> PowerBIPrincipal:  # noqa: UP006
+        """One principal can surface as more than one row - a workspace-member
+        row and a dataset-ACL row for the same `(principal_type, identifier)`
+        - and the two endpoints don't carry the same fields (the dataset-ACL
+        endpoint has no email or display name at all for a `Group`; see
+        `PowerBIPrincipal.from_dataset_user`). Merge every row's identifying
+        info before resolving, so resolution has whatever any row provides,
+        not just whichever row happened to be the write-capable one.
+        """
+        base = rows[0]
+        return PowerBIPrincipal(
+            principal_type=base.principal_type,
+            identifier=base.identifier,
+            email=next((row.email for row in rows if row.email), None),
+            display_name=next((row.display_name for row in rows if row.display_name), None),
+            access_right=base.access_right,
+        )
+
+    def _collect_non_admin_owners(
+        self,
+        configured_by: Optional[str],  # noqa: UP045
+        principals: List[PowerBIPrincipal],  # noqa: UP006
+        is_write_right: Callable[[Optional[str]], bool],  # noqa: UP045
+    ) -> List[EntityReference]:  # noqa: UP006
+        """`configured_by` (the non-admin equivalent of admin mode's
+        `modifiedBy`) plus every write-capable principal, resolved to distinct
+        owner references. Both paths go through `resolve_owner_principal` so a
+        subclass override (e.g. provisioning missing users) applies uniformly.
+        """
+        owner_refs: List[EntityReference] = []  # noqa: UP006
+        seen_ids: set = set()
+
+        def _add(ref: Optional[EntityReference]) -> None:  # noqa: UP045
+            if ref is None:
+                return
+            # `ref.id` is a `Uuid` RootModel, not hashable on its own - key on
+            # its string form instead (see `model_str()`'s docstring).
+            ref_id = model_str(ref.id)
+            if ref_id not in seen_ids:
+                seen_ids.add(ref_id)
+                owner_refs.append(ref)
+
+        if configured_by:
+            try:
+                _add(
+                    self.resolve_owner_principal(
+                        PowerBIPrincipal(
+                            principal_type=POWERBI_USER_PRINCIPAL_TYPE,
+                            identifier=configured_by,
+                            email=configured_by,
+                        )
+                    )
+                )
+            except Exception as err:
+                logger.debug(f"Could not resolve configuredBy owner {configured_by}: {err}")
+
+        for owner_ref in self._resolve_write_principals(principals, is_write_right):
+            _add(owner_ref)
+        return owner_refs
+
+    def _compute_dataflow_owner_refs(self, dataflow: Dataflow) -> List[EntityReference]:  # noqa: UP006
+        """Dataflow owners = `configuredBy` + workspace members with a write-capable role.
+
+        Memoised per dataflow id for the current workspace (`WorkspaceState`):
+        a dataflow's owner set is looked up here at most once per run, however
+        many times it is reached, since nothing currently re-derives a
+        dataflow's owners from a dependent asset the way a dataset's are.
+        Kept memoised anyway for the same reason as the dataset path below -
+        cheap, and future-proof against a dependent being added later.
+        """
+        cached = self.state.get_dataflow_owner_refs(dataflow.id)
+        if cached is not None:
+            return list(cached)
+        owner_refs = self._collect_non_admin_owners(
+            configured_by=dataflow.configuredBy,
+            principals=self.state.workspace_principals,
+            is_write_right=lambda right: right in POWERBI_WRITE_WORKSPACE_ROLES,
+        )
+        self.state.cache_dataflow_owner_refs(dataflow.id, owner_refs)
+        return owner_refs
+
+    def _compute_datamodel_owner_refs(self, dataset: Dataset) -> List[EntityReference]:  # noqa: UP006
+        """Semantic model (dataset) owners = `configuredBy` + workspace members with
+        a write-capable role + dataset-ACL principals with a write-level right.
+
+        A principal's `access_right` is checked against whichever domain it
+        actually came from (workspace role vs dataset right) via a single
+        combined predicate - the two domains' values never overlap, so this
+        stays correct for a merged principals list without needing to track
+        each principal's source separately.
+
+        Memoised per dataset id for the current workspace: every report that
+        points at this dataset (`_compute_report_owner_refs`), and every
+        dashboard tile behind one of those reports
+        (`_compute_dashboard_owner_refs`), reaches this same dataset - without
+        memoisation each of those recomputes the full principal resolution,
+        including the `resolve_owner_principal` OpenMetadata lookups, once per
+        dependent instead of once per dataset.
+        """
+        cached = self.state.get_dataset_owner_refs(dataset.id)
+        if cached is not None:
+            return list(cached)
+        principals = list(self.state.workspace_principals) + list(dataset.dataset_principals or [])
+        owner_refs = self._collect_non_admin_owners(
+            configured_by=dataset.configuredBy,
+            principals=principals,
+            is_write_right=lambda right: right in POWERBI_WRITE_WORKSPACE_ROLES or is_write_dataset_right(right),
+        )
+        self.state.cache_dataset_owner_refs(dataset.id, owner_refs)
+        return owner_refs
+
+    def _compute_report_owner_refs(self, report: PowerBIReport) -> List[EntityReference]:  # noqa: UP006
+        """Reports have no owner endpoint in non-admin mode (404) - they inherit
+        their semantic model's owners via `datasetId`.
+        """
+        if not report.datasetId:
+            return []
+        dataset = self.state.find_dataset(report.datasetId)
+        if dataset is None:
+            return []
+        return self._compute_datamodel_owner_refs(dataset)
+
+    def _compute_dashboard_owner_refs(self, dashboard: PowerBIDashboard) -> List[EntityReference]:  # noqa: UP006
+        """Dashboards have no owner endpoint in non-admin mode either - they union
+        the owners of every report behind their tiles.
+        """
+        owner_refs: List[EntityReference] = []  # noqa: UP006
+        seen_ids: set = set()
+        for tile in dashboard.tiles or []:
+            if not tile.reportId:
+                continue
+            report = self.state.find_report(tile.reportId)
+            if report is None:
+                continue
+            for ref in self._compute_report_owner_refs(report):
+                ref_id = model_str(ref.id)
+                if ref_id not in seen_ids:
+                    seen_ids.add(ref_id)
+                    owner_refs.append(ref)
+        return owner_refs
+
+    def _get_owner_ref_non_admin(self, dashboard_details: Any) -> Optional[EntityReferenceList]:  # noqa: UP045
+        """
+        Non-admin owner resolution.
+
+        Non-admin GET endpoints never populate `users` on individual dashboard
+        entities - that array is filled by the admin scan's `getArtifactUsers`
+        (see `_get_owner_ref_admin`). Instead, ownership is derived from
+        `configuredBy` plus workspace membership and dataset ACLs fetched
+        separately (`fetch_group_users` / `fetch_dataset_users`, wired in
+        `get_org_workspace_data`); reports and dashboards have no owner
+        endpoint of their own in non-admin mode and inherit owners from their
+        semantic model / reports respectively. See the `_compute_*_owner_refs`
+        methods for the per-entity-type rules.
+        """
+        if isinstance(dashboard_details, PowerBIDashboard):
+            owner_refs = self._compute_dashboard_owner_refs(dashboard_details)
+            metric = self.METRIC_OWNERS_ASSIGNED_DASHBOARDS
+        elif isinstance(dashboard_details, PowerBIReport):
+            owner_refs = self._compute_report_owner_refs(dashboard_details)
+            metric = self.METRIC_OWNERS_ASSIGNED_REPORTS
+        elif isinstance(dashboard_details, Dataset):
+            owner_refs = self._compute_datamodel_owner_refs(dashboard_details)
+            metric = self.METRIC_OWNERS_ASSIGNED_DATAMODELS
+        elif isinstance(dashboard_details, Dataflow):
+            owner_refs = self._compute_dataflow_owner_refs(dashboard_details)
+            metric = self.METRIC_OWNERS_ASSIGNED_DATAFLOWS
+        else:
+            # Datamart is admin-scan-only (see its docstring in models.py) -
+            # never reached when useAdminApis is False.
+            return None
+        if owner_refs:
+            self._metrics[metric] += 1
+            logger.debug(f"Successfully resolved non-admin owners for {dashboard_details.id}")
+            return EntityReferenceList(root=owner_refs)
+        self._metrics[self.METRIC_ASSETS_WITHOUT_OWNER] += 1
         return None

@@ -910,13 +910,30 @@ class OpenMetadata(
         response = self.client.put(url, json=data)
         return response if isinstance(response, dict) else None
 
-    def compute_percentile(self, entity: Union[Type[T], str], date: str) -> None:  # noqa: UP006, UP007
+    def compute_percentile(self, entity: Union[Type[T], str], date: str) -> bool:  # noqa: UP006, UP007
         """
-        Compute an entity usage percentile
+        Compute an entity usage percentile.
+
+        One synchronous server-side UPDATE over every usage row of the type for the day, with a
+        correlated count per row: on a catalogue of tens of thousands of tables it outlives an
+        ingress timeout. The server keeps computing after the gateway gives up, so a 504 here means
+        "started, not confirmed" - it is logged and reported as such, never retried: a retry would
+        launch the same job again on top of the one still running. Returns True when the server
+        confirmed the computation.
         """
         entity_name = get_entity_type(entity)
-        resp = self.client.post(f"/usage/compute.percentile/{entity_name}/{date}")
+        try:
+            resp = self.client.post(f"/usage/compute.percentile/{entity_name}/{date}", retries=0)
+        except APIError as err:
+            if err.status_code in (502, 503, 504):
+                logger.warning(
+                    f"compute.percentile for {entity_name} {date} timed out at the gateway ({err.status_code}); "
+                    "the server keeps computing, the result lands when it finishes"
+                )
+                return False
+            raise
         logger.debug("published compute percentile %s", resp)
+        return True
 
     def _group_entities_by_type(self, entities: List[Type[T]]) -> Dict[Type[T], List[Type[T]]]:  # noqa: UP006
         """Group entities by type so we can process them in the correct order when

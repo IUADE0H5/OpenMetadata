@@ -1,0 +1,426 @@
+#  Copyright 2023 Collate
+#  Licensed under the Collate Community License, Version 1.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#  https://github.com/open-metadata/OpenMetadata/blob/main/ingestion/LICENSE
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+"""
+Resolves which physical semantic-model columns are actually used by a set of reports,
+per the adopted "used" rule (project docs, section 5):
+
+- Direct uses: visual projections/sorts/objects refs and filters at report, page and
+  visual level, plus tooltip page bindings.
+- Transitive uses: a used measure pulls in the columns (and further measures) its DAX
+  touches; a used calculated column pulls in its own DAX dependencies the same way.
+- A `sortByColumn` target of a used column is used.
+- A relationship key is used only if the relationship is *traversed*: both endpoint
+  tables already have at least one used *business* column. A table with zero business
+  columns (every auto-date table, by construction) can never satisfy that on its own
+  side, so a relationship into an auto-date table never marks the business-side key
+  used by itself.
+- Relationship traversal and `sortByColumn` are evaluated exactly once, against the
+  base (direct + transitive) used set -- deliberately not a fixpoint. A column either
+  rule adds never itself unlocks a further relationship or sortBy target. (Calculated
+  columns still expand to their own fixpoint first, since a chain of calculated
+  columns genuinely needs multiple hops to resolve; only the two structural rules are
+  single-pass.)
+- Everything else among the business columns (i.e. not belonging to an auto-date table)
+  is unused. A model can back several reports; usage is the union across all of them.
+
+Power BI/DAX identifiers (tables, columns, measures) are case-insensitive: a report
+field ref, a `sortByColumn`, a relationship endpoint, or a variation target can name a
+column under different casing than the model's own TMDL declaration and still name the
+same column. Every resolution in this module -- report refs via `_resolve_ref`,
+sortByColumn, hierarchy levels, and relationships -- is case-insensitive and always
+returns the model's canonical declared spelling. A name that matches no declared
+table/column/measure under any casing is unresolved: dangling for a report field ref
+(never added to `used`, never chart lineage), `dax_unresolved` for a DAX reference
+(handled in dax.py, which returns only already-canonicalized keys here).
+"""
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+
+from metadata.ingestion.source.dashboard.powerbi.dax import DaxReferences, extract_dax_references
+from metadata.ingestion.source.dashboard.powerbi.report_definition import FieldRef, ReportDefinition
+from metadata.ingestion.source.dashboard.powerbi.tmdl import SemanticModelDefinition
+
+ColumnKey = tuple[str, str]
+VisualKey = tuple[str, str]
+
+# Every counter this module reports, seeded at 0 so a diff against a prior run never
+# has to guess whether a missing key means "zero" or "not measured yet".
+_COUNTER_KEYS = (
+    "reports",
+    "visuals_data",
+    "visuals_non_data",
+    "direct_column_refs",
+    "direct_measure_refs",
+    "hierarchy_level_refs",
+    "dangling_refs",
+    "measures_transitive",
+    "calculated_columns_expanded",
+    "relationships_traversed",
+    "sortby_columns_added",
+    "dax_unresolved",
+)
+
+# Fixpoint safety cap: real models have at most a few hundred tables/relationships, so
+# this is never reached in practice -- it exists to turn a modelling bug into a
+# truncated-but-finite result instead of an infinite loop.
+_MAX_FIXPOINT_ITERATIONS = 50
+
+
+@dataclass(frozen=True)
+class ColumnUse:
+    table: str
+    column: str
+    # The visual-facing measure this column was reached through, if any. None for a
+    # direct column/hierarchy-level use. Two different measures reaching the same
+    # physical column produce two separate ColumnUse entries, never merged.
+    via_measure: str | None = None
+
+
+@dataclass
+class ModelColumnUsage:
+    business_columns: frozenset[ColumnKey]
+    used: frozenset[ColumnKey]
+    unused: frozenset[ColumnKey]
+    wholly_unused_tables: frozenset[str]
+    # Always a genuine, declared business column (exact membership in
+    # business_columns) -- every key reaching here is already canonicalized, so this
+    # is equivalent to "not an auto-date table" but stated as the stricter check since
+    # that's what it actually is once casing is no longer a variable.
+    per_visual: dict[VisualKey, list[ColumnUse]] = field(default_factory=dict)
+    dangling: dict[str, list[FieldRef]] = field(default_factory=dict)
+    dax_unresolved: set[str] = field(default_factory=set)
+    counters: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class _ModelIndex:
+    """Precomputed, read-only lookups derived once from the model, shared by every
+    step of resolution. The `*_by_lower` maps are a per-model casefold index -- built
+    once here, bounded by the model's own table/column/measure counts, not an
+    accumulating cache -- used to resolve any name case-insensitively while always
+    returning the model's canonical declared spelling."""
+
+    all_columns: set[ColumnKey]
+    business_columns: frozenset[ColumnKey]
+    auto_date_tables: frozenset[str]
+    measure_index: set[ColumnKey]
+    sort_by: dict[ColumnKey, ColumnKey]
+    measure_deps: dict[ColumnKey, DaxReferences]
+    calc_column_deps: dict[ColumnKey, DaxReferences]
+    table_by_lower: dict[str, str]
+    column_by_lower: dict[tuple[str, str], ColumnKey]
+    measure_by_lower: dict[tuple[str, str], ColumnKey]
+    # (table.lower(), hierarchy.lower(), level.lower()) -> canonical column name.
+    hierarchy_level_by_lower: dict[tuple[str, str, str], str]
+
+
+def _build_index(model: SemanticModelDefinition) -> _ModelIndex:
+    table_by_lower = {table.name.lower(): table.name for table in model.tables}
+    column_by_lower = {
+        (table.name.lower(), column.name.lower()): (table.name, column.name)
+        for table in model.tables
+        for column in table.columns
+    }
+    measure_by_lower = {
+        (table.name.lower(), measure.name.lower()): (table.name, measure.name)
+        for table in model.tables
+        for measure in table.measures
+    }
+    hierarchy_level_by_lower = {
+        (table.name.lower(), hierarchy.name.lower(), level.name.lower()): level.column
+        for table in model.tables
+        for hierarchy in table.hierarchies
+        for level in hierarchy.levels
+        if level.column is not None
+    }
+
+    sort_by: dict[ColumnKey, ColumnKey] = {}
+    for table in model.tables:
+        for column in table.columns:
+            if not column.sort_by_column:
+                continue
+            target = column_by_lower.get((table.name.lower(), column.sort_by_column.lower()))
+            if target is not None:
+                sort_by[(table.name, column.name)] = target
+
+    return _ModelIndex(
+        all_columns=set(column_by_lower.values()),
+        business_columns=frozenset(
+            (table.name, column.name) for table in model.tables if not table.is_auto_date for column in table.columns
+        ),
+        auto_date_tables=frozenset(table.name for table in model.tables if table.is_auto_date),
+        measure_index=set(measure_by_lower.values()),
+        sort_by=sort_by,
+        measure_deps={
+            (table.name, measure.name): extract_dax_references(measure.expression, model, table.name)
+            for table in model.tables
+            for measure in table.measures
+        },
+        calc_column_deps={
+            (table.name, column.name): extract_dax_references(column.expression, model, table.name)
+            for table in model.tables
+            for column in table.columns
+            if column.expression
+        },
+        table_by_lower=table_by_lower,
+        column_by_lower=column_by_lower,
+        measure_by_lower=measure_by_lower,
+        hierarchy_level_by_lower=hierarchy_level_by_lower,
+    )
+
+
+def _resolve_ref(ref: FieldRef, index: _ModelIndex) -> tuple[str, ColumnKey] | None:
+    """Resolves a FieldRef to ("column", key) or ("measure", key) against the model,
+    case-insensitively, always returning the model's canonical spelling. Applies the
+    same kind/actual-model cross-check fallback as the reference implementation: a ref
+    tagged Column that is actually a measure (or vice versa) still resolves, since the
+    JSON's own tag can lag the model."""
+    table_lower = ref.table.lower()
+    if ref.kind == "hierarchy_level":
+        if ref.hierarchy is None:
+            # A variation-based ref: report_definition.py already resolved it straight
+            # to the physical (table, column) the auto-date hierarchy was built on --
+            # just check that column genuinely exists (case-insensitively).
+            key = index.column_by_lower.get((table_lower, ref.name.lower()))
+            return ("column", key) if key is not None else None
+        column = index.hierarchy_level_by_lower.get((table_lower, ref.hierarchy.lower(), ref.name.lower()))
+        if column is None:
+            return None
+        canonical_table = index.table_by_lower.get(table_lower)
+        return ("column", (canonical_table, column)) if canonical_table is not None else None
+    name_lower = ref.name.lower()
+    measure_key = index.measure_by_lower.get((table_lower, name_lower))
+    if measure_key is not None:
+        return ("measure", measure_key)
+    column_key = index.column_by_lower.get((table_lower, name_lower))
+    if column_key is not None:
+        return ("column", column_key)
+    return None
+
+
+@dataclass
+class _DirectUsageResult:
+    used: set[ColumnKey]
+    per_visual: dict[VisualKey, list[ColumnUse]]
+    dangling: dict[str, list[FieldRef]]
+    dax_unresolved: set[str]
+    measures_seen: set[ColumnKey]
+
+
+def _measure_closure(
+    start: ColumnKey,
+    measure_deps: dict[ColumnKey, DaxReferences],
+    all_measures_seen: set[ColumnKey],
+    dax_unresolved: set[str],
+) -> set[ColumnKey]:
+    """Returns the full transitive column closure reached from `start`. Cycle-guarded
+    with a *local* seen set, deliberately not `all_measures_seen`: that set is shared
+    across every ref in a report purely to count distinct measures reached overall
+    (`measures_transitive`), and gating traversal on it here would make a call's
+    returned columns depend on which other ref happened to explore the same measure
+    subgraph first -- correct for the report-wide `used` set (a union anyway) but
+    silently incomplete for any one visual's own per-visual attribution."""
+    columns: set[ColumnKey] = set()
+    local_seen: set[ColumnKey] = set()
+    stack = [start]
+    while stack:
+        key = stack.pop()
+        if key in local_seen:
+            continue
+        local_seen.add(key)
+        all_measures_seen.add(key)
+        deps = measure_deps.get(key)
+        if deps is None:
+            continue
+        columns |= deps.columns
+        dax_unresolved.update(deps.unresolved)
+        stack.extend(deps.measures)
+    return columns
+
+
+def _collect_direct_usage(
+    reports: Mapping[str, ReportDefinition], index: _ModelIndex, counters: dict[str, int]
+) -> _DirectUsageResult:
+    result = _DirectUsageResult(used=set(), per_visual={}, dangling={}, dax_unresolved=set(), measures_seen=set())
+
+    def apply_ref(ref: FieldRef, report_id: str, visual_key: VisualKey | None) -> None:
+        resolution = _resolve_ref(ref, index)
+        if resolution is None:
+            result.dangling.setdefault(report_id, []).append(ref)
+            counters["dangling_refs"] += 1
+            return
+        kind, key = resolution
+        if kind == "column":
+            metric = "hierarchy_level_refs" if ref.kind == "hierarchy_level" else "direct_column_refs"
+            counters[metric] += 1
+            result.used.add(key)
+            # Chart lineage excludes auto-date tables (never ingested into
+            # OpenMetadata, so a lineage entry pointing at one would be silently
+            # dropped by the server). `key` is already canonicalized and verified to
+            # exist by `_resolve_ref`/dax.py, so exact business_columns membership is
+            # now the correct check -- it's equivalent to "not auto-date" once casing
+            # is no longer a variable. `ref.variation_level` is kept on the FieldRef
+            # for logging only.
+            if visual_key is not None and key in index.business_columns:
+                result.per_visual.setdefault(visual_key, []).append(ColumnUse(key[0], key[1]))
+        else:
+            counters["direct_measure_refs"] += 1
+            reached = _measure_closure(key, index.measure_deps, result.measures_seen, result.dax_unresolved)
+            result.used.update(reached)
+            if visual_key is not None:
+                entries = result.per_visual.setdefault(visual_key, [])
+                entries.extend(
+                    ColumnUse(col[0], col[1], via_measure=key[1]) for col in reached if col in index.business_columns
+                )
+
+    for report_id, report in reports.items():
+        counters["reports"] += 1
+        for ref in report.report_refs:
+            apply_ref(ref, report_id, None)
+        for page_refs in report.page_refs.values():
+            for ref in page_refs:
+                apply_ref(ref, report_id, None)
+        for visual in report.visuals:
+            counters["visuals_data" if visual.is_data_visual else "visuals_non_data"] += 1
+            visual_key = (report_id, visual.visual_id)
+            for ref in visual.refs:
+                apply_ref(ref, report_id, visual_key)
+
+    return result
+
+
+def _traversed_relationships(
+    model: SemanticModelDefinition, used: set[ColumnKey], index: _ModelIndex
+) -> tuple[set[ColumnKey], set[str]]:
+    """A relationship is traversed only when both endpoint tables already have at
+    least one used business column; an auto-date table has none, by construction, so
+    it can never satisfy this on its own side. Endpoints are resolved
+    case-insensitively (relationships.tmdl is a separate parse pass from the tables
+    themselves, so casing drift, while unlikely, isn't ruled out); an endpoint that
+    doesn't resolve to a real column under any casing makes the relationship
+    unusable and it's skipped rather than guessed at."""
+    added: set[ColumnKey] = set()
+    traversed: set[str] = set()
+    used_business_tables = {table for table, column in used if (table, column) in index.business_columns}
+    for relationship in model.relationships:
+        from_key = index.column_by_lower.get((relationship.from_table.lower(), relationship.from_column.lower()))
+        to_key = index.column_by_lower.get((relationship.to_table.lower(), relationship.to_column.lower()))
+        if from_key is None or to_key is None:
+            continue
+        if from_key[0] not in used_business_tables or to_key[0] not in used_business_tables:
+            continue
+        added.update(key for key in (from_key, to_key) if key not in used)
+        traversed.add(f"{from_key[0]}.{from_key[1]}->{to_key[0]}.{to_key[1]}")
+    return added, traversed
+
+
+def _sortby_additions(used: set[ColumnKey], index: _ModelIndex) -> set[ColumnKey]:
+    added = set()
+    for key in used:
+        sort_target = index.sort_by.get(key)
+        if sort_target and sort_target not in used:
+            added.add(sort_target)
+    return added
+
+
+def _calculated_column_additions(
+    used: set[ColumnKey], index: _ModelIndex, measures_seen: set[ColumnKey], dax_unresolved: set[str]
+) -> tuple[set[ColumnKey], int]:
+    added: set[ColumnKey] = set()
+    expanded = 0
+    for key in used:
+        deps = index.calc_column_deps.get(key)
+        if deps is None:
+            continue
+        expanded += 1
+        added.update(column_key for column_key in deps.columns if column_key not in used)
+        for measure_key in deps.measures:
+            added.update(
+                column_key
+                for column_key in _measure_closure(measure_key, index.measure_deps, measures_seen, dax_unresolved)
+                if column_key not in used
+            )
+        dax_unresolved.update(deps.unresolved)
+    return added, expanded
+
+
+def _expand_calculated_columns(
+    used: set[ColumnKey],
+    index: _ModelIndex,
+    measures_seen: set[ColumnKey],
+    dax_unresolved: set[str],
+    counters: dict[str, int],
+) -> None:
+    """Fixpoint over calculated-column DAX deps only: a calculated column can depend on
+    another calculated column, so this alone needs to iterate until stable. This is
+    part of computing the "direct + transitive" base used set, strictly before the
+    structural rules below ever run."""
+    for _ in range(_MAX_FIXPOINT_ITERATIONS):
+        added, expanded = _calculated_column_additions(used, index, measures_seen, dax_unresolved)
+        counters["calculated_columns_expanded"] += expanded
+        if not added:
+            break
+        used |= added
+
+
+def _apply_structural_rules_once(
+    model: SemanticModelDefinition,
+    used: set[ColumnKey],
+    index: _ModelIndex,
+    counters: dict[str, int],
+) -> set[ColumnKey]:
+    """Relationship traversal and sortByColumn targets are evaluated exactly once
+    against the base (direct + transitive) used set -- deliberately not a fixpoint. A
+    column a relationship or sortBy adds here never unlocks a further relationship or
+    sortBy target; that keeps unused_lenient <= unused_section5 <= unused_strict for
+    every model, which a fixpoint here would not guarantee."""
+    relationship_added, traversed = _traversed_relationships(model, used, index)
+    counters["relationships_traversed"] = len(traversed)
+
+    sortby_added = _sortby_additions(used, index)
+    counters["sortby_columns_added"] = len(sortby_added)
+
+    return relationship_added | sortby_added
+
+
+def resolve_column_usage(model: SemanticModelDefinition, reports: Mapping[str, ReportDefinition]) -> ModelColumnUsage:
+    counters: dict[str, int] = dict.fromkeys(_COUNTER_KEYS, 0)
+    index = _build_index(model)
+
+    direct = _collect_direct_usage(reports, index, counters)
+    counters["measures_transitive"] = len(direct.measures_seen)
+
+    used = direct.used
+    _expand_calculated_columns(used, index, direct.measures_seen, direct.dax_unresolved, counters)
+    used |= _apply_structural_rules_once(model, used, index, counters)
+    counters["dax_unresolved"] = len(direct.dax_unresolved)
+
+    final_used = index.business_columns & frozenset(used)
+    unused = index.business_columns - final_used
+    wholly_unused_tables = frozenset(
+        table.name
+        for table in model.tables
+        if not table.is_auto_date
+        and any((table.name, column.name) in index.business_columns for column in table.columns)
+        and not any((table.name, column.name) in final_used for column in table.columns)
+    )
+
+    return ModelColumnUsage(
+        business_columns=index.business_columns,
+        used=final_used,
+        unused=unused,
+        wholly_unused_tables=wholly_unused_tables,
+        per_visual=direct.per_visual,
+        dangling=direct.dangling,
+        dax_unresolved=direct.dax_unresolved,
+        counters=counters,
+    )

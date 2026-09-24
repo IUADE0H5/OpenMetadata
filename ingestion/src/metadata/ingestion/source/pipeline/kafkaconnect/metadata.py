@@ -56,7 +56,11 @@ from metadata.generated.schema.type.entityReference import EntityReference
 from metadata.ingestion.api.models import Either
 from metadata.ingestion.api.steps import InvalidSourceException
 from metadata.ingestion.lineage.sql_lineage import get_column_fqn
-from metadata.ingestion.lineage.topic_lineage import get_topic_field_fqn
+from metadata.ingestion.lineage.topic_lineage import (
+    get_topic_field_fqn,
+    is_cdc_envelope,
+    unwrap_record,
+)
 from metadata.ingestion.models.pipeline_status import OMetaPipelineStatus
 from metadata.ingestion.ometa.ometa_api import OpenMetadata, T
 from metadata.ingestion.ometa.utils import model_str
@@ -65,7 +69,6 @@ from metadata.ingestion.source.pipeline.kafkaconnect.client import (
     parse_cdc_topic_name,
 )
 from metadata.ingestion.source.pipeline.kafkaconnect.constants import (
-    CDC_ENVELOPE_FIELDS,
     CONNECTOR_CLASS_TO_SERVICE_TYPE,
     MESSAGING_ENDPOINT_KEYS,
     SERVICE_TYPE_HOSTNAME_KEYS,
@@ -764,7 +767,7 @@ class KafkaconnectSource(PipelineServiceSource):
             # Check if this is a Debezium CDC envelope structure
             # Can be either flat (top-level: op, before, after) or nested (Envelope -> op, before, after)
             field_names = {model_str(f.name) for f in schema_fields}
-            is_debezium_cdc = CDC_ENVELOPE_FIELDS.issubset(field_names)
+            is_debezium_cdc = is_cdc_envelope(field_names)
 
             # Fallback: Check schemaText for CDC structure if schemaFields doesn't indicate CDC
             if not is_debezium_cdc and entity.messageSchema.schemaText:
@@ -774,7 +777,7 @@ class KafkaconnectSource(PipelineServiceSource):
                     schema_dict = json.loads(entity.messageSchema.schemaText)
                     schema_props = schema_dict.get("properties", {})
                     # Check if schemaText has CDC envelope fields
-                    is_debezium_cdc = CDC_ENVELOPE_FIELDS.issubset(set(schema_props.keys()))
+                    is_debezium_cdc = is_cdc_envelope(schema_props.keys())
                 except Exception:
                     pass
 
@@ -787,7 +790,7 @@ class KafkaconnectSource(PipelineServiceSource):
                 envelope_field = schema_fields[0]
                 if envelope_field.children:
                     envelope_child_names = {model_str(c.name) for c in envelope_field.children}
-                    is_debezium_cdc = CDC_ENVELOPE_FIELDS.issubset(envelope_child_names)
+                    is_debezium_cdc = is_cdc_envelope(envelope_child_names)
                     if is_debezium_cdc:
                         logger.debug(f"Nested Debezium CDC envelope detected: {model_str(envelope_field.name)}")
                         schema_fields = envelope_field.children  # Use envelope children as schema fields
@@ -799,7 +802,7 @@ class KafkaconnectSource(PipelineServiceSource):
                     field_name_str = model_str(field.name)
                     # Prefer 'after' for source connectors (contains new/updated record state)
                     if field_name_str == "after" and field.children:
-                        columns = [model_str(child.name) for child in field.children]
+                        columns = [model_str(child.name) for child in unwrap_record(field).children]
                         logger.debug(f"Debezium CDC: extracted {len(columns)} columns from 'after' field")
                         return columns
 
@@ -807,7 +810,7 @@ class KafkaconnectSource(PipelineServiceSource):
                 for field in schema_fields:
                     field_name_str = model_str(field.name)
                     if field_name_str == "before" and field.children:
-                        columns = [model_str(child.name) for child in field.children]
+                        columns = [model_str(child.name) for child in unwrap_record(field).children]
                         logger.debug(f"Debezium CDC: extracted {len(columns)} columns from 'before' field")
                         return columns
 

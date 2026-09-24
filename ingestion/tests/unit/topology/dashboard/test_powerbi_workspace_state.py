@@ -21,6 +21,7 @@ from metadata.ingestion.source.dashboard.powerbi.models import (
     Dataset,
     Group,
     PowerBIDashboard,
+    PowerBIPrincipal,
     PowerBIReport,
 )
 from metadata.ingestion.source.dashboard.powerbi.workspace_state import WorkspaceState
@@ -87,6 +88,32 @@ def test_dataset_lookup_populated_on_enter_cleared_on_exit(state, ws_a):
     assert state.find_dataset("d_a1") is not None
     state.exit()
     assert state.find_dataset("d_a1") is None
+
+
+def test_report_lookup_populated_on_enter_cleared_on_exit(state, ws_a):
+    """Non-admin dashboard owner resolution looks up a tile's report by id."""
+    state.enter(ws_a)
+    assert state.find_report("r_a1") is not None
+    state.exit()
+    assert state.find_report("r_a1") is None
+
+
+def test_workspace_principals_populated_on_enter_cleared_on_exit(state):
+    """Non-admin only: `workspace_principals` mirrors `Group.workspace_principals`
+    for the active workspace and is released on exit.
+    """
+    principal = PowerBIPrincipal(principal_type="User", identifier="ada@example.com")
+    workspace = Group(id="ws_c", name="Workspace C", workspace_principals=[principal])
+    state.enter(workspace)
+    assert state.workspace_principals == [principal]
+    state.exit()
+    assert state.workspace_principals == []
+
+
+def test_workspace_principals_empty_for_admin_scan_workspace(state, ws_a):
+    """`ws_a` has no `workspace_principals` set (admin-scan shaped fixture)."""
+    state.enter(ws_a)
+    assert state.workspace_principals == []
 
 
 def test_dataflow_exports_cleared_on_exit(state, ws_a):

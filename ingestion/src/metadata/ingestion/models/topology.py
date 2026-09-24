@@ -316,6 +316,13 @@ class Queue:
         """Checks that the Queue is not Empty."""
         return not self._queue.empty()
 
+    def depth(self) -> int:
+        """Approximate number of items waiting to be processed. Used to apply backpressure to
+        producers so a fast producer cannot outrun a slow consumer and grow this buffer without
+        bound (an OOM on large lineage/usage runs). `qsize()` is approximate but adequate here -
+        it only gates whether to start more producer work, never correctness."""
+        return self._queue.qsize()
+
     def process(self) -> Any:
         """Yields all the items currently on the Queue."""
         while True:

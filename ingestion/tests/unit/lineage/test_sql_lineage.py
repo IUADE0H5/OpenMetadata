@@ -219,6 +219,23 @@ class SqlLineageTest(TestCase):
             "vw_customer",
         )
 
+    def test_table_name_from_query_drops_the_athena_glue_catalog_name(self):
+        """
+        Athena/Trino qualify a table as catalog.schema.table. "AwsDataCatalog" (Athena's default
+        Glue Data Catalog) is never an OpenMetadata database and must be dropped like the sqllineage
+        `<default>` placeholder, so callers fall back to the connector's real database name instead
+        of searching for a database literally named "awsdatacatalog" (issue: usage sink warnings
+        "Could not fetch table default.awsdatacatalog.<schema>.<table>").
+        """
+        assert get_table_fqn_from_query_name("awsdatacatalog.sales.orders") == (None, "sales", "orders")
+        assert get_table_fqn_from_query_name("AwsDataCatalog.sales.orders") == (None, "sales", "orders")
+        # a schema/database that merely contains the substring must not be dropped
+        assert get_table_fqn_from_query_name("my_awsdatacatalog_backup.sales.orders") == (
+            "my_awsdatacatalog_backup",
+            "sales",
+            "orders",
+        )
+
         assert get_table_fqn_from_query_name('Prod."OpsDataViews.Reporting".vw_customer') == (
             "Prod",
             '"OpsDataViews.Reporting"',
@@ -488,3 +505,26 @@ class SqlLineageTest(TestCase):
                 len(parser.target_tables) > 0,
                 f"Expected target tables for query: {query}",
             )
+
+
+def test_get_lineage_by_graph_is_silent_on_an_empty_graph_and_quiet_otherwise(caplog):
+    """A session-scoped lineage run calls this once per session - tens of thousands of times - and
+    most sessions leave an empty graph. Nothing to say about those, and the size of a non-empty one
+    is detail, not run progress."""
+    import logging
+    from unittest.mock import MagicMock
+
+    import networkx as nx
+
+    from metadata.ingestion.lineage.sql_lineage import get_lineage_by_graph
+
+    with caplog.at_level(logging.DEBUG, logger="metadata.Utils"):
+        assert list(get_lineage_by_graph(graph=nx.DiGraph(), metadata=MagicMock()) or []) == []
+    assert not [r for r in caplog.records if "Processing graph" in r.getMessage()]
+
+    graph = nx.DiGraph()
+    graph.add_edge("a", "b")
+    with caplog.at_level(logging.DEBUG, logger="metadata.Utils"):
+        list(get_lineage_by_graph(graph=graph, metadata=MagicMock()) or [])
+    levels = {r.levelname for r in caplog.records if "Processing graph" in r.getMessage()}
+    assert levels == {"DEBUG"}

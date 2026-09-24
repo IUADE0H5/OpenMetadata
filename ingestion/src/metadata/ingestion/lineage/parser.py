@@ -13,8 +13,10 @@ Lineage Parser configuration
 """
 
 import hashlib
+import re
 import time
 import traceback
+import warnings
 from collections import defaultdict
 from copy import deepcopy
 from logging.config import DictConfigurator
@@ -66,6 +68,29 @@ LINEAGE_PARSING_TIMEOUT = 30
 LINEAGE_PARSING_MEMORY_LIMIT_MB = 100
 
 
+# sqllineage warns through `warnings` when a Table is built from a `schema.table` name with a schema
+# argument as well - its own analyzers do exactly that on every qualified name, so the line is noise
+# printed straight to stderr, outside the log format, from every parser process.
+warnings.filterwarnings("ignore", message="Name is in schema.table format, schema param is ignored")
+
+# Words SqlGlot tokenizes as keywords but these engines accept as bare identifiers; on a table or
+# subquery alias (`... ) out ON inc.id = out.id`) SqlGlot gives up on the whole statement and parses it
+# as an opaque command with no tables. They are quoted before the SqlGlot attempt only - the other
+# parsers see the query as written - and never inside string literals.
+_SQLGLOT_RESERVED_IDENTIFIERS = {Dialect.ATHENA: ("out",), Dialect.TRINO: ("out",)}
+_STRING_LITERAL = re.compile(r"('(?:[^']|'')*')")
+
+
+def quote_reserved_identifiers(query: str, dialect: Dialect) -> str:
+    words = _SQLGLOT_RESERVED_IDENTIFIERS.get(dialect)
+    if not words:
+        return query
+    pattern = re.compile(r'(?<![\w."`])(' + "|".join(words) + r')(?![\w"`])', re.IGNORECASE)
+    return "".join(
+        part if part.startswith("'") else pattern.sub(r'"\1"', part) for part in _STRING_LITERAL.split(query)
+    )
+
+
 class LineageParser:
     """
     Class that acts like a wrapper for the LineageRunner library usage
@@ -87,6 +112,10 @@ class LineageParser:
         self.query_hash = self.get_query_hash(query)
         self.query_parsing_success = True
         self.query_parsing_failure_reason = None
+        # Which parser delivered, and - when it was not the first one tried - why the earlier one
+        # gave up. A fallback that works is a successful parse; the reason stays visible.
+        self.parser_name: Optional[str] = None  # noqa: UP045
+        self.fallback_reason: Optional[str] = None  # noqa: UP045
         self.dialect = dialect
         self.masked_query = None
         self._clean_query = self.clean_raw_query(query)
@@ -106,6 +135,21 @@ class LineageParser:
                 )
                 or self._clean_query
             )
+
+    def _parser_selected(self, name: str, recovered: bool = True) -> None:
+        """Record the parser that delivered. If an earlier parser had failed, that failure is kept
+        as ``fallback_reason`` and said once at INFO; the parse itself is a success - otherwise the
+        column lineage this parser produced would be dropped downstream as if nothing had parsed.
+        ``recovered=False`` is the last-resort sqlparse pass, whose output is degraded (no column
+        lineage, tables only) and keeps the earlier failure as the parse's reason."""
+        if recovered and not self.query_parsing_success:
+            reason = re.sub(r"^\[[^\]]*\] ", "", self.query_parsing_failure_reason or "")
+            self.fallback_reason = reason
+            logger.info(f"[{self.query_hash}] {name} parsed the query after a fallback: {reason}")
+            self.query_parsing_success = True
+            self.query_parsing_failure_reason = None
+        self.parser_name = name
+        logger.debug(f"[{self.query_hash}] Selected {name} for query parsing")
 
     @staticmethod
     def get_query_hash(query: str, length: int = 8) -> str:
@@ -130,9 +174,9 @@ class LineageParser:
         :return: List of involved tables
         """
         try:
-            logger.debug(f"[{self.query_hash}] [UsageSink] Source tables: {self.source_tables}")
-            logger.debug(f"[{self.query_hash}] [UsageSink] Intermediate tables: {self.intermediate_tables}")
-            logger.debug(f"[{self.query_hash}] [UsageSink] Target tables: {self.target_tables}")
+            logger.debug(f"[{self.query_hash}] Source tables: {self.source_tables}")
+            logger.debug(f"[{self.query_hash}] Intermediate tables: {self.intermediate_tables}")
+            logger.debug(f"[{self.query_hash}] Target tables: {self.target_tables}")
 
             return list(set(self.source_tables).union(set(self.intermediate_tables)).union(set(self.target_tables)))
 
@@ -481,6 +525,18 @@ class LineageParser:
         ):
             return None
 
+        # Athena/Redshift `UNLOAD (query) TO 's3://...' WITH (...)` writes files, not a table: the only
+        # metadata in it is the tables the inner query reads. SqlGlot has no grammar for it and parses
+        # the whole statement as an opaque command with no tables, which counted zero usage for the
+        # sources; unwrap to the inner query so it is parsed as the read it is.
+        unload = re.match(
+            r"^\s*(?:/\*.*?\*/\s*|--[^\n]*\n\s*)*UNLOAD\s*\((.*)\)\s*TO\s*'[^']*'",
+            clean_query,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if unload:
+            clean_query = unload.group(1).strip()
+
         # Filter out CREATE TRIGGER statements - they don't provide lineage information
         if insensitive_match(clean_query, r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+"):
             return None
@@ -538,7 +594,7 @@ class LineageParser:
         # SqlGlot is enabled when query parser type is Auto or SqlGlot
         if parser_type in [QueryParserType.Auto, QueryParserType.SqlGlot]:
             try:
-                lr_sqlglot = get_sqlglot_lineage_runner(query, dialect.value)
+                lr_sqlglot = get_sqlglot_lineage_runner(quote_reserved_identifiers(query, dialect), dialect.value)
                 _ = len(lr_sqlglot.get_column_lineage()) + len(
                     set(lr_sqlglot.source_tables).union(
                         set(lr_sqlglot.target_tables).union(set(lr_sqlglot.intermediate_tables))
@@ -569,8 +625,7 @@ class LineageParser:
                 lr_sqlglot = None
 
             if lr_sqlglot:
-                self.query_hash += "-SqlGlot"
-                logger.debug(f"[{self.query_hash}] Selected SqlGlot for query parsing")
+                self._parser_selected("SqlGlot")
                 return lr_sqlglot
 
         @timeout(seconds=timeout_seconds)
@@ -618,8 +673,7 @@ class LineageParser:
                 lr_sqlfluff = None
 
             if lr_sqlfluff:
-                self.query_hash += "-SqlFluff"
-                logger.debug(f"[{self.query_hash}] Selected SqlFluff for query parsing")
+                self._parser_selected("SqlFluff")
                 return lr_sqlfluff
 
         @timeout(seconds=timeout_seconds)
@@ -667,8 +721,7 @@ class LineageParser:
             lr_sqlparse = None
 
         if lr_sqlparse:
-            self.query_hash += "-SqlParse"
-            logger.debug(f"[{self.query_hash}] Selected SqlParse for query parsing")
+            self._parser_selected("SqlParse", recovered=False)
             return lr_sqlparse
 
         # log failed query

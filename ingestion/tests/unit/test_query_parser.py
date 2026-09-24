@@ -195,6 +195,56 @@ class QueryParserTests(TestCase):
             "/* comment */ merge into table_1 using (select a, b from table_2)",
         )
 
+    def test_clean_raw_query_unload_keeps_the_inner_read(self):
+        """
+        UNLOAD (query) TO 's3://...' WITH (...) writes files, not a table; only the inner query's
+        reads are metadata. Leading comments and nested parentheses in the query must not confuse it.
+        """
+        query = """/* {"app": "x"} */
+            UNLOAD (SELECT a.id, b.amount FROM sales.accounts a JOIN sales.trans b ON a.id = b.acc_id
+                    WHERE b.dt > DATE '2026-01-01' AND b.kind IN ('a', 'b'))
+            TO 's3://bucket/exports/accounts/'
+            WITH (format = 'PARQUET', compression = 'SNAPPY')"""
+        cleaned = LineageParser.clean_raw_query(query)
+        self.assertTrue(cleaned.startswith("SELECT a.id, b.amount FROM sales.accounts a"))
+        self.assertTrue(cleaned.endswith("AND b.kind IN ('a', 'b')"))
+        parser = LineageParser(query, dialect=Dialect.ATHENA)
+        self.assertEqual(sorted(str(t) for t in parser.source_tables), ["sales.accounts", "sales.trans"])
+        self.assertEqual(parser.target_tables, [])
+
+    def test_reserved_alias_out_is_parsed_by_sqlglot_for_athena(self):
+        """
+        Athena accepts `out` as a subquery alias; SqlGlot reserves the word and parsed the whole
+        statement as an opaque command with no tables. The alias is quoted for SqlGlot only, never
+        inside a string literal, so the statement keeps its full column lineage.
+        """
+        query = """CREATE TABLE IF NOT EXISTS sales.money AS
+            SELECT inc.cust_id AS client_id, out.total AS total_out
+            FROM (SELECT cust_id, SUM(amt) AS total FROM sales.tx WHERE txt NOT LIKE '%out%' GROUP BY cust_id) inc
+            JOIN (SELECT cust_id, SUM(amt) AS total FROM sales.tx GROUP BY cust_id) out ON inc.cust_id = out.cust_id"""
+        parser = LineageParser(query, dialect=Dialect.ATHENA)
+        self.assertEqual(parser.parser_name, "SqlGlot")
+        self.assertEqual([str(t) for t in parser.target_tables], ["sales.money"])
+        self.assertEqual([str(t) for t in parser.source_tables], ["sales.tx"])
+        self.assertEqual(
+            sorted(str(dst) for _, dst in parser.column_lineage),
+            ["sales.money.client_id", "sales.money.total_out"],
+        )
+
+    def test_quote_reserved_identifiers_leaves_strings_and_other_dialects_alone(self):
+        from metadata.ingestion.lineage.parser import quote_reserved_identifiers
+
+        query = "SELECT out.a, 'out', 'it''s out' FROM t out WHERE out.b = 'x'"
+        self.assertEqual(
+            quote_reserved_identifiers(query, Dialect.ATHENA),
+            "SELECT \"out\".a, 'out', 'it''s out' FROM t \"out\" WHERE \"out\".b = 'x'",
+        )
+        self.assertEqual(quote_reserved_identifiers(query, Dialect.MYSQL), query)
+        self.assertEqual(
+            quote_reserved_identifiers("SELECT outer_id, output FROM t", Dialect.ATHENA),
+            "SELECT outer_id, output FROM t",
+        )
+
     def test_clean_raw_query_copy_from(self):
         """
         Validate COPY FROM query cleaning logic
@@ -657,3 +707,45 @@ END $$"""
         self.assertEqual(parser.source_tables, [])
         self.assertEqual(parser.target_tables, [])
         self.assertEqual(parser.column_lineage, [])
+
+
+MERGE_WITH_CTE_WILDCARD = """
+MERGE INTO cur.t t USING (
+    WITH r AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY ts DESC) AS rn FROM raw.t)
+    SELECT * FROM r WHERE rn = 1
+) s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.v
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)
+"""
+
+
+class _BrokenAnalyzer:
+    """Stands in for the SqlGlot analyzer of collate-sqllineage 2.1.7, which died with KeyError
+    'type' on a MERGE whose USING subquery selects *; a fixed library parses that itself, so the
+    fallback is forced here rather than relied upon."""
+
+    def __init__(self, *args, **kwargs):
+        raise KeyError("type")
+
+
+def test_a_parser_that_delivers_after_another_failed_is_a_successful_parse(monkeypatch):
+    """SqlFluff parsing a statement SqlGlot gave up on is a success with a story, not a failure:
+    the flag must say so, or the pool drops whatever the fallback produced."""
+    monkeypatch.setattr("metadata.ingestion.lineage.parser.SqlGlotLineageAnalyzer", _BrokenAnalyzer)
+    parser = LineageParser(MERGE_WITH_CTE_WILDCARD, dialect=Dialect.ATHENA)
+    assert parser.query_parsing_success is True
+    assert parser.query_parsing_failure_reason is None
+    assert parser.parser_name == "SqlFluff"
+    assert parser.fallback_reason and "SqlGlot" in parser.fallback_reason and "'type'" in parser.fallback_reason
+    assert {str(t) for t in parser.source_tables} == {"raw.t"} and {str(t) for t in parser.target_tables} == {"cur.t"}
+
+
+def test_the_query_hash_never_changes_with_the_parser_chosen(monkeypatch):
+    """One id per query in the logs, whichever parser ends up delivering."""
+    plain = LineageParser("INSERT INTO cur.t SELECT id, v FROM raw.t", dialect=Dialect.ATHENA)
+    assert plain.query_hash == LineageParser.get_query_hash(plain.query) and "-" not in plain.query_hash
+    assert plain.parser_name == "SqlGlot" and plain.fallback_reason is None
+    monkeypatch.setattr("metadata.ingestion.lineage.parser.SqlGlotLineageAnalyzer", _BrokenAnalyzer)
+    fallback = LineageParser(MERGE_WITH_CTE_WILDCARD, dialect=Dialect.ATHENA)
+    assert fallback.parser_name == "SqlFluff"
+    assert fallback.query_hash == LineageParser.get_query_hash(fallback.query) and "-" not in fallback.query_hash

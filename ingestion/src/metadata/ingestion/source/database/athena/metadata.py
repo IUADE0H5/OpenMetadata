@@ -14,8 +14,9 @@
 import hashlib
 import re
 import traceback
-from typing import Iterable, Optional, Tuple  # noqa: UP035
+from typing import Iterable, List, Optional, Tuple  # noqa: UP035
 
+from cachetools import LRUCache
 from pyathena.sqlalchemy.base import AthenaDialect
 from sqlalchemy import text
 from sqlalchemy.engine.reflection import Inspector
@@ -52,6 +53,9 @@ from metadata.ingestion.models.custom_properties import (
 from metadata.ingestion.models.ometa_classification import OMetaTagAndClassification
 from metadata.ingestion.ometa.ometa_api import OpenMetadata
 from metadata.ingestion.source.database.athena.client import AthenaLakeFormationClient
+from metadata.ingestion.source.database.athena.iceberg_partition import (
+    get_iceberg_partition_columns,
+)
 from metadata.ingestion.source.database.athena.utils import (
     _get_column_type,
     get_columns,
@@ -124,6 +128,9 @@ class AthenaSource(ExternalTableLineageMixin, CommonDbSourceService):
         self.external_location_map = {}
         self.schema_description_map = {}
         self.glue_client = None
+        self.s3_client = None
+        # One Glue/S3 partition-spec lookup per table, bounded to the tables in flight.
+        self._partition_columns_cache: LRUCache = LRUCache(maxsize=256)
         self._processed_prop: set[str] = set()
         self._string_property_type_ref = None
 
@@ -134,6 +141,7 @@ class AthenaSource(ExternalTableLineageMixin, CommonDbSourceService):
         try:
             super().prepare()
             self.glue_client = AWSClient(self.service_connection.awsConfig).get_glue_client()
+            self.s3_client = AWSClient(self.service_connection.awsConfig).get_s3_client()
             paginator = self.glue_client.get_paginator("get_databases")
             paginate_params = {}
             if self.service_connection.catalogId:
@@ -194,6 +202,18 @@ class AthenaSource(ExternalTableLineageMixin, CommonDbSourceService):
         Returns:
             Tuple[bool, Optional[TablePartition]]:
         """
+        partition_columns = self._partition_columns(table_name, schema_name, inspector)
+        if partition_columns:
+            return True, TablePartition(columns=partition_columns)
+        return False, None
+
+    def _partition_columns(
+        self, table_name: str, schema_name: str, inspector: Inspector
+    ) -> List[PartitionColumnDetails]:  # noqa: UP006
+        """Hive-style keys from Glue (Parquet/CSV tables), else the Iceberg partition spec."""
+        key = (schema_name, table_name)
+        if key in self._partition_columns_cache:
+            return self._partition_columns_cache[key]
         columns = inspector.get_columns(
             table_name=table_name,
             schema=schema_name,
@@ -202,21 +222,37 @@ class AthenaSource(ExternalTableLineageMixin, CommonDbSourceService):
             catalog_id=self.service_connection.catalogId,
         )
         if columns:
-            partition_details = TablePartition(
-                columns=[
-                    PartitionColumnDetails(
-                        columnName=col["name"],
-                        intervalType=ATHENA_INTERVAL_TYPE_MAP.get(
-                            col.get("projection_type", str(col["type"])),
-                            PartitionIntervalTypes.COLUMN_VALUE,
-                        ),
-                        interval=None,
-                    )
-                    for col in columns
-                ]
+            result = [
+                PartitionColumnDetails(
+                    columnName=col["name"],
+                    intervalType=ATHENA_INTERVAL_TYPE_MAP.get(
+                        col.get("projection_type", str(col["type"])),
+                        PartitionIntervalTypes.COLUMN_VALUE,
+                    ),
+                    interval=None,
+                )
+                for col in columns
+            ]
+        else:
+            result = self._get_iceberg_partition_columns(table_name, schema_name) or []
+        self._partition_columns_cache[key] = result
+        return result
+
+    def _get_iceberg_partition_columns(self, table_name: str, schema_name: str):
+        """Glue has no partition keys for Iceberg tables; the spec is in the table's metadata.json."""
+        if not (self.glue_client and self.s3_client):
+            return None
+        try:
+            return get_iceberg_partition_columns(
+                self.glue_client,
+                self.s3_client,
+                schema_name,
+                table_name,
+                catalog_id=self.service_connection.catalogId,
             )
-            return True, partition_details
-        return False, None
+        except Exception as exc:
+            logger.debug(f"Could not resolve Iceberg partition spec for {schema_name}.{table_name}: {exc}")
+            return None
 
     def get_location_path(self, table_name: str, schema_name: str) -> Optional[str]:  # noqa: UP045
         """
